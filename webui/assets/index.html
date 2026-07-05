@@ -226,12 +226,13 @@
   }
   .nav { display: flex; flex-direction: column; gap: 2px; }
   .nav-item {
-    display: flex; align-items: center; gap: 11px;
+    display: flex; align-items: center; gap: var(--s3);
     padding: 9px var(--s3); border-radius: var(--r-sm);
     color: var(--text-soft); font-weight: 550; font-size: 13.5px; cursor: pointer;
     transition: background .13s var(--ease), color .13s var(--ease);
   }
   .nav-item:hover { background: var(--bg-hover); color: var(--text); }
+  .nav-item:focus-visible { outline: none; background: var(--bg-hover); color: var(--text); box-shadow: inset 0 0 0 1.5px var(--accent); }
   .nav-item.active { background: var(--bg-active); color: var(--accent-strong); font-weight: 650; }
   .nav-item .ico { width: 18px; text-align: center; opacity: .8; font-size: 13px; flex: none; }
   .nav-item.active .ico { opacity: 1; }
@@ -246,7 +247,7 @@
   .sidebar-foot {
     margin-top: auto; padding: var(--s3) var(--s2) var(--s1);
     border-top: 1px solid var(--border);
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: center; gap: var(--s3);
   }
   .avatar { width: 32px; height: 32px; border-radius: 50%; flex: none; font-size: 12.5px; }
   .sidebar-foot .who { min-width: 0; }
@@ -282,8 +283,11 @@
     transition: background .12s var(--ease);
   }
   .msg-row:hover { background: var(--bg-hover); }
+  .msg-row:hover::before { background: var(--border-strong); }
   .msg-row.active { background: var(--bg-active); }
   .msg-row.active::before { background: var(--accent); }
+  .msg-row:focus-visible { outline: none; background: var(--bg-hover); }
+  .msg-row:focus-visible::before { background: var(--accent); }
   .msg-row .av { width: 38px; height: 38px; border-radius: 50%; flex: none; margin-top: 1px; font-size: 14px; }
   .msg-row .content { min-width: 0; flex: 1; }
   .msg-row .top { display: flex; align-items: baseline; gap: var(--s2); min-width: 0; margin-bottom: 2px; }
@@ -319,9 +323,10 @@
   .reader-meta .mfrom { font-weight: 650; font-size: 14px; }
   .reader-meta .maddr { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); margin-top: 2px; }
   .reader-meta .mto {
-    margin-left: auto; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
-    font-size: 10.5px; color: var(--text-faint); text-align: right; padding-left: var(--s4);
+    margin-left: auto; text-align: right; padding-left: var(--s4); flex: none;
   }
+  .reader-meta .mdate { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 11px; color: var(--text-soft); }
+  .reader-meta .mrcpt { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); margin-top: 2px; }
   .reader-body {
     flex: 1; overflow-y: auto; padding: var(--s6) var(--s8) var(--s8);
     white-space: pre-wrap; overflow-wrap: break-word;
@@ -469,7 +474,10 @@
             <div id="reader-from" class="mfrom"></div>
             <div id="reader-fromaddr" class="maddr"></div>
           </div>
-          <div id="reader-to" class="mto"></div>
+          <div id="reader-to" class="mto">
+            <div id="reader-date" class="mdate"></div>
+            <div id="reader-rcpt" class="mrcpt"></div>
+          </div>
         </div>
       </div>
       <div id="reader-body" class="reader-body scroll"></div>

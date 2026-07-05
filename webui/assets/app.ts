@@ -36,6 +36,14 @@ function $(id: string): HTMLElement {
 }
 function inp(id: string): HTMLInputElement { return $(id) as HTMLInputElement }
 
+// focusSibling moves keyboard focus to the next/prev message row (arrow keys).
+function focusSibling(row: HTMLElement, dir: 1 | -1): void {
+	const rows = Array.from(document.querySelectorAll<HTMLElement>('.msg-row'))
+	const i = rows.indexOf(row)
+	const next = rows[i + dir]
+	if (next) next.focus()
+}
+
 async function jmap(method: string, args: any): Promise<any> {
 	const body = {
 		using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission'],
@@ -83,6 +91,17 @@ function relTime(iso?: string): string {
 	if (day < 7) return day + 'd'
 	const d = new Date(t)
 	return (d.getMonth() + 1) + '/' + d.getDate()
+}
+
+// absTime formats a full, sortable timestamp for the reader header
+// (e.g. "2026-07-05 14:22"). Machine metadata → monospace + tabular in CSS.
+function absTime(iso?: string): string {
+	if (!iso) return ''
+	const d = new Date(iso)
+	if (isNaN(d.getTime())) return ''
+	const p = (n: number) => String(n).padStart(2, '0')
+	return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+		' ' + p(d.getHours()) + ':' + p(d.getMinutes())
 }
 
 function mailboxIcon(role: string | null, name: string): string {
@@ -166,7 +185,12 @@ function renderNav(): void {
 			'<span class="lbl"></span>' +
 			'<span class="count">' + count + '</span>'
 		;(el.querySelector('.lbl') as HTMLElement).textContent = m.name
-		el.onclick = () => { selectMailbox(m.id).catch(showListError) }
+		el.tabIndex = 0
+		el.setAttribute('role', 'tab')
+		el.setAttribute('aria-selected', m.id === currentMailbox ? 'true' : 'false')
+		const go = () => { selectMailbox(m.id).catch(showListError) }
+		el.onclick = go
+		el.onkeydown = (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go() } }
 		nav.appendChild(el)
 	}
 }
@@ -240,13 +264,23 @@ function renderRow(em: Email, i: number): HTMLElement {
 	row.appendChild(av)
 	row.appendChild(content)
 	if (unread) { const d = document.createElement('div'); d.className = 'dot'; row.appendChild(d) }
-	row.onclick = () => {
-		document.querySelectorAll('.msg-row').forEach(r => r.classList.remove('active'))
+	row.tabIndex = 0
+	row.setAttribute('role', 'option')
+	row.setAttribute('aria-label', fromLabel + ': ' + (em.subject || '(no subject)'))
+	const activate = () => {
+		document.querySelectorAll('.msg-row').forEach(r => { r.classList.remove('active'); r.setAttribute('aria-selected', 'false') })
 		row.classList.add('active')
+		row.setAttribute('aria-selected', 'true')
 		// Optimistically reflect "read": drop unread emphasis + the dot.
 		row.classList.remove('unread')
 		const d = row.querySelector('.dot'); if (d) d.remove()
 		openMessage(em.id).catch(e => { $('reader-body').textContent = String(e) })
+	}
+	row.onclick = activate
+	row.onkeydown = (e: KeyboardEvent) => {
+		if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate() }
+		else if (e.key === 'ArrowDown') { e.preventDefault(); focusSibling(row, 1) }
+		else if (e.key === 'ArrowUp') { e.preventDefault(); focusSibling(row, -1) }
 	}
 	return row
 }
@@ -278,7 +312,8 @@ async function openMessage(id: string): Promise<void> {
 	$('reader-fromaddr').textContent = from && from.email ? from.email : ''
 	$('reader-av').textContent = initials(from ? (from.email || displayName(from)) : '?')
 	const to = (em.to || []).map(a => a.email || displayName(a)).join(', ')
-	$('reader-to').textContent = to ? 'to ' + to : ''
+	$('reader-date').textContent = absTime(em.receivedAt)
+	$('reader-rcpt').textContent = to ? 'to ' + to : ''
 	$('reader-body').textContent = body
 }
 
