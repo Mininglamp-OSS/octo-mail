@@ -374,6 +374,20 @@ func run() error {
 		}
 	})
 
+	// Blob GC: hard-delete expunged message rows (their history lives in the
+	// changelog) and reclaim any body blob no live message/queue row references.
+	// Without this, storage grows monotonically — every expunge leaks its body.
+	// Safe on every node: the row delete uses FOR UPDATE SKIP LOCKED and the
+	// per-blob referrer re-check is authoritative at delete time.
+	go runLoop(ctx, log, "blob-gc", time.Hour, func() {
+		rows, blobs, err := s.CollectGarbage(ctx, 1000)
+		if err != nil {
+			log.Warn("blob gc", "err", err)
+		} else if rows > 0 || blobs > 0 {
+			log.Info("blob gc", "rows_deleted", rows, "blobs_removed", blobs)
+		}
+	})
+
 	// Queue depth gauge sampler: publish due/held/total to Prometheus each tick.
 	// Safe on every node (a read-only aggregate); the scraper sees the latest value.
 	go runLoop(ctx, log, "queue-depth", 15*time.Second, func() {
