@@ -3,51 +3,414 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>octo-mail webmail</title>
+<title>octo-mail</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 0; color: #222; }
-  header { background: #2a5db0; color: #fff; padding: 10px 16px; font-weight: 600; }
-  .pane { padding: 16px; }
-  input, textarea { display: block; margin: 6px 0; padding: 6px; width: 320px; max-width: 90%; }
-  button { padding: 6px 14px; cursor: pointer; }
-  .row { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
-  .row:hover { background: #f4f7fd; }
-  #reader { border: 1px solid #ddd; padding: 12px; margin-top: 12px; }
-  #reader-body { white-space: pre-wrap; }
-  .status { color: #b00; min-height: 1em; }
-  fieldset { border: 1px solid #ddd; margin: 12px 0; max-width: 400px; }
-  h3 { margin: 6px 0; }
+  /* ---- Design tokens: an "ink & tide" system. Teal/slate, generous rhythm,
+         monospace for machine metadata. Light-first with an automatic dark
+         mapping via prefers-color-scheme. No external fonts/CDN — everything
+         embeds in the binary and works offline. ---- */
+  :root {
+    --bg:            #f4f6f8;
+    --bg-panel:      #ffffff;
+    --bg-sunken:     #eef1f4;
+    --bg-hover:      #e9f2f1;
+    --bg-active:     #d7ece9;
+    --border:        #e2e6ea;
+    --border-strong: #cdd4da;
+    --text:          #1a2b32;
+    --text-soft:     #5b6b73;
+    --text-faint:    #8a979e;
+    --accent:        #0d7d76;
+    --accent-strong: #0a615c;
+    --accent-ghost:  #e0f1ef;
+    --danger:        #b4453a;
+    --unread-dot:    #0d7d76;
+    --shadow-sm: 0 1px 2px rgba(20,40,45,.06), 0 1px 1px rgba(20,40,45,.04);
+    --shadow-md: 0 4px 16px rgba(20,40,45,.10), 0 1px 3px rgba(20,40,45,.06);
+    --shadow-lg: 0 18px 50px rgba(20,40,45,.22);
+    --font-ui: ui-sans-serif, -apple-system, "Segoe UI", system-ui, "Helvetica Neue", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
+    --r-sm: 6px; --r-md: 10px; --r-lg: 16px;
+    --sidebar-w: 232px;
+    --list-w: 360px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:            #0f1518;
+      --bg-panel:      #151d21;
+      --bg-sunken:     #101619;
+      --bg-hover:      #1b262b;
+      --bg-active:     #12312e;
+      --border:        #232e34;
+      --border-strong: #314047;
+      --text:          #e6edf0;
+      --text-soft:     #9fb0b7;
+      --text-faint:    #6b7c83;
+      --accent:        #2bb3a8;
+      --accent-strong: #4fcabf;
+      --accent-ghost:  #14302d;
+      --danger:        #e07a6f;
+      --unread-dot:    #2bb3a8;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,.3);
+      --shadow-md: 0 6px 20px rgba(0,0,0,.4);
+      --shadow-lg: 0 18px 50px rgba(0,0,0,.55);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--font-ui);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection { background: var(--accent-ghost); }
+
+  /* ---------- Login ---------- */
+  #login-view {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background:
+      radial-gradient(120% 90% at 15% -10%, var(--accent-ghost) 0%, transparent 55%),
+      radial-gradient(90% 80% at 110% 110%, var(--accent-ghost) 0%, transparent 50%),
+      var(--bg);
+  }
+  .login-card {
+    width: 100%;
+    max-width: 380px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-lg);
+    padding: 36px 34px 30px;
+    animation: rise .5s cubic-bezier(.2,.8,.2,1) both;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 11px;
+    margin-bottom: 26px;
+  }
+  .brand .mark {
+    width: 38px; height: 38px; border-radius: 11px; flex: none;
+    background: linear-gradient(145deg, var(--accent), var(--accent-strong));
+    display: grid; place-items: center;
+    color: #fff; font-size: 20px; box-shadow: var(--shadow-sm);
+  }
+  .brand .name { font-size: 19px; font-weight: 680; letter-spacing: -.02em; }
+  .brand .name span { color: var(--accent); }
+  .brand .tag { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); letter-spacing: .02em; }
+
+  .field { margin-bottom: 14px; }
+  .field label {
+    display: block; font-size: 11px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--text-faint); margin-bottom: 6px;
+  }
+  input, textarea {
+    width: 100%;
+    font-family: inherit; font-size: 14px; color: var(--text);
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 10px 12px;
+    transition: border-color .15s, box-shadow .15s, background .15s;
+  }
+  input:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: var(--bg-panel);
+    box-shadow: 0 0 0 3px var(--accent-ghost);
+  }
+  button {
+    font-family: inherit; font-size: 14px; font-weight: 600;
+    cursor: pointer; border: none; border-radius: var(--r-sm);
+    transition: background .15s, transform .06s, box-shadow .15s, color .15s;
+  }
+  button:active { transform: translateY(1px); }
+  .btn-primary {
+    width: 100%; padding: 11px; margin-top: 6px;
+    color: #fff; background: var(--accent); box-shadow: var(--shadow-sm);
+  }
+  .btn-primary:hover { background: var(--accent-strong); }
+  .status { font-size: 12.5px; color: var(--danger); min-height: 1.2em; margin-top: 10px; font-family: var(--font-mono); }
+
+  /* ---------- App shell: three panes ---------- */
+  #mail-view { height: 100vh; display: none; grid-template-columns: var(--sidebar-w) var(--list-w) 1fr; }
+
+  /* Sidebar */
+  .sidebar {
+    background: var(--bg-sunken);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; min-height: 0;
+    padding: 16px 12px;
+  }
+  .sidebar .brand { margin: 6px 8px 20px; }
+  .sidebar .brand .mark { width: 30px; height: 30px; border-radius: 9px; font-size: 16px; }
+  .sidebar .brand .name { font-size: 16px; }
+  .compose-btn {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; padding: 11px; margin-bottom: 18px;
+    color: #fff; background: var(--accent); box-shadow: var(--shadow-sm);
+    font-size: 13.5px;
+  }
+  .compose-btn:hover { background: var(--accent-strong); }
+  .compose-btn .plus { font-size: 17px; line-height: 0; margin-top: -1px; }
+  .nav-label {
+    font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--text-faint); padding: 0 10px; margin: 8px 0 6px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: var(--r-sm);
+    color: var(--text-soft); font-weight: 550; cursor: pointer;
+    transition: background .12s, color .12s;
+  }
+  .nav-item:hover { background: var(--bg-hover); color: var(--text); }
+  .nav-item.active { background: var(--bg-active); color: var(--accent-strong); font-weight: 650; }
+  .nav-item .ico { width: 18px; text-align: center; opacity: .85; }
+  .nav-item .count { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); }
+  .sidebar-foot {
+    margin-top: auto; padding: 10px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .avatar {
+    width: 30px; height: 30px; border-radius: 50%; flex: none;
+    display: grid; place-items: center; color: #fff; font-weight: 650; font-size: 13px;
+    background: linear-gradient(145deg, var(--accent), var(--accent-strong));
+  }
+  .sidebar-foot .who { min-width: 0; }
+  .sidebar-foot .who .u { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sidebar-foot .who .s { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); }
+  .icon-btn {
+    margin-left: auto; background: transparent; color: var(--text-faint);
+    padding: 6px; border-radius: var(--r-sm); font-size: 15px;
+  }
+  .icon-btn:hover { background: var(--bg-hover); color: var(--text); }
+
+  /* Message list */
+  .list-pane { background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+  .list-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 18px 14px; border-bottom: 1px solid var(--border);
+  }
+  .list-head h2 { margin: 0; font-size: 17px; font-weight: 680; letter-spacing: -.02em; }
+  .list-head .sub { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); }
+  .list-scroll { overflow-y: auto; flex: 1; }
+  .msg-row {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 13px 18px; border-bottom: 1px solid var(--border);
+    cursor: pointer; position: relative;
+    transition: background .12s;
+  }
+  .msg-row:hover { background: var(--bg-hover); }
+  .msg-row.active { background: var(--bg-active); }
+  .msg-row.active::before {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--accent);
+  }
+  .msg-row .av {
+    width: 36px; height: 36px; border-radius: 50%; flex: none; margin-top: 2px;
+    display: grid; place-items: center; color: #fff; font-weight: 650; font-size: 14px;
+    background: linear-gradient(145deg, #4b8f89, #2f6c66);
+  }
+  .msg-row .content { min-width: 0; flex: 1; }
+  .msg-row .top { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .msg-row .from { font-weight: 640; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .msg-row.unread .from { font-weight: 720; }
+  .msg-row .time { margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); white-space: nowrap; flex: none; }
+  .msg-row .subj { font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .msg-row .prev { font-size: 12px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .msg-row .dot { position: absolute; right: 14px; bottom: 14px; width: 7px; height: 7px; border-radius: 50%; background: var(--unread-dot); }
+  .tag-junk {
+    font-family: var(--font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: .04em;
+    color: var(--danger); border: 1px solid var(--danger); border-radius: 4px;
+    padding: 0 4px; text-transform: uppercase; opacity: .8;
+  }
+  .empty { padding: 40px 24px; text-align: center; color: var(--text-faint); font-size: 13px; }
+  .empty .big { font-size: 34px; opacity: .35; margin-bottom: 10px; }
+
+  /* Reader */
+  .reader-pane { background: var(--bg); display: flex; flex-direction: column; min-height: 0; }
+  .reader-empty { flex: 1; display: grid; place-items: center; text-align: center; color: var(--text-faint); }
+  .reader-empty .big { font-size: 56px; opacity: .18; margin-bottom: 14px; }
+  #reader { flex: 1; display: none; flex-direction: column; min-height: 0; }
+  .reader-head { padding: 26px 32px 20px; border-bottom: 1px solid var(--border); background: var(--bg-panel); }
+  .reader-head h1 { margin: 0 0 14px; font-size: 22px; font-weight: 700; letter-spacing: -.02em; line-height: 1.25; }
+  .reader-meta { display: flex; align-items: center; gap: 12px; }
+  .reader-meta .av {
+    width: 42px; height: 42px; border-radius: 50%; flex: none;
+    display: grid; place-items: center; color: #fff; font-weight: 650; font-size: 16px;
+    background: linear-gradient(145deg, #4b8f89, #2f6c66);
+  }
+  .reader-meta .mfrom { font-weight: 650; font-size: 14px; }
+  .reader-meta .maddr { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-faint); }
+  .reader-meta .mto { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); text-align: right; }
+  .reader-body {
+    flex: 1; overflow-y: auto; padding: 26px 32px 40px;
+    white-space: pre-wrap; word-wrap: break-word;
+    font-size: 14.5px; line-height: 1.7; color: var(--text);
+    max-width: 780px;
+  }
+
+  /* Compose modal */
+  .modal-scrim {
+    position: fixed; inset: 0; background: rgba(15,25,28,.45);
+    display: none; place-items: end center; z-index: 50;
+    animation: fade .2s ease both;
+  }
+  .modal-scrim.open { display: grid; }
+  .compose {
+    width: 100%; max-width: 640px; margin: 0 24px;
+    background: var(--bg-panel); border: 1px solid var(--border-strong);
+    border-radius: var(--r-lg) var(--r-lg) 0 0; box-shadow: var(--shadow-lg);
+    display: flex; flex-direction: column; max-height: 82vh;
+    animation: rise .28s cubic-bezier(.2,.8,.2,1) both;
+  }
+  .compose-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 15px 18px; border-bottom: 1px solid var(--border);
+  }
+  .compose-head h3 { margin: 0; font-size: 15px; font-weight: 680; }
+  .compose-body { padding: 6px 18px 4px; overflow-y: auto; }
+  .compose-body .line { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+  .compose-body .line label { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); width: 52px; flex: none; }
+  .compose-body .line input {
+    border: none; background: transparent; padding: 12px 0; border-radius: 0;
+  }
+  .compose-body .line input:focus { box-shadow: none; }
+  .compose-body textarea {
+    border: none; background: transparent; padding: 14px 0; min-height: 200px; resize: vertical;
+    line-height: 1.6;
+  }
+  .compose-body textarea:focus { box-shadow: none; }
+  .compose-foot { display: flex; align-items: center; gap: 12px; padding: 13px 18px; border-top: 1px solid var(--border); }
+  .btn-send { padding: 10px 22px; color: #fff; background: var(--accent); box-shadow: var(--shadow-sm); display: flex; align-items: center; gap: 7px; }
+  .btn-send:hover { background: var(--accent-strong); }
+  .btn-ghost { padding: 10px 16px; background: transparent; color: var(--text-soft); }
+  .btn-ghost:hover { background: var(--bg-hover); color: var(--text); }
+  .compose .status { margin: 0 0 0 auto; }
+  .status.ok { color: var(--accent); }
+
+  .spinner {
+    width: 15px; height: 15px; border: 2px solid currentColor; border-right-color: transparent;
+    border-radius: 50%; display: inline-block; animation: spin .6s linear infinite; vertical-align: -2px;
+  }
+
+  @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .msg-row { animation: rise .3s ease both; }
+
+  @media (max-width: 860px) {
+    #mail-view { grid-template-columns: 1fr; }
+    .sidebar, .list-pane { display: none; }
+  }
 </style>
 </head>
 <body>
-<header>octo-mail webmail</header>
 
-<div id="login-view" class="pane">
-  <h3>Sign in</h3>
-  <input id="user" type="text" placeholder="you@example.com" autocomplete="username">
-  <input id="pass" type="password" placeholder="password" autocomplete="current-password">
-  <button id="login-btn">Sign in</button>
-  <div id="login-status" class="status"></div>
+<div id="login-view">
+  <div class="login-card">
+    <div class="brand">
+      <div class="mark">✦</div>
+      <div>
+        <div class="name">octo<span>·</span>mail</div>
+        <div class="tag">change-log mail kernel</div>
+      </div>
+    </div>
+    <div class="field">
+      <label for="user">Email</label>
+      <input id="user" type="text" placeholder="you@example.com" autocomplete="username" autofocus>
+    </div>
+    <div class="field">
+      <label for="pass">Password</label>
+      <input id="pass" type="password" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <button id="login-btn" class="btn-primary">Sign in</button>
+    <div id="login-status" class="status"></div>
+  </div>
 </div>
 
-<div id="mail-view" class="pane" style="display:none">
-  <button id="refresh-btn">Refresh inbox</button>
-  <h3>Inbox</h3>
-  <div id="list">loading…</div>
+<div id="mail-view">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="mark">✦</div>
+      <div class="name">octo<span>·</span>mail</div>
+    </div>
+    <button id="compose-open" class="compose-btn"><span class="plus">+</span> Compose</button>
+    <div class="nav-label">Mailboxes</div>
+    <div id="nav" class="nav"></div>
+    <div class="sidebar-foot">
+      <div id="side-avatar" class="avatar">?</div>
+      <div class="who">
+        <div id="side-user" class="u">—</div>
+        <div class="s">signed in</div>
+      </div>
+      <button id="signout-btn" class="icon-btn" title="Sign out">⏻</button>
+    </div>
+  </aside>
 
-  <div id="reader" style="display:none">
-    <h3 id="reader-subject"></h3>
-    <div id="reader-body"></div>
+  <!-- Message list -->
+  <section class="list-pane">
+    <div class="list-head">
+      <div>
+        <h2 id="list-title">Inbox</h2>
+        <div id="list-sub" class="sub">—</div>
+      </div>
+      <button id="refresh-btn" class="icon-btn" title="Refresh">↻</button>
+    </div>
+    <div id="list" class="list-scroll"></div>
+  </section>
+
+  <!-- Reader -->
+  <section class="reader-pane">
+    <div id="reader-empty" class="reader-empty">
+      <div>
+        <div class="big">✉</div>
+        <div>Select a message to read</div>
+      </div>
+    </div>
+    <div id="reader">
+      <div class="reader-head">
+        <h1 id="reader-subject"></h1>
+        <div class="reader-meta">
+          <div id="reader-av" class="av">?</div>
+          <div>
+            <div id="reader-from" class="mfrom"></div>
+            <div id="reader-fromaddr" class="maddr"></div>
+          </div>
+          <div id="reader-to" class="mto"></div>
+        </div>
+      </div>
+      <div id="reader-body" class="reader-body"></div>
+    </div>
+  </section>
+</div>
+
+<!-- Compose modal -->
+<div id="compose-scrim" class="modal-scrim">
+  <div class="compose">
+    <div class="compose-head">
+      <h3>New message</h3>
+      <button id="compose-close" class="icon-btn">✕</button>
+    </div>
+    <div class="compose-body">
+      <div class="line"><label for="to">To</label><input id="to" type="text" placeholder="recipient@example.com"></div>
+      <div class="line"><label for="subject">Subject</label><input id="subject" type="text" placeholder="Subject"></div>
+      <textarea id="compose-text" placeholder="Write your message…"></textarea>
+    </div>
+    <div class="compose-foot">
+      <button id="send-btn" class="btn-send">Send</button>
+      <button id="compose-cancel" class="btn-ghost">Discard</button>
+      <div id="send-status" class="status"></div>
+    </div>
   </div>
-
-  <fieldset>
-    <legend>Compose</legend>
-    <input id="to" type="text" placeholder="to@example.com">
-    <input id="subject" type="text" placeholder="Subject">
-    <textarea id="compose-body" rows="5" placeholder="Message…"></textarea>
-    <button id="send-btn">Send</button>
-    <div id="send-status" class="status"></div>
-  </fieldset>
 </div>
 
 <script src="app.js"></script>
