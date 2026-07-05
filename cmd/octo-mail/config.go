@@ -43,6 +43,13 @@ type config struct {
 	junkDir       string
 	junkThreshold float64
 
+	// Inbound decision-engine tuning (all optional; zero uses Decider defaults).
+	greylistDelay     time.Duration
+	rejectThreshold   float64
+	trustedHamCount   int64
+	subjectPassKey    []byte
+	subjectPassPeriod time.Duration
+
 	webhookURL string
 
 	adminAddr  string
@@ -92,6 +99,12 @@ func loadConfig() config {
 
 		junkDir:       envDefault("OCTO_MAIL_JUNK_DIR", "./junk"),
 		junkThreshold: envFloat("OCTO_MAIL_JUNK_THRESHOLD", 0.95),
+
+		greylistDelay:     envDuration("OCTO_MAIL_GREYLIST_DELAY", 0),
+		rejectThreshold:   envFloat("OCTO_MAIL_REJECT_THRESHOLD", 0),
+		trustedHamCount:   envInt64("OCTO_MAIL_TRUSTED_HAM_COUNT", 0),
+		subjectPassKey:    []byte(os.Getenv("OCTO_MAIL_SUBJECTPASS_KEY")),
+		subjectPassPeriod: envDuration("OCTO_MAIL_SUBJECTPASS_PERIOD", 0),
 
 		webhookURL: os.Getenv("OCTO_MAIL_WEBHOOK_URL"),
 

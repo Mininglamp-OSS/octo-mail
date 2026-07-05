@@ -189,8 +189,28 @@ func run() error {
 
 	// Inbound authenticator (SPF/DKIM/DMARC/iprev/DNSBL) for the MX listener.
 	authenticator := &inbound.Authenticator{Resolver: dns.StrictResolver{Pkg: "octo-mail"}, DNSBLZones: cfg.dnsblZones}
-	decider := &inbound.Decider{Pool: s.Pool, GreylistEnabled: cfg.greylist, JunkThreshold: cfg.junkThreshold}
+	decider := &inbound.Decider{
+		Pool:              s.Pool,
+		GreylistEnabled:   cfg.greylist,
+		GreylistDelay:     cfg.greylistDelay,
+		JunkThreshold:     cfg.junkThreshold,
+		RejectThreshold:   cfg.rejectThreshold,
+		TrustedHamCount:   cfg.trustedHamCount,
+		SubjectPassKey:    cfg.subjectPassKey,
+		SubjectPassPeriod: cfg.subjectPassPeriod,
+	}
 	reports := &reportdb.Store{Pool: s.Pool}
+
+	// Surface security-relevant weakened defaults at startup so an operator does
+	// not silently run with spoofing enforcement off. These stay opt-in (flipping
+	// them on by default could reject legitimate mail from misconfigured senders),
+	// but running without them should be a conscious choice, not an accident.
+	if !cfg.rejectDMARC {
+		log.Warn("DMARC enforcement OFF: messages failing a domain's DMARC p=reject policy are accepted (spoofing risk). Set OCTO_MAIL_REJECT_DMARC=1 to enforce.")
+	}
+	if len(cfg.subjectPassKey) == 0 {
+		log.Info("subjectpass disabled (no OCTO_MAIL_SUBJECTPASS_KEY); content-rejected senders get no challenge-retry path")
+	}
 
 	// Per-account junk filter (bayesian), routing spam to the Junk mailbox.
 	junkMgr := junkfilter.NewManager(cfg.junkDir, junkfilter.DefaultParams, cfg.junkThreshold)

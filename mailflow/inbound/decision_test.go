@@ -43,6 +43,13 @@ func TestAdaptiveThresholdAndForwarded(t *testing.T) {
 	}
 
 	const acc = int64(9001)
+	// Seed account 9001 when the full schema is present: rulesets may carry a FK to
+	// accounts(id) (it does under the real schema, which another test in the shared
+	// DB applies). Best-effort and idempotent — a no-op on the minimal standalone
+	// schema where accounts/tenants don't exist. Both id columns are GENERATED
+	// ALWAYS AS IDENTITY, so forcing the ids needs OVERRIDING SYSTEM VALUE.
+	_, _ = pool.Exec(ctx, `INSERT INTO tenants (id, name) OVERRIDING SYSTEM VALUE VALUES (9001,'dec-test') ON CONFLICT DO NOTHING`)
+	_, _ = pool.Exec(ctx, `INSERT INTO accounts (id, tenant_id, name) OVERRIDING SYSTEM VALUE VALUES ($1,9001,'dec-test') ON CONFLICT DO NOTHING`, acc)
 	// A classifier that always returns prob=0.90, significant. Base junk threshold
 	// is 0.95, so 0.90 is normally NOT junk. But with adaptive lowering for a
 	// junk-heavy domain, the effective threshold drops below 0.90 → filed Junk.
