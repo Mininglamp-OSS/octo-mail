@@ -777,24 +777,16 @@ func parseUploadBlobID(id string) (tenantID int64, ref string, ok bool) {
 	return t, rest[dash+1:], true
 }
 
-// applyJMAPKeywords sets message flags from a JMAP keywords map.
+// applyJMAPKeywords sets message flags from a JMAP keywords map, routing system
+// keywords through the canonical store.Flags parser and treating the rest as
+// free-form keywords.
 func applyJMAPKeywords(m *store.Message, kw map[string]bool) {
 	for k, v := range kw {
-		switch strings.ToLower(k) {
-		case "$seen":
-			m.Seen = v
-		case "$flagged":
-			m.Flagged = v
-		case "$answered":
-			m.Answered = v
-		case "$draft":
-			m.Draft = v
-		case "$junk":
-			m.Junk = v
-		default:
-			if v {
-				m.Keywords = append(m.Keywords, k)
-			}
+		if m.Flags.SetByName(k, v) {
+			continue
+		}
+		if v {
+			m.Keywords = append(m.Keywords, k)
 		}
 	}
 }
@@ -984,28 +976,11 @@ func emptyList(l []map[string]any) []map[string]any {
 
 // --- helpers ---
 
-// jmapKeywords maps flags/keywords to JMAP keyword map ($seen, $flagged, ...).
+// jmapKeywords maps flags/keywords to JMAP keyword map ($seen, $flagged, ...)
+// via the canonical registry in store.Flags, so it cannot drift from the IMAP
+// and WebAPI renderers.
 func jmapKeywords(m store.Message) map[string]bool {
-	kw := map[string]bool{}
-	if m.Seen {
-		kw["$seen"] = true
-	}
-	if m.Answered {
-		kw["$answered"] = true
-	}
-	if m.Flagged {
-		kw["$flagged"] = true
-	}
-	if m.Draft {
-		kw["$draft"] = true
-	}
-	for _, k := range m.Keywords {
-		kw[k] = true
-	}
-	if len(kw) == 0 {
-		return nil
-	}
-	return kw
+	return m.Flags.JMAPKeywords(m.Keywords)
 }
 
 // applyKeywordPatch applies a JMAP patch like {"keywords/$seen": true}.

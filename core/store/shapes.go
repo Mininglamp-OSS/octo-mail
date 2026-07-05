@@ -112,6 +112,95 @@ func (m Message) EffectiveEmailID() int64 {
 	return m.ID
 }
 
+// flagSpec is one row of the canonical flag registry: the pointer into a Flags
+// value, its IMAP token (\Seen, $Junk, ...) and its JMAP keyword ($seen, ...).
+// This single table is the source of truth for every flag<->wire conversion, so
+// the IMAP, JMAP and WebAPI surfaces cannot drift apart (e.g. one emitting Junk
+// while another omits it).
+type flagSpec struct {
+	ptr  func(*Flags) *bool
+	imap string // IMAP system flag / keyword token
+	jmap string // JMAP keyword
+}
+
+var flagRegistry = []flagSpec{
+	{func(f *Flags) *bool { return &f.Seen }, `\Seen`, "$seen"},
+	{func(f *Flags) *bool { return &f.Answered }, `\Answered`, "$answered"},
+	{func(f *Flags) *bool { return &f.Flagged }, `\Flagged`, "$flagged"},
+	{func(f *Flags) *bool { return &f.Deleted }, `\Deleted`, "$deleted"},
+	{func(f *Flags) *bool { return &f.Draft }, `\Draft`, "$draft"},
+	{func(f *Flags) *bool { return &f.Forwarded }, `$Forwarded`, "$forwarded"},
+	{func(f *Flags) *bool { return &f.Junk }, `$Junk`, "$junk"},
+	{func(f *Flags) *bool { return &f.Notjunk }, `$NotJunk`, "$notjunk"},
+	{func(f *Flags) *bool { return &f.Phishing }, `$Phishing`, "$phishing"},
+	{func(f *Flags) *bool { return &f.MDNSent }, `$MDNSent`, "$mdnsent"},
+}
+
+// IMAPFlags renders the set flags as IMAP tokens (\Seen, $Junk, ...), followed
+// by the given per-message keywords. It is the one renderer the IMAP FETCH/STORE
+// and WebAPI surfaces share.
+func (f Flags) IMAPFlags(keywords []string) []string {
+	fc := f
+	var out []string
+	for _, s := range flagRegistry {
+		if *s.ptr(&fc) {
+			out = append(out, s.imap)
+		}
+	}
+	return append(out, keywords...)
+}
+
+// JMAPKeywords renders the set flags plus per-message keywords as a JMAP keyword
+// map ($seen, $flagged, ...). Returns nil when empty (JMAP omits empty maps).
+func (f Flags) JMAPKeywords(keywords []string) map[string]bool {
+	fc := f
+	kw := map[string]bool{}
+	for _, s := range flagRegistry {
+		if *s.ptr(&fc) {
+			kw[s.jmap] = true
+		}
+	}
+	for _, k := range keywords {
+		kw[k] = true
+	}
+	if len(kw) == 0 {
+		return nil
+	}
+	return kw
+}
+
+// SetByName sets a single flag by an IMAP token or JMAP keyword (case- and
+// prefix-insensitive: "\Seen", "$seen" and "seen" all map to Seen). It reports
+// whether name matched a known system flag; when false, the caller should treat
+// name as a free-form keyword. This is the one parser all surfaces share, so a
+// token handled by one protocol is handled identically by the others.
+func (f *Flags) SetByName(name string, v bool) (known bool) {
+	n := normalizeFlagName(name)
+	for _, s := range flagRegistry {
+		if normalizeFlagName(s.imap) == n || normalizeFlagName(s.jmap) == n {
+			*s.ptr(f) = v
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeFlagName lowercases and strips a leading \ or $ so IMAP and JMAP
+// spellings of the same flag compare equal.
+func normalizeFlagName(name string) string {
+	n := ""
+	for _, r := range name {
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		n += string(r)
+	}
+	for len(n) > 0 && (n[0] == '\\' || n[0] == '$') {
+		n = n[1:]
+	}
+	return n
+}
+
 // Annotation is an IMAP METADATA (RFC 5464) entry: a per-mailbox or server-level
 // (MailboxID=0) key/value. Value is nil when the entry is absent.
 type Annotation struct {

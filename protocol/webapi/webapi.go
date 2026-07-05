@@ -414,26 +414,7 @@ func (s *Server) messageFlags(ctx context.Context, a authCtx, body []byte, add b
 // --- helpers ---
 
 func flagList(m store.Message) []string {
-	var f []string
-	if m.Seen {
-		f = append(f, `\Seen`)
-	}
-	if m.Answered {
-		f = append(f, `\Answered`)
-	}
-	if m.Flagged {
-		f = append(f, `\Flagged`)
-	}
-	if m.Draft {
-		f = append(f, `\Draft`)
-	}
-	if m.Deleted {
-		f = append(f, `\Deleted`)
-	}
-	if m.Junk {
-		f = append(f, `$Junk`)
-	}
-	f = append(f, m.Keywords...)
+	f := m.Flags.IMAPFlags(m.Keywords)
 	if f == nil {
 		f = []string{}
 	}
@@ -441,22 +422,9 @@ func flagList(m store.Message) []string {
 }
 
 func setFlag(m *store.Message, name string, v bool) {
-	switch strings.ToLower(name) {
-	case `\seen`:
-		m.Seen = v
-	case `\answered`:
-		m.Answered = v
-	case `\flagged`:
-		m.Flagged = v
-	case `\draft`:
-		m.Draft = v
-	case `\deleted`:
-		m.Deleted = v
-	case `$junk`, `\junk`:
-		m.Junk = v
-	case `$notjunk`, `\notjunk`:
-		m.Notjunk = v
-	}
+	// Canonical parser: sets a known system flag (\Seen, $Junk, ...); unknown
+	// names are ignored here (this endpoint does not manage free-form keywords).
+	m.Flags.SetByName(name, v)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

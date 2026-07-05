@@ -139,30 +139,17 @@ func parseFlagList(s string) []string {
 // applyFlags mutates m's flags per the STORE op (FLAGS/+FLAGS/-FLAGS).
 func applyFlags(m *store.Message, op string, flags []string) {
 	set := func(name string, v bool) {
-		switch strings.ToLower(name) {
-		case `\seen`:
-			m.Seen = v
-		case `\answered`:
-			m.Answered = v
-		case `\flagged`:
-			m.Flagged = v
-		case `\deleted`:
-			m.Deleted = v
-		case `\draft`:
-			m.Draft = v
-		case `$junk`, `\junk`:
-			m.Junk = v
-		case `$notjunk`, `\notjunk`:
-			m.Notjunk = v
-		default:
-			// keyword
-			if v {
-				if !contains(m.Keywords, name) {
-					m.Keywords = append(m.Keywords, name)
-				}
-			} else {
-				m.Keywords = remove(m.Keywords, name)
+		// Canonical parser handles system flags (\Seen, $Junk, ...); anything else
+		// is a free-form IMAP keyword tracked on the message.
+		if m.Flags.SetByName(name, v) {
+			return
+		}
+		if v {
+			if !contains(m.Keywords, name) {
+				m.Keywords = append(m.Keywords, name)
 			}
+		} else {
+			m.Keywords = remove(m.Keywords, name)
 		}
 	}
 	switch op {

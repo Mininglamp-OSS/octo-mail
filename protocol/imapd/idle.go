@@ -84,21 +84,5 @@ func (c *conn) pushChanges(changes []store.Change) {
 }
 
 func flagsToStrings(f store.Flags, kw []string) []string {
-	var out []string
-	if f.Seen {
-		out = append(out, `\Seen`)
-	}
-	if f.Answered {
-		out = append(out, `\Answered`)
-	}
-	if f.Flagged {
-		out = append(out, `\Flagged`)
-	}
-	if f.Deleted {
-		out = append(out, `\Deleted`)
-	}
-	if f.Draft {
-		out = append(out, `\Draft`)
-	}
-	return append(out, kw...)
+	return f.IMAPFlags(kw)
 }
