@@ -63,6 +63,13 @@ services:
       # Enforce DMARC so the security-posture default is exercised in acceptance.
       OCTO_MAIL_REJECT_DMARC: "1"
       OCTO_MAIL_NODE_ID: "e2e-node-1"
+    # Loopback MX for the test domains: outbound delivery to acme.test/other.test
+    # (no real DNS) resolves to this container itself, so a send goes out via SMTP
+    # and comes back into our own MX — a full send->receive round trip locally.
+    extra_hosts:
+      - "acme.test:127.0.0.1"
+      - "other.test:127.0.0.1"
+      - "mail.octo-mail.test:127.0.0.1"
     ports:
       - "2525:25"     # SMTP MX
       - "5587:587"    # SMTP submission
