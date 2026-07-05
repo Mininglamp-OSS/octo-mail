@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>octo-mail webmail</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; color: #222; }
+  header { background: #2a5db0; color: #fff; padding: 10px 16px; font-weight: 600; }
+  .pane { padding: 16px; }
+  input, textarea { display: block; margin: 6px 0; padding: 6px; width: 320px; max-width: 90%; }
+  button { padding: 6px 14px; cursor: pointer; }
+  .row { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+  .row:hover { background: #f4f7fd; }
+  #reader { border: 1px solid #ddd; padding: 12px; margin-top: 12px; }
+  #reader-body { white-space: pre-wrap; }
+  .status { color: #b00; min-height: 1em; }
+  fieldset { border: 1px solid #ddd; margin: 12px 0; max-width: 400px; }
+  h3 { margin: 6px 0; }
+</style>
+</head>
+<body>
+<header>octo-mail webmail</header>
+
+<div id="login-view" class="pane">
+  <h3>Sign in</h3>
+  <input id="user" type="text" placeholder="you@example.com" autocomplete="username">
+  <input id="pass" type="password" placeholder="password" autocomplete="current-password">
+  <button id="login-btn">Sign in</button>
+  <div id="login-status" class="status"></div>
+</div>
+
+<div id="mail-view" class="pane" style="display:none">
+  <button id="refresh-btn">Refresh inbox</button>
+  <h3>Inbox</h3>
+  <div id="list">loading…</div>
+
+  <div id="reader" style="display:none">
+    <h3 id="reader-subject"></h3>
+    <div id="reader-body"></div>
+  </div>
+
+  <fieldset>
+    <legend>Compose</legend>
+    <input id="to" type="text" placeholder="to@example.com">
+    <input id="subject" type="text" placeholder="Subject">
+    <textarea id="compose-body" rows="5" placeholder="Message…"></textarea>
+    <button id="send-btn">Send</button>
+    <div id="send-status" class="status"></div>
+  </fieldset>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

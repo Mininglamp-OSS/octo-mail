@@ -1,0 +1,26 @@
+octo-mail
+Copyright 2026 The octo-mail Authors
+
+This product includes software developed as part of the octo-mail project,
+licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+------------------------------------------------------------------------------
+Third-party software
+------------------------------------------------------------------------------
+
+octo-mail vendors its Go module dependencies under vendor/. Each vendored
+module retains its own upstream license file (LICENSE / NOTICE) in its
+directory under vendor/; those license terms govern the corresponding code and
+are distributed with this repository.
+
+Notably, octo-mail reuses the pure-protocol libraries of mox
+(github.com/mjl-/mox) as an unmodified library dependency. mox is dual-licensed
+under the MIT License and the Mozilla Public License 2.0; octo-mail uses it
+under the terms of the MIT License. See:
+
+  vendor/github.com/mjl-/mox/LICENSE.MIT
+    Copyright 2021 Mechiel Lukkien <mechiel@ueber.net>
+
+For a full inventory of vendored modules and their licenses, see the license
+files under vendor/ (e.g. `find vendor -iname 'LICENSE*' -o -iname 'NOTICE*'`)
+or run `go mod download -x` / inspect go.mod.

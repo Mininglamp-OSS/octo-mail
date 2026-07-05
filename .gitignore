@@ -1,0 +1,15 @@
+# Build / test artifacts
+/cover.html
+*.test
+
+# Local-only Go workspace (for mox co-development; not part of the build)
+/go.work
+/go.work.sum
+
+# Runtime data directories (created by cmd/octo-mail defaults & tests)
+/blobs/
+/junk/
+/acme/
+
+# Editor / OS
+.DS_Store

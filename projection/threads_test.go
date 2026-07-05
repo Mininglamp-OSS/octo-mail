@@ -1,0 +1,147 @@
+package projection_test
+
+import (
+	"context"
+	"io"
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-mail/core/store"
+	"github.com/Mininglamp-OSS/octo-mail/projection"
+	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
+	"github.com/Mininglamp-OSS/octo-mail/storage/postgres"
+	"github.com/mjl-/mox/smtp"
+)
+
+const testDSN = "postgres://octo_mail:octo_mail@localhost:55432/octo_mail"
+
+func mem(s string) store.BlobReader {
+	return &memBlob{data: []byte(s)}
+}
+
+type memBlob struct {
+	data []byte
+	off  int64
+}
+
+func (m *memBlob) Read(p []byte) (int, error) {
+	if m.off >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.data[m.off:])
+	m.off += int64(n)
+	return n, nil
+}
+func (m *memBlob) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+func (m *memBlob) Size() int64  { return int64(len(m.data)) }
+func (m *memBlob) Close() error { return nil }
+
+// TestThreadingProjectionAndRebuild proves threading is an async, rebuildable
+// fold: a reply chain (root + two replies via In-Reply-To/References) collapses
+// to a single thread_id, an unrelated message gets its own, and rebuilding from
+// zero reproduces the identical grouping.
+func TestThreadingProjectionAndRebuild(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, fts, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	if err := s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool.QueryRow(ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, tenantID).Scan(&accID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool.QueryRow(ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, tenantID).Scan(&domID); err != nil {
+		t.Fatal(err)
+	}
+	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+
+	dir := s.NewDirectory()
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, err := dir.ResolveInbound(ctx, addr.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A 3-message conversation, plus one unrelated message.
+	root := "Message-ID: <root@example.com>\r\nSubject: hello\r\n\r\nroot body\r\n"
+	reply1 := "Message-ID: <r1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\nSubject: Re: hello\r\n\r\nreply one\r\n"
+	reply2 := "Message-ID: <r2@example.com>\r\nIn-Reply-To: <r1@example.com>\r\nReferences: <root@example.com> <r1@example.com>\r\nSubject: Re: hello\r\n\r\nreply two\r\n"
+	unrelated := "Message-ID: <other@example.com>\r\nSubject: different\r\n\r\nnot in thread\r\n"
+	for _, raw := range []string{root, reply1, reply2, unrelated} {
+		if _, err := target.Deliver(ctx, &store.Message{}, mem(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 10}
+	if err := w.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatalf("thread drain: %v", err)
+	}
+
+	// The three-message conversation must share one thread_id; unrelated differs.
+	threadIDs := func() (conv []int64, other int64) {
+		rows, err := s.Pool.Query(ctx, `SELECT id, thread_id FROM messages WHERE account_id=$1 ORDER BY id`, accID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var ids, threads []int64
+		for rows.Next() {
+			var id int64
+			var th *int64
+			if err := rows.Scan(&id, &th); err != nil {
+				t.Fatal(err)
+			}
+			if th == nil {
+				t.Fatalf("message %d has NULL thread_id after threading", id)
+			}
+			ids = append(ids, id)
+			threads = append(threads, *th)
+		}
+		// ids[0..2] are the conversation (delivery order), ids[3] is unrelated.
+		return threads[:3], threads[3]
+	}
+	conv, other := threadIDs()
+	if conv[0] != conv[1] || conv[1] != conv[2] {
+		t.Fatalf("conversation did not collapse to one thread: %v", conv)
+	}
+	if other == conv[0] {
+		t.Fatalf("unrelated message joined the conversation thread (%d)", other)
+	}
+	firstThread := conv[0]
+
+	// Rebuild from zero reproduces the identical grouping.
+	if err := w.RebuildAccount(ctx, tenantID, accID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	conv2, other2 := threadIDs()
+	if conv2[0] != conv2[1] || conv2[1] != conv2[2] {
+		t.Fatalf("after rebuild, conversation not one thread: %v", conv2)
+	}
+	if conv2[0] != firstThread {
+		t.Fatalf("rebuild produced different thread_id: %d != %d (fold must be deterministic)", conv2[0], firstThread)
+	}
+	if other2 == conv2[0] {
+		t.Fatalf("after rebuild, unrelated joined conversation")
+	}
+	t.Logf("OK: reply chain collapsed to thread %d; unrelated separate; rebuild-from-zero identical", firstThread)
+}
