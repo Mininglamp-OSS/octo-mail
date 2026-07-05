@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -86,7 +87,21 @@ func (s *subscriber) advance(seq store.ModSeq) {
 
 // Open connects to Postgres, applies the schema, and returns a Store.
 func Open(ctx context.Context, dsn string, bs blob.Store) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parsing postgres dsn: %w", err)
+	}
+	// Detect dead connections promptly. Without this, a partitioned leadership
+	// connection relies on OS TCP defaults (often minutes) before it notices the
+	// backend is gone — widening the leader-election handoff window. A short
+	// TCP keepalive plus periodic pool health checks bound that detection to
+	// seconds; the authoritative liveness signal is still the advisory lock
+	// (see ops/ha.Leader.IsLeader), this just makes the client side timely.
+	cfg.ConnConfig.RuntimeParams["tcp_keepalives_idle"] = "10"
+	cfg.ConnConfig.RuntimeParams["tcp_keepalives_interval"] = "5"
+	cfg.ConnConfig.RuntimeParams["tcp_keepalives_count"] = "3"
+	cfg.HealthCheckPeriod = 15 * time.Second
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to postgres: %w", err)
 	}

@@ -63,6 +63,16 @@ func TestLeaderElection(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Split-brain guard: A's own IsLeader must now report false. PostgreSQL
+	// released A's advisory lock when its backend died; IsLeader verifies lock
+	// ownership server-side (pg_locks for our backend), so it detects the loss
+	// even though a naive client-side Ping to a fresh pooled connection would
+	// still succeed. This is the window that would otherwise let A and B both
+	// believe they lead.
+	if a.IsLeader(ctx) {
+		t.Fatalf("crashed leader A still reports IsLeader after its backend was terminated (split-brain window)")
+	}
+
 	// B retries and now acquires leadership (automatic failover).
 	acquired := false
 	for i := 0; i < 100; i++ {

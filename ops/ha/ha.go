@@ -63,13 +63,27 @@ func (l *Leader) TryAcquire(ctx context.Context) (bool, error) {
 // 0 when not leader. Exposed so operators/tests can observe or terminate it.
 func (l *Leader) BackendPID() int32 { return l.pid }
 
-// IsLeader reports whether this node currently holds leadership. It verifies the
-// held connection is still alive (a dropped connection means leadership was lost).
+// IsLeader reports whether this node currently holds leadership. It verifies, on
+// the dedicated leadership connection itself, that the advisory lock is STILL
+// held by this backend — not merely that the connection is reachable. A plain
+// Ping only detects this node's own TCP dropping; it cannot detect the case
+// where PostgreSQL released the lock (e.g. the backend was terminated
+// server-side) while the socket still answers. Querying pg_locks for an advisory
+// lock owned by our own backend closes that split-brain window: if the lock is
+// gone, we are no longer leader even if the connection is fine. The check is
+// non-mutating (unlike a re-entrant pg_try_advisory_lock probe, which could
+// spuriously acquire-then-release a freed lock).
 func (l *Leader) IsLeader(ctx context.Context) bool {
 	if l.conn == nil {
 		return false
 	}
-	if err := l.conn.Ping(ctx); err != nil {
+	// This dedicated connection holds nothing but the leadership advisory lock, so
+	// "our backend still holds an advisory lock" is equivalent to "we are leader".
+	var held bool
+	err := l.conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid())`,
+	).Scan(&held)
+	if err != nil || !held {
 		l.conn.Release()
 		l.conn = nil
 		return false
