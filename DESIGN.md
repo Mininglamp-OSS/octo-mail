@@ -1,105 +1,115 @@
 ---
 version: alpha
-name: octo-mail — Ink & Tide
+name: octo-mail — Monochrome
 description: >-
   The visual identity for octo-mail's product surfaces (webmail and any future
-  UI). A calm, tool-grade system: teal "tide" accents over slate "ink" neutrals,
-  a 4px spacing grid, and monospace for machine metadata. Light-first with an
-  automatic dark mapping via prefers-color-scheme.
+  UI). An enterprise-grade, near-achromatic system: a neutral zinc ramp does all
+  the layout work, and emphasis is carried by near-black / near-white fills,
+  type weight, and contrast — not by hue. Compact information density.
+  Light-first with an automatic dark mapping via prefers-color-scheme.
 
 colors:
-  # Brand
-  primary:        "#0d7d76"   # teal — actions, active state, links
-  primary-strong: "#0a615c"   # hover/pressed accent
-  primary-soft:   "#128f87"   # lighter accent for gradients
-  primary-ghost:  "#e2f1ef"   # tinted accent wash (focus ring, active row)
-  on-primary:     "#ffffff"   # text/icon on a primary fill
-  danger:         "#b4453a"   # errors, junk, destructive
-  danger-ghost:   "#f6e6e4"
+  # Emphasis — the "accent" is contrast, not color. Near-black in light,
+  # near-white in dark; on-accent flips accordingly. `primary` and `accent` are
+  # the same near-black ink (primary is the canonical name; accent reads better
+  # in prose).
+  primary:        "#18181b"   # primary interactive color (= accent)
+  accent:         "#18181b"   # primary fills, active state, focus, unread dot
+  accent-strong:  "#000000"   # hover/pressed
+  on-accent:      "#ffffff"   # text/icon on an accent fill
+  focus:          "#18181b"   # keyboard focus ring
+
+  # Functional (used narrowly)
+  danger:         "#c0392b"   # errors, junk, send failure
+  danger-ghost:   "#fbecea"
 
   # Surfaces (low -> high elevation)
-  bg:             "#eef1f4"   # app background
-  bg-sunken:      "#e7ebef"   # sidebar, inputs
+  bg:             "#fafafa"   # app canvas
+  bg-sunken:      "#f4f4f5"   # sidebar, inputs
   bg-panel:       "#ffffff"   # list & reader panels, cards, modals
-  bg-hover:       "#eef4f3"   # row/nav hover
-  bg-active:      "#dcefec"   # selected row/nav tint
+  bg-hover:       "#f4f4f5"   # row/nav hover
+  bg-active:      "#efeff1"   # selected row/nav (neutral, not tinted)
 
   # Lines
-  border:         "#e4e8ec"   # standard hairline
-  border-soft:    "#edf0f3"   # inner list dividers
-  border-strong:  "#ccd3d9"   # modal edge, scrollbar thumb
+  border:         "#ececee"
+  border-soft:    "#f2f2f3"
+  border-strong:  "#d9d9dd"
 
-  # Text (high -> low emphasis)
-  text:           "#16262c"   # primary
-  text-soft:      "#566871"   # secondary
-  text-faint:     "#859399"   # tertiary / metadata
+  # Text (high -> low emphasis) — pure neutral ramp
+  text:           "#0a0a0b"
+  text-soft:      "#5c5c66"
+  text-faint:     "#9a9aa4"
+
+  # Neutral avatar (no hue)
+  avatar-bg:      "#e6e6e9"
+  avatar-fg:      "#52525b"
 
   # Dark theme (applied under prefers-color-scheme: dark)
-  dark-primary:        "#2bb3a8"
-  dark-primary-strong: "#52ccc1"
-  dark-primary-ghost:  "#123330"
-  dark-on-primary:     "#06201e"
-  dark-bg:             "#0d1417"
-  dark-bg-sunken:      "#0a1013"
-  dark-bg-panel:       "#141d21"
-  dark-bg-hover:       "#1a262b"
-  dark-bg-active:      "#143430"
-  dark-border:         "#222d33"
-  dark-border-strong:  "#33434b"
-  dark-text:           "#e8eef1"
-  dark-text-soft:      "#a3b3ba"
-  dark-text-faint:     "#6a7b83"
+  dark-accent:        "#fafafa"
+  dark-accent-strong: "#ffffff"
+  dark-on-accent:     "#0a0a0b"
+  dark-focus:         "#d4d4d8"
+  dark-bg:            "#0a0a0b"
+  dark-bg-sunken:     "#0d0d0f"
+  dark-bg-panel:      "#121214"
+  dark-bg-hover:      "#19191c"
+  dark-bg-active:     "#202024"
+  dark-border:        "#222226"
+  dark-border-strong: "#34343a"
+  dark-text:          "#fafafa"
+  dark-text-soft:     "#a1a1aa"
+  dark-text-faint:    "#6b6b74"
+  dark-avatar-bg:     "#26262b"
+  dark-avatar-fg:     "#b0b0ba"
 
 typography:
-  # Families
   fontFamilyUI:   'ui-sans-serif, -apple-system, "Segoe UI", system-ui, "Helvetica Neue", sans-serif'
   fontFamilyMono: 'ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace'
 
-  # Scale (used across the UI)
-  display:
+  display:      # reader subject headline
     fontFamily: "{typography.fontFamilyUI}"
-    fontSize: "22px"
-    fontWeight: 700
-    lineHeight: 1.28
-    letterSpacing: "-0.02em"
-  title:
-    fontFamily: "{typography.fontFamilyUI}"
-    fontSize: "17px"
-    fontWeight: 700
+    fontSize: "19px"
+    fontWeight: 680
     lineHeight: 1.3
     letterSpacing: "-0.02em"
-  body:
+  title:        # pane headers ("Inbox")
     fontFamily: "{typography.fontFamilyUI}"
-    fontSize: "14px"
+    fontSize: "15px"
+    fontWeight: 680
+    lineHeight: 1.3
+    letterSpacing: "-0.02em"
+  body:         # base UI text
+    fontFamily: "{typography.fontFamilyUI}"
+    fontSize: "13px"
     fontWeight: 400
     lineHeight: 1.5
-  body-read:
-    fontFamily: "{typography.fontFamilyUI}"
-    fontSize: "14.5px"
-    fontWeight: 400
-    lineHeight: 1.72
-  emphasis:
+  body-read:    # reading pane
     fontFamily: "{typography.fontFamilyUI}"
     fontSize: "13.5px"
-    fontWeight: 720
-    lineHeight: 1.4
-  label-caps:
+    fontWeight: 400
+    lineHeight: 1.7
+  emphasis:     # unread sender/subject + button labels
     fontFamily: "{typography.fontFamilyUI}"
-    fontSize: "10.5px"
+    fontSize: "13px"
     fontWeight: 700
     lineHeight: 1.4
-    letterSpacing: "0.06em"
-  meta:
+  label-caps:   # form labels, "MAILBOXES"
+    fontFamily: "{typography.fontFamilyUI}"
+    fontSize: "10px"
+    fontWeight: 650
+    lineHeight: 1.4
+    letterSpacing: "0.05em"
+  meta:         # timestamps, addresses, counts, status
     fontFamily: "{typography.fontFamilyMono}"
-    fontSize: "10.5px"
+    fontSize: "10px"
     fontWeight: 400
     lineHeight: 1.4
 
 rounded:
-  xs:   "5px"
-  sm:   "8px"
-  md:   "11px"
-  lg:   "16px"
+  xs:   "4px"
+  sm:   "6px"
+  md:   "9px"
+  lg:   "13px"
   pill: "999px"
 
 spacing:
@@ -111,32 +121,32 @@ spacing:
   s5: "20px"
   s6: "24px"
   s8: "32px"
-  sidebar-width: "244px"
-  list-width: "372px"
+  sidebar-width: "212px"
+  list-width: "344px"
 
 components:
-  button-primary:
-    backgroundColor: "{colors.primary}"
-    textColor: "{colors.on-primary}"
+  button-primary:      # the single strong action per view
+    backgroundColor: "{colors.accent}"
+    textColor: "{colors.on-accent}"
     rounded: "{rounded.sm}"
-    padding: "11px 22px"
+    padding: "9px 20px"
     typography: "{typography.emphasis}"
   button-primary-hover:
-    backgroundColor: "{colors.primary-strong}"
-    textColor: "{colors.on-primary}"
+    backgroundColor: "{colors.accent-strong}"
+    textColor: "{colors.on-accent}"
   button-ghost:
     backgroundColor: "transparent"
     textColor: "{colors.text-soft}"
     rounded: "{rounded.sm}"
-    padding: "10px 16px"
+    padding: "9px 14px"
   button-ghost-hover:
     backgroundColor: "{colors.bg-hover}"
     textColor: "{colors.text}"
   input:
-    backgroundColor: "{colors.bg-sunken}"
+    backgroundColor: "{colors.bg-panel}"
     textColor: "{colors.text}"
     rounded: "{rounded.sm}"
-    padding: "10px 12px"
+    padding: "9px 11px"
   input-focus:
     backgroundColor: "{colors.bg-panel}"
     textColor: "{colors.text}"
@@ -144,10 +154,10 @@ components:
     backgroundColor: "transparent"
     textColor: "{colors.text-soft}"
     rounded: "{rounded.sm}"
-    padding: "9px 12px"
+    padding: "6px 8px"
   nav-item-active:
     backgroundColor: "{colors.bg-active}"
-    textColor: "{colors.primary-strong}"
+    textColor: "{colors.text}"
   card:
     backgroundColor: "{colors.bg-panel}"
     textColor: "{colors.text}"
@@ -156,167 +166,168 @@ components:
   message-row:
     backgroundColor: "{colors.bg-panel}"
     textColor: "{colors.text}"
-    padding: "13px 20px 13px 16px"
+    padding: "8px 16px 8px 12px"
   message-row-active:
     backgroundColor: "{colors.bg-active}"
     textColor: "{colors.text}"
 ---
 
-# octo-mail — Ink & Tide
+# octo-mail — Monochrome
 
 ## Overview
 
 octo-mail is a change-log-centric mail server kernel. Its product surfaces should
-feel like precise, quiet instruments — closer to a well-built developer tool than
-a consumer inbox. The system is named **Ink & Tide**: *ink* is the slate-neutral
-foundation, *tide* is the single teal accent that carries every action and every
-"you are here" signal.
+read like a precise professional instrument — the register of Linear, Vercel, or
+Hey, not a consumer inbox. The system is **Monochrome**: a near-achromatic zinc
+neutral ramp carries the entire interface, and *emphasis is expressed through
+contrast, not hue*.
 
-Two rules give the identity its character:
+Three rules define the identity:
 
-- **One accent, used sparingly.** Teal appears only where the user acts or where
-  the app answers "what's selected / unread / primary." Everything else is
-  neutral. A screen with three teal things is right; a screen with ten is wrong.
+- **The "accent" is near-black (near-white in dark), not a color.** The single
+  strong action per view — Sign in, Compose, Send — is a solid near-black fill.
+  Selection, focus, and the unread dot use the same near-black. There is no brand
+  hue; introducing one would cheapen the result. Color appears only for genuinely
+  functional signals (`danger` for errors/junk).
+- **Density is enterprise-grade.** Rows are compact (~40px), the type scale is
+  small (13px base, 10px metadata), and the panes are narrow so a screen shows
+  ~14+ messages. Whitespace is deliberate, not generous.
 - **Monospace is for machine facts.** Timestamps, addresses, counts, status
-  lines, section labels — anything the *system* asserts rather than a human wrote
-  — is set in the mono family. This is the visual tell that octo-mail is
-  infrastructure, and it keeps prose and metadata legibly distinct.
+  lines, and section labels are set in the mono family — the visual tell that
+  octo-mail is infrastructure, keeping prose and metadata legibly distinct.
 
 The system is **light-first** but ships a full dark mapping applied automatically
-via `prefers-color-scheme: dark`; never hardcode a single theme's literal hex in
-a component — reference tokens so both themes resolve.
+via `prefers-color-scheme: dark`. Never hardcode a single theme's literal hex in
+a component — reference tokens so both themes (and both accent polarities)
+resolve.
 
 ## Colors
 
-The palette is one teal ramp over a cool-slate neutral ramp. Restraint is the
-point: the neutrals do the layout work, the teal does the pointing.
+One neutral ramp, no hue. The neutrals do all the layout and hierarchy work;
+"accent" is simply the darkest ink (or, in dark mode, the lightest).
 
-- **`primary` (#0d7d76)** — the only brand color that touches interactive
-  surfaces: primary buttons, the compose button, active nav/rows, links, focus
-  rings (via `primary-ghost`), and the unread dot. `primary-strong` is its
-  hover/pressed state; `primary-soft` is reserved for the brand-mark gradient.
-- **Surfaces** stack by elevation: `bg` (app) → `bg-sunken` (sidebar, inputs) →
-  `bg-panel` (list, reader, cards, modals). Hover and selection are the tinted
-  `bg-hover` / `bg-active`, never a heavier neutral — selection reads as a *warm
-  teal wash*, not a gray block.
-- **Text** has three emphasis levels only. Use `text` for content, `text-soft`
-  for secondary labels and read (already-seen) rows, `text-faint` for metadata.
-  Do not invent intermediate grays.
-- **`danger`** is used narrowly: sign-in errors, the `junk` tag, send failures.
-  It is never a decorative color.
+- **`accent` (#18181b / dark #fafafa)** — the only strong fill: primary buttons,
+  the active row's left bar, the unread dot, focus rings. `accent-strong` is its
+  hover. Text on an accent fill uses `on-accent`, which flips to dark ink in dark
+  mode so the light fill never glares.
+- **Surfaces** stack by elevation: `bg` (canvas) → `bg-sunken` (sidebar, inputs)
+  → `bg-panel` (list, reader, cards, modals). Hover and selection are the
+  **neutral** `bg-hover` / `bg-active` — a slightly deeper gray, never a colored
+  tint. Selection reads as "one step lifted," reinforced by the near-black
+  accent bar, not by warmth.
+- **Text** has exactly three neutral emphasis levels: `text` for content,
+  `text-soft` for secondary labels and read (already-seen) rows, `text-faint`
+  for metadata. Do not invent intermediate grays.
+- **`danger`** is the only chromatic color, used narrowly: sign-in errors, the
+  `junk` tag, send failures. Never decorative.
+- **Avatars** are neutral (`avatar-bg` / `avatar-fg`) — no gradient, no hue —
+  circles with uppercase initials.
 
-Dark theme is not an inversion — it's a re-grounding. Backgrounds go to deep
-slate (`dark-bg` #0d1417), the accent *brightens* to `dark-primary` (#2bb3a8) so
-it stays legible on dark, and text on a primary fill flips to the dark ink
-`dark-on-primary` rather than white to keep the fill from glaring.
+Dark mode is a re-grounding, not an inversion: backgrounds go to true near-black
+(`dark-bg` #0a0a0b), and the accent becomes near-white so the strongest element
+is still the highest-contrast one.
 
-Contrast targets: body text meets WCAG AA on its surface; `text-faint` is for
-non-essential metadata and is allowed to sit lighter. Accent fills always pair
-with `on-primary` / `dark-on-primary`, not raw white in dark.
+Contrast: body text meets WCAG AA on its surface; `text-faint` is reserved for
+non-essential metadata and may sit lighter. Accent fills always pair with the
+matching `on-accent`.
 
 ## Typography
 
-Two families, one scale. The UI family is the platform's native sans (no web
-font download — the product embeds in a single binary and must render offline);
-the mono family carries all machine metadata.
+Two families, one small scale tuned for density. The UI family is the platform's
+native sans (no web-font download — the product embeds in a single binary and
+must render offline); the mono family carries all machine metadata.
 
-- **`display`** — reader subject headline. Tight tracking, one per screen.
+- **`display`** — reader subject headline, one per screen.
 - **`title`** — pane headers ("Inbox").
-- **`emphasis` (weight 720)** — unread senders/subjects and button labels. The
-  heavy weight is how "unread" is signaled in the list, alongside color.
-- **`body` / `body-read`** — UI text and the message reading pane; the reader
-  uses the taller `body-read` line-height (1.72) for comfortable long reading.
-- **`label-caps`** — uppercase, tracked section labels (form labels, "MAILBOXES").
-- **`meta` (mono)** — timestamps, addresses, counts, the "signed in" status,
-  the sign-in tagline. Always pair with `font-variant-numeric: tabular-nums` so
-  times and counts align.
+- **`emphasis` (weight 700)** — unread senders/subjects and button labels. Weight
+  is the primary "unread" signal, paired with `text` color and the dot.
+- **`body` / `body-read`** — UI text (13px) and the reading pane (13.5px / 1.7).
+- **`label-caps`** — uppercase, tracked section labels.
+- **`meta` (mono)** — timestamps, addresses, counts, "signed in", the sign-in
+  tagline. Always pair with `font-variant-numeric: tabular-nums`.
 
-Read (already-seen) list rows drop to `text-soft` and normal weight; unread rows
-use `text` + `emphasis`. That weight/color shift is the primary read/unread cue;
-the teal dot is the secondary one.
+Read list rows drop to `text-soft` + normal weight; unread rows use `text` +
+`emphasis`. That weight/color shift is the primary read/unread cue; the dot is
+secondary.
 
 ## Layout
 
-The app is a **fixed three-pane shell**: sidebar (`sidebar-width` 244px) ·
-message list (`list-width` 372px) · flexible reader. Below 760px the two left
-panes collapse and the reader takes the full width.
+A **fixed, compact three-pane shell**: sidebar (`sidebar-width` 212px) · message
+list (`list-width` 344px) · flexible reader. Below 720px the two left panes
+collapse and the reader fills the width.
 
-All spacing derives from a **4px grid** (`s1`…`s8`). Compose padding, gaps, and
-margins must snap to these tokens — no ad-hoc `13px`/`18px` values except the
-few intentional optical adjustments already baked into the message-row and
-list-head components. Panels are separated by `border` hairlines, not shadows;
-shadows are reserved for *floating* things (cards, modals).
-
-Content width is capped for readability: the reading pane is `max-width: 74ch`.
+All spacing derives from a **4px grid** (`s1`…`s8`). Rows are tight (8px vertical
+padding, ~40px total) to maximize messages-per-screen; panes are separated by
+`border` hairlines, not shadows. The reading pane caps at `72ch` for legibility.
 
 ## Elevation & Depth
 
-Depth is expressed with three shadow steps and hairline borders, not heavy
-blocks:
+Depth is expressed with hairline borders and three restrained shadow steps — the
+monochrome palette makes heavy shadows look muddy, so they stay subtle:
 
-- **Flat** — panels sit at the same plane, divided by `border`.
-- **`shadow-sm`** — resting buttons and small raised chips.
-- **`shadow-md`** — hover lift on primary buttons.
-- **`shadow-lg`** — the sign-in card and the compose modal (things that float
-  above the app). The compose scrim adds a light `backdrop-blur(2px)`.
+- **Flat** — panels sit coplanar, divided by `border`.
+- **`shadow-sm`** — resting fills (buttons).
+- **`shadow-md`** — hover lift.
+- **`shadow-lg`** — the sign-in card and compose modal (things that float). The
+  compose scrim adds `backdrop-blur(3px)`.
 
-Primary fills carry a 1px inner top highlight (`inset 0 1px 0 rgba(255,255,255,.14)`)
-for a subtle "lit from above" quality. In dark mode shadows deepen rather than
-disappear.
+In dark mode shadows deepen rather than disappear.
 
 ## Shapes
 
-Corners come from the `rounded` scale, matched to element size:
+Corners come from a slightly tightened `rounded` scale (enterprise UIs read
+sharper), matched to element size:
 
-- **`xs` (5px)** — focus-ring rounding, tiny tags.
-- **`sm` (8px)** — the workhorse: buttons, inputs, nav items, message-row
-  affordances.
-- **`md` (11px)** — the brand mark tile.
-- **`lg` (16px)** — cards and the compose modal (top corners only, since it
-  docks to the bottom edge).
-- **`pill` (999px)** — avatars (as circles), nav count badges, scrollbar thumbs.
-
-Avatars are always perfect circles filled with the teal→deep-teal gradient and
-uppercase initials.
+- **`xs` (4px)** — focus rounding, tiny tags.
+- **`sm` (6px)** — the workhorse: buttons, inputs, nav items, rows.
+- **`md` (9px)** — the brand mark tile.
+- **`lg` (13px)** — cards and the compose modal (top corners only; it docks to
+  the bottom edge).
+- **`pill` (999px)** — avatars (circles) and scrollbar thumbs.
 
 ## Components
 
-- **button-primary** — teal fill, `on-primary` text, `sm` radius, inner
-  highlight, `shadow-sm`. Hover → `primary-strong`. This is the only filled
-  button; there is at most one per view (sign-in, compose-open, send).
+- **button-primary** — near-black fill, `on-accent` text, `sm` radius,
+  `shadow-sm`. Hover → `accent-strong`. The only filled button; at most one per
+  view (sign-in, compose-open, send).
 - **button-ghost** — transparent, `text-soft`, hover fills `bg-hover`. Used for
   Discard and all icon buttons (refresh, sign-out, close).
-- **input** — `bg-sunken` fill, `border` hairline; on focus it lifts to
-  `bg-panel`, the border goes `primary`, and a 3px `primary-ghost` ring appears.
+- **input** — `bg-panel` fill, `border-strong` hairline; on focus the border goes
+  `accent` with a faint 3px ring (a low-alpha mix of the accent).
 - **nav-item** — quiet `text-soft` row; hover tints `bg-hover`; active gets the
-  `bg-active` wash + `primary-strong` label + a pill count badge.
-- **message-row** — avatar · (sender + time) · subject · preview, with a left
-  accent bar and `bg-active` tint when selected, and an unread dot (with a
-  surface-matched halo) when unread. Unread uses `emphasis` weight + `text`;
-  read uses normal weight + `text-soft`.
+  neutral `bg-active` + `text` label + a mono count. No colored badge.
+- **message-row** — avatar · (sender + time) · subject · preview, with a
+  near-black left bar and `bg-active` when selected, and a near-black unread dot
+  (with a surface-matched halo) when unread. Unread = `emphasis` weight +
+  `text`; read = normal weight + `text-soft`. Hover previews the bar in a neutral
+  tone; active/focus resolves it to the accent.
 - **card / compose** — `bg-panel`, `lg` radius, `shadow-lg`, float above the app.
 
-Interactive elements show a keyboard-only focus ring (`:focus-visible`), never a
-mouse-click outline. All transitions use a shared `cubic-bezier(.2,.8,.2,1)`
-easing and respect `prefers-reduced-motion`.
+Interactive elements (including the clickable nav items and message rows) are
+keyboard-operable and show a keyboard-only focus ring (`:focus-visible`), never a
+mouse-click outline. Transitions share a `cubic-bezier(.2,.7,.2,1)` easing and
+respect `prefers-reduced-motion`.
 
 ## Do's and Don'ts
 
 **Do**
-- Reference tokens (`{colors.primary}`, `{spacing.s4}`) so light and dark both
-  resolve and the 4px rhythm holds.
-- Keep teal scarce — reserve it for actions and "selected / unread / primary."
+- Reference tokens (`{colors.accent}`, `{spacing.s4}`) so light/dark and both
+  accent polarities resolve and the 4px rhythm holds.
+- Keep the interface neutral — express emphasis with the near-black fill, type
+  weight, and contrast.
 - Set all timestamps, addresses, counts, and status text in the mono family with
   `tabular-nums`.
-- Separate panels with hairline borders; reserve shadows for floating surfaces.
+- Separate panes with hairline borders; reserve shadows for floating surfaces.
 - Signal unread with weight **and** color, not the dot alone.
+- Keep density high: compact rows, small type, narrow panes.
 
 **Don't**
-- Hardcode a theme's literal hex in a component — it will break the other theme.
-- Introduce a second accent hue or a purple/blue gradient; this system is
-  mono-accent teal.
+- Introduce a brand hue, a gradient, or a colored selection tint — this system
+  is monochrome; selection is a neutral step + a near-black bar.
+- Hardcode a theme's literal hex in a component — it will break the other theme
+  or the accent polarity.
 - Invent intermediate grays between the three text levels or the surface steps.
 - Put body copy in the mono family, or metadata in the sans family.
 - Use color as the *only* differentiator for state (pair it with weight, an
-  icon, or the accent bar) — and never rely on a focus style that only shows on
+  icon, or the accent bar), and never rely on a focus style that only shows on
   mouse click.
