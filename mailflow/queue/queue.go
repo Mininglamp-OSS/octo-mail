@@ -214,6 +214,39 @@ func (w *Worker) lease() time.Duration {
 	}
 	return w.Lease
 }
+
+// deliveryTimeout bounds a single delivery so it cannot run past the lease
+// window (after which another node may reclaim and re-send the message). It is
+// the lease minus a safety margin for DB/node clock skew and the retire round
+// trip — a delivery that would exceed this is aborted and rescheduled rather
+// than risk a double-send.
+func (w *Worker) deliveryTimeout() time.Duration {
+	lease := w.lease()
+	margin := lease / 5 // 20% headroom
+	if margin < time.Second {
+		margin = time.Second
+	}
+	if margin >= lease {
+		return lease
+	}
+	return lease - margin
+}
+
+// renewLease resets this message's lease to a fresh full window, but only if
+// this node still holds it (leased_by = NodeID and not yet expired). It returns
+// held=false when the lease was lost to another node, signaling the caller to
+// skip delivery. This makes each message in a batch deliver on its own full
+// window instead of the shared, eroding window from the initial claim.
+func (w *Worker) renewLease(ctx context.Context, m Msg) (held bool, err error) {
+	tag, err := w.Pool.Exec(ctx,
+		`UPDATE queue SET lease_until=now()+$3::interval
+		 WHERE id=$1 AND leased_by=$2 AND lease_until > now()`,
+		m.ID, w.NodeID, w.lease().String())
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
 func (w *Worker) batch() int {
 	if w.Batch == 0 {
 		return 10
@@ -246,9 +279,33 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	// attempts incremented, and would otherwise sit stranded until lease expiry).
 	var firstErr error
 	for _, m := range msgs {
+		// Renew this message's lease to a fresh full window immediately before
+		// delivering it. The batch was leased together in claim(), so without
+		// renewal the Nth message would deliver on a lease already eroded by the
+		// N-1 deliveries ahead of it. If renewal shows we no longer hold the lease
+		// (a slow tick let it expire and another node reclaimed the row), skip
+		// delivery — that node now owns the outcome, and delivering here would be
+		// the double-send we are preventing.
+		held, rerr := w.renewLease(ctx, m)
+		if rerr != nil {
+			if firstErr == nil {
+				firstErr = rerr
+			}
+			continue
+		}
+		if !held {
+			continue
+		}
+
+		// Bound the delivery to strictly less than the lease window so this node
+		// stops transmitting before lease_until can pass and another node reclaim
+		// the row. The margin absorbs clock skew between the DB (which stamps
+		// lease_until via now()) and this node (which enforces the timeout).
+		dctx, cancel := context.WithTimeout(ctx, w.deliveryTimeout())
 		start := time.Now()
-		derr := w.Deliver(ctx, m)
+		derr := w.Deliver(dctx, m)
 		dur := time.Since(start)
+		cancel()
 		if w.ObserveDelivery != nil {
 			result := "ok"
 			if derr != nil {
