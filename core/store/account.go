@@ -40,15 +40,12 @@ type BlobReader interface {
 // an InboundTarget), never by global name — this is what makes tenant isolation
 // structural rather than a per-query discipline.
 //
-// The method set is exactly what the reused protocol handlers call. WithWLock
-// serializes writers for the account; on the Postgres backend it acquires a
-// transaction-scoped advisory lock so serialization holds across stateless nodes.
+// The method set is exactly what the reused protocol handlers call. Writer
+// serialization for an account is provided by Tx, which on the Postgres backend
+// takes a transaction-scoped advisory lock so ordering holds across stateless
+// nodes; there is no separate in-process lock to acquire.
 type Account interface {
 	ID() int64
-
-	// WithWLock/WithRLock run fn under the account's write/read lock.
-	WithWLock(fn func())
-	WithRLock(fn func())
 
 	// Tx runs fn in a database transaction (read-write). The advisory writer
 	// lock is taken inside write transactions.

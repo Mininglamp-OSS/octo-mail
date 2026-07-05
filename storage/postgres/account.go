@@ -26,11 +26,6 @@ type account struct {
 func (a *account) ID() int64    { return a.id }
 func (a *account) Close() error { return nil }
 
-// WithWLock/WithRLock satisfy the protocol interface. Cross-node serialization
-// is the advisory lock inside Tx; these just run fn.
-func (a *account) WithWLock(fn func()) { fn() }
-func (a *account) WithRLock(fn func()) { fn() }
-
 // pgTx is the store.Tx implementation: a live pgx transaction plus the write
 // state (accumulated changelog entries and the running modseq head).
 type pgTx struct {
