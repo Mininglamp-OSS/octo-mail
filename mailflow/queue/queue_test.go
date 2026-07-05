@@ -76,13 +76,20 @@ func TestLeaseFailover(t *testing.T) {
 	// RunOnce's retire path — instead use a Deliverer that panics-as-crash by
 	// just not being reachable). Simplest faithful model: node A claims via a raw
 	// short-lease worker whose Deliver hangs; we abandon it.
+	claimed := make(chan struct{})
+	aCtx, aCancel := context.WithCancel(ctx)
 	nodeA := &queue.Worker{
 		Pool: p, NodeID: "nodeA", Lease: 500 * time.Millisecond, Batch: 1,
-		Deliver: func(ctx context.Context, m queue.Msg) error {
-			// Simulate a crashed node: block until the test ends so node A never
-			// runs its own retire/reschedule and interferes with B's reclaim.
-			<-ctx.Done()
-			return ctx.Err()
+		Deliver: func(dctx context.Context, m queue.Msg) error {
+			// Signal that A has claimed and is now delivering, then block until A's
+			// context is cancelled — modeling the process dying mid-delivery. A
+			// dead node runs no retire/reschedule that lands, so the lease simply
+			// expires and B reclaims. (Blocking forever is no longer a faithful
+			// crash model: deliveries are now time-bounded, so a hung delivery
+			// would legitimately time out and reschedule.)
+			close(claimed)
+			<-aCtx.Done()
+			return aCtx.Err()
 		},
 	}
 
@@ -97,11 +104,17 @@ func TestLeaseFailover(t *testing.T) {
 		},
 	}
 
-	// Node A claims (and will be stuck delivering past its lease).
-	go func() { _, _ = nodeA.RunOnce(ctx) }()
-	time.Sleep(200 * time.Millisecond) // let A claim
+	// Node A claims (and will "crash" mid-delivery).
+	go func() { _, _ = nodeA.RunOnce(aCtx) }()
+	// Wait until A has actually claimed the message and entered delivery, so the
+	// next assertion is deterministic regardless of scheduler/CPU load.
+	select {
+	case <-claimed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("node A never claimed the message")
+	}
 
-	// Immediately, node B should find nothing due (A holds a fresh lease).
+	// Node B should find nothing due (A holds a fresh 500ms lease).
 	n, err := nodeB.RunOnce(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +122,10 @@ func TestLeaseFailover(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("node B claimed %d while A held a live lease; want 0", n)
 	}
+
+	// A "crashes": cancel its context so it stops without rescheduling. Its lease
+	// (500ms) will simply expire, after which B reclaims.
+	aCancel()
 
 	// Wait for A's lease to expire, then B reclaims and delivers.
 	time.Sleep(700 * time.Millisecond)
