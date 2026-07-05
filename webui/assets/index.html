@@ -321,6 +321,19 @@
     font-size: 13.5px; line-height: 1.7; color: var(--text);
     max-width: 72ch;
   }
+  /* Rendered HTML message bodies: normal flow (not pre-wrap), tuned to the system. */
+  .reader-body.is-html { white-space: normal; }
+  .reader-body.is-html img { max-width: 100%; height: auto; }
+  .reader-body.is-html a { color: var(--text); text-underline-offset: 2px; }
+  .reader-body.is-html h1, .reader-body.is-html h2, .reader-body.is-html h3 { line-height: 1.3; letter-spacing: -.01em; margin: 1.1em 0 .5em; }
+  .reader-body.is-html p { margin: 0 0 .8em; }
+  .reader-body.is-html ul, .reader-body.is-html ol { margin: 0 0 .8em; padding-left: 1.4em; }
+  .reader-body.is-html blockquote { margin: 0 0 .8em; padding-left: var(--s3); border-left: 2px solid var(--border-strong); color: var(--text-soft); }
+  .reader-body.is-html pre, .reader-body.is-html code { font-family: var(--font-mono); font-size: 12.5px; }
+  .reader-body.is-html pre { background: var(--bg-sunken); padding: var(--s3); border-radius: var(--r-sm); overflow-x: auto; }
+  .reader-body.is-html table { border-collapse: collapse; max-width: 100%; }
+  .reader-body.is-html td, .reader-body.is-html th { border: 1px solid var(--border); padding: 4px 8px; }
+  .reader-body.is-html hr { border: none; border-top: 1px solid var(--border); margin: var(--s4) 0; }
 
   /* Compose modal */
   .modal-scrim {

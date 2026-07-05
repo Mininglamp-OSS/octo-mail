@@ -9,6 +9,7 @@ interface JmapResponse {
 }
 interface Mailbox { id: string; name: string; role: string | null; totalEmails?: number; unreadEmails?: number }
 interface Addr { name?: string; email?: string }
+interface BodyPart { partId?: string; type?: string; size?: number; subParts?: BodyPart[] }
 interface Email {
 	id: string
 	subject?: string
@@ -18,6 +19,7 @@ interface Email {
 	receivedAt?: string
 	keywords?: { [k: string]: boolean }
 	bodyValues?: { [k: string]: { value: string } }
+	bodyStructure?: BodyPart
 }
 
 let authHeader = ''
@@ -296,14 +298,11 @@ async function openMessage(id: string): Promise<void> {
 	currentEmailId = id
 	const g = await jmap('Email/get', {
 		accountId, ids: [id],
-		properties: ['subject', 'from', 'to', 'preview', 'receivedAt', 'bodyValues', 'textBody'],
-		fetchTextBodyValues: true,
+		properties: ['subject', 'from', 'to', 'preview', 'receivedAt', 'bodyStructure', 'bodyValues'],
+		fetchAllBodyValues: true,
 	})
 	const em: Email = (g.list || [])[0]
 	if (!em) return
-	let body = ''
-	if (em.bodyValues) for (const k of Object.keys(em.bodyValues)) body += em.bodyValues[k].value
-	if (!body) body = em.preview || '(no text content)'
 	const from = (em.from && em.from[0]) ? em.from[0] : undefined
 	$('reader-empty').style.display = 'none'
 	$('reader').style.display = 'flex'
@@ -314,7 +313,62 @@ async function openMessage(id: string): Promise<void> {
 	const to = (em.to || []).map(a => a.email || displayName(a)).join(', ')
 	$('reader-date').textContent = absTime(em.receivedAt)
 	$('reader-rcpt').textContent = to ? 'to ' + to : ''
-	$('reader-body').textContent = body
+	renderBody(em)
+}
+
+// renderBody chooses the best body part and renders it: the text/html part
+// (sanitized) is preferred, falling back to the text/plain part as escaped text.
+// This is how a multipart/alternative message shows as formatted HTML instead of
+// raw markup.
+function renderBody(em: Email): void {
+	const el = $('reader-body')
+	const parts = collectLeafParts(em.bodyStructure)
+	const values = em.bodyValues || {}
+	const htmlPart = parts.find(p => p.type === 'text/html' && p.partId && values[p.partId])
+	const textPart = parts.find(p => p.type === 'text/plain' && p.partId && values[p.partId])
+	el.className = 'reader-body scroll'
+	if (htmlPart && htmlPart.partId) {
+		el.classList.add('is-html')
+		el.innerHTML = sanitizeHTML(values[htmlPart.partId].value)
+		return
+	}
+	// Plain text (or unknown): render as escaped, pre-wrapped text.
+	let text = ''
+	if (textPart && textPart.partId) text = values[textPart.partId].value
+	else for (const k of Object.keys(values)) text += values[k].value
+	el.textContent = text || em.preview || '(no text content)'
+}
+
+// collectLeafParts flattens a JMAP bodyStructure into its leaf parts (those with
+// a partId), preserving document order.
+function collectLeafParts(node?: BodyPart): BodyPart[] {
+	if (!node) return []
+	if (node.subParts && node.subParts.length) {
+		return node.subParts.flatMap(collectLeafParts)
+	}
+	return node.partId ? [node] : []
+}
+
+// sanitizeHTML removes script/style/dangerous constructs before the message HTML
+// is inserted into the reader. Email HTML is untrusted; we parse it in an inert
+// document, drop <script>/<style>/<iframe>/<object> and event-handler / javascript:
+// attributes, and force links to open safely in a new tab.
+function sanitizeHTML(raw: string): string {
+	const doc = new DOMParser().parseFromString(raw, 'text/html')
+	const banned = ['script', 'style', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'form']
+	doc.querySelectorAll(banned.join(',')).forEach(n => n.remove())
+	doc.querySelectorAll('*').forEach(el => {
+		for (const attr of Array.from(el.attributes)) {
+			const name = attr.name.toLowerCase()
+			const val = attr.value.trim().toLowerCase()
+			if (name.startsWith('on')) { el.removeAttribute(attr.name); continue }
+			if ((name === 'href' || name === 'src') && (val.startsWith('javascript:') || val.startsWith('data:') || val.startsWith('vbscript:'))) {
+				el.removeAttribute(attr.name)
+			}
+		}
+		if (el.tagName === 'A') { el.setAttribute('target', '_blank'); el.setAttribute('rel', 'noopener noreferrer nofollow') }
+	})
+	return doc.body.innerHTML
 }
 
 // ---------- compose ----------

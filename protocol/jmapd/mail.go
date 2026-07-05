@@ -1135,16 +1135,84 @@ func messageHasAttachment(p *moxmessage.Part) bool {
 	return false
 }
 
-func preview(data []byte) string { // Crude: take text after the first blank line, cap at 100 chars.
-	s := string(data)
-	if i := strings.Index(s, "\r\n\r\n"); i >= 0 {
-		s = s[i+4:]
+// preview returns a short plain-text snippet for the list view. It parses the
+// MIME tree and takes the first text/plain leaf (falling back to a de-tagged
+// text/html leaf), so multipart and HTML messages get a clean snippet instead of
+// raw MIME boundaries. Capped at 140 chars.
+func preview(data []byte) string {
+	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
+	s := ""
+	if err == nil || part.Envelope != nil {
+		s = previewFromPart(&part)
 	}
-	s = strings.TrimSpace(s)
-	if len(s) > 100 {
-		s = s[:100]
+	if s == "" {
+		// Fallback: raw text after the first blank line (non-MIME messages).
+		s = string(data)
+		if i := strings.Index(s, "\r\n\r\n"); i >= 0 {
+			s = s[i+4:]
+		}
+	}
+	s = strings.Join(strings.Fields(s), " ") // collapse whitespace/newlines
+	if len(s) > 140 {
+		s = s[:140]
 	}
 	return s
+}
+
+// previewFromPart extracts snippet text: prefer the first text/plain leaf, else
+// the first text/html leaf with tags stripped.
+func previewFromPart(p *moxmessage.Part) string {
+	var plain, html string
+	var walk func(n *moxmessage.Part)
+	walk = func(n *moxmessage.Part) {
+		if len(n.Parts) > 0 {
+			for i := range n.Parts {
+				walk(&n.Parts[i])
+			}
+			return
+		}
+		if !strings.EqualFold(n.MediaType, "TEXT") {
+			return
+		}
+		r := n.Reader()
+		if r == nil {
+			return
+		}
+		b, _ := io.ReadAll(r)
+		if strings.EqualFold(n.MediaSubType, "HTML") {
+			if html == "" {
+				html = stripTags(string(b))
+			}
+		} else if plain == "" {
+			plain = string(b)
+		}
+	}
+	walk(p)
+	if plain != "" {
+		return plain
+	}
+	return html
+}
+
+// stripTags removes HTML tags for a text-only preview (not for rendering).
+func stripTags(s string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
 }
 
 func jsonInt64(raw json.RawMessage, key string) int64 {
