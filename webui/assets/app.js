@@ -373,8 +373,9 @@ function collectLeafParts(node) {
 }
 // sanitizeHTML removes script/style/dangerous constructs before the message HTML
 // is inserted into the reader. Email HTML is untrusted; we parse it in an inert
-// document, drop <script>/<style>/<iframe>/<object> and event-handler / javascript:
-// attributes, and force links to open safely in a new tab.
+// document, drop <script>/<style>/<iframe>/<object> and event-handler / dangerous
+// URL attributes, allow-list image sources (remote http(s) and inline
+// data:image/* except SVG), and force links to open safely in a new tab.
 function sanitizeHTML(raw) {
     const doc = new DOMParser().parseFromString(raw, 'text/html');
     const banned = ['script', 'style', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'form'];
@@ -382,21 +383,55 @@ function sanitizeHTML(raw) {
     doc.querySelectorAll('*').forEach(el => {
         for (const attr of Array.from(el.attributes)) {
             const name = attr.name.toLowerCase();
-            const val = attr.value.trim().toLowerCase();
+            const val = attr.value.trim();
             if (name.startsWith('on')) {
                 el.removeAttribute(attr.name);
                 continue;
             }
-            if ((name === 'href' || name === 'src') && (val.startsWith('javascript:') || val.startsWith('data:') || val.startsWith('vbscript:'))) {
+            if (name === 'href' && !safeLinkURL(val)) {
                 el.removeAttribute(attr.name);
             }
+            else if (name === 'src' && !safeImageURL(val)) {
+                el.removeAttribute(attr.name);
+            }
+            else if (name === 'srcset') {
+                el.removeAttribute(attr.name);
+            } // avoid bypassing the src allow-list
         }
         if (el.tagName === 'A') {
             el.setAttribute('target', '_blank');
             el.setAttribute('rel', 'noopener noreferrer nofollow');
         }
+        if (el.tagName === 'IMG') {
+            el.setAttribute('loading', 'lazy');
+            el.setAttribute('referrerpolicy', 'no-referrer');
+        }
     });
     return doc.body.innerHTML;
+}
+// safeLinkURL allows http(s), mailto and protocol-relative hrefs; blocks
+// javascript:/data:/vbscript: and anything else.
+function safeLinkURL(v) {
+    const s = v.toLowerCase();
+    if (s.startsWith('http://') || s.startsWith('https://') || s.startsWith('mailto:') || s.startsWith('//'))
+        return true;
+    if (s.startsWith('#') || s.startsWith('/'))
+        return true;
+    return false;
+}
+// safeImageURL allows remote http(s) images and inline data:image/* — except
+// SVG, which can carry scripts (a known XSS vector). This matches how major
+// webmail clients treat inline images: bitmap data URIs render, SVG does not.
+function safeImageURL(v) {
+    const s = v.toLowerCase().trim();
+    if (s.startsWith('http://') || s.startsWith('https://') || s.startsWith('//'))
+        return true;
+    if (s.startsWith('data:image/')) {
+        return !s.startsWith('data:image/svg');
+    }
+    // cid: (inline attachment refs) aren't resolved to blobs yet — drop to avoid
+    // broken-image icons; render support can be added when cid resolution lands.
+    return false;
 }
 // ---------- compose ----------
 function openCompose(prefillTo) {
