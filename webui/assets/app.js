@@ -214,7 +214,7 @@ function renderRow(em, i) {
     const from = (em.from && em.from[0]) ? em.from[0] : undefined;
     const fromLabel = displayName(from);
     const av = document.createElement('div');
-    av.className = 'av';
+    av.className = 'av av-gradient';
     av.textContent = initials(from ? (from.email || fromLabel) : fromLabel);
     const content = document.createElement('div');
     content.className = 'content';
@@ -250,7 +250,16 @@ function renderRow(em, i) {
         d.className = 'dot';
         row.appendChild(d);
     }
-    row.onclick = () => { openMessage(em.id).catch(e => { $('reader-body').textContent = String(e); }); };
+    row.onclick = () => {
+        document.querySelectorAll('.msg-row').forEach(r => r.classList.remove('active'));
+        row.classList.add('active');
+        // Optimistically reflect "read": drop unread emphasis + the dot.
+        row.classList.remove('unread');
+        const d = row.querySelector('.dot');
+        if (d)
+            d.remove();
+        openMessage(em.id).catch(e => { $('reader-body').textContent = String(e); });
+    };
     return row;
 }
 // ---------- reader ----------
@@ -260,8 +269,6 @@ function closeReader() {
 }
 async function openMessage(id) {
     currentEmailId = id;
-    // Re-mark active row without a full reload.
-    document.querySelectorAll('.msg-row').forEach(r => r.classList.remove('active'));
     const g = await jmap('Email/get', {
         accountId, ids: [id],
         properties: ['subject', 'from', 'to', 'preview', 'receivedAt', 'bodyValues', 'textBody'],

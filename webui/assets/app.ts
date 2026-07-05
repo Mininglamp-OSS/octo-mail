@@ -221,7 +221,7 @@ function renderRow(em: Email, i: number): HTMLElement {
 	const from = (em.from && em.from[0]) ? em.from[0] : undefined
 	const fromLabel = displayName(from)
 	const av = document.createElement('div')
-	av.className = 'av'
+	av.className = 'av av-gradient'
 	av.textContent = initials(from ? (from.email || fromLabel) : fromLabel)
 
 	const content = document.createElement('div')
@@ -240,7 +240,14 @@ function renderRow(em: Email, i: number): HTMLElement {
 	row.appendChild(av)
 	row.appendChild(content)
 	if (unread) { const d = document.createElement('div'); d.className = 'dot'; row.appendChild(d) }
-	row.onclick = () => { openMessage(em.id).catch(e => { $('reader-body').textContent = String(e) }) }
+	row.onclick = () => {
+		document.querySelectorAll('.msg-row').forEach(r => r.classList.remove('active'))
+		row.classList.add('active')
+		// Optimistically reflect "read": drop unread emphasis + the dot.
+		row.classList.remove('unread')
+		const d = row.querySelector('.dot'); if (d) d.remove()
+		openMessage(em.id).catch(e => { $('reader-body').textContent = String(e) })
+	}
 	return row
 }
 
@@ -253,8 +260,6 @@ function closeReader(): void {
 
 async function openMessage(id: string): Promise<void> {
 	currentEmailId = id
-	// Re-mark active row without a full reload.
-	document.querySelectorAll('.msg-row').forEach(r => r.classList.remove('active'))
 	const g = await jmap('Email/get', {
 		accountId, ids: [id],
 		properties: ['subject', 'from', 'to', 'preview', 'receivedAt', 'bodyValues', 'textBody'],
