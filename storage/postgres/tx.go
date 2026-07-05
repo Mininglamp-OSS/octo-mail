@@ -93,7 +93,11 @@ func scanMessage(row pgx.Row) (store.Message, error) {
 // --- MessageQuery: the bounded SQL builder replacing bstore.QueryTx[Message] ---
 
 func (pt *pgTx) QueryMessage() store.MessageQuery {
-	return &msgQuery{pt: pt}
+	// Isolation is structural, not a caller convention: every message query is
+	// unconditionally constrained to this tx's account. A caller-supplied
+	// mailbox/uid id that belongs to another account simply matches no rows —
+	// there is no way to widen the query past the account boundary.
+	return (&msgQuery{pt: pt}).add("account_id=", pt.acc.id)
 }
 
 type msgQuery struct {
