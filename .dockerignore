@@ -1,0 +1,13 @@
+# Keep the build context small and reproducible. vendor/ is intentionally NOT
+# ignored — the image builds offline from it.
+.git
+.gitignore
+blobs/
+junk/
+acme/
+cover.html
+*.test
+.DS_Store
+docker-compose.yml
+Dockerfile
+.dockerignore

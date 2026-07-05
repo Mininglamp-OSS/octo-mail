@@ -1,0 +1,73 @@
+# Local end-to-end stack for octo-mail: PostgreSQL 17 + MinIO (real S3) + the
+# node itself. Brings up the full runtime the way the acceptance tests exercise
+# it — SMTP MX/submission, IMAP, JMAP+webmail, admin+metrics.
+#
+#   docker compose up -d --build
+#   ...run e2e...
+#   docker compose down -v
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: octo_mail
+      POSTGRES_PASSWORD: octo_mail
+      POSTGRES_DB: octo_mail
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U octo_mail -d octo_mail"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19010:9000"
+      - "19011:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  octo-mail:
+    build: .
+    image: octo-mail:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      OCTO_MAIL_DSN: "postgres://octo_mail:octo_mail@postgres:5432/octo_mail?sslmode=disable"
+      OCTO_MAIL_HOSTNAME: "mail.octo-mail.test"
+      # Real S3 via MinIO (exercises the content-addressed S3 blob path).
+      OCTO_MAIL_S3_ENDPOINT: "http://minio:9000"
+      OCTO_MAIL_S3_REGION: "us-east-1"
+      OCTO_MAIL_S3_BUCKET: "octo-mail"
+      OCTO_MAIL_S3_ACCESS: "minioadmin"
+      OCTO_MAIL_S3_SECRET: "minioadmin"
+      # Listen addresses (container-internal; mapped below).
+      OCTO_MAIL_SMTP_ADDR: ":25"
+      OCTO_MAIL_SUBMISSION_ADDR: ":587"
+      OCTO_MAIL_IMAP_ADDR: ":143"
+      OCTO_MAIL_JMAP_ADDR: ":8080"
+      OCTO_MAIL_JMAP_BASEURL: "http://localhost:8090"
+      OCTO_MAIL_ADMIN_ADDR: ":8081"
+      OCTO_MAIL_ADMIN_TOKEN: "e2e-admin-token"
+      # Enforce DMARC so the security-posture default is exercised in acceptance.
+      OCTO_MAIL_REJECT_DMARC: "1"
+      OCTO_MAIL_NODE_ID: "e2e-node-1"
+    ports:
+      - "2525:25"     # SMTP MX
+      - "5587:587"    # SMTP submission
+      - "1143:143"    # IMAP
+      - "8090:8080"   # JMAP + webmail
+      - "8091:8081"   # admin + /metrics + /healthz
+    # No container healthcheck: the distroless runtime has no shell/curl. The e2e
+    # harness polls http://localhost:8081/healthz from the host instead.
