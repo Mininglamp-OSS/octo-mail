@@ -1,17 +1,19 @@
-// Package webapi is octo-mail's HTTP/JSON RPC for programmatic mail, matching the
-// shape of the webapi (a reference webapi): a per-account-authenticated surface for
-// sending mail and managing messages/suppressions without speaking SMTP/IMAP.
-// Each method is POST /webapi/v0/<Method> with a JSON request body and JSON
-// response, authenticated with the account's own credentials (HTTP Basic) — not
-// the admin token. It sits on the same kernel primitives as SMTP/IMAP/JMAP: Send
-// enqueues to the one shared outbound queue; message ops go through the account's
-// change-log.
+// Package webapi is octo-mail's RESTful HTTP/JSON API for programmatic mail. It
+// is a per-account surface — authenticated with an account API key
+// (Authorization: Bearer omk_...) or HTTP Basic — for sending mail and managing
+// messages, threads, drafts, mailboxes, and the suppression list, without
+// speaking SMTP/IMAP/JMAP. It sits on the same kernel primitives: Send enqueues
+// to the shared outbound queue; message ops go through the account's change-log.
+//
+// The API is resource-oriented under /webapi/v0: real HTTP verbs, correct status
+// codes, camelCase JSON, and a small {"error":{"code","message"}} body on
+// failure. Provisioning (tenants/accounts/domains) is deliberately NOT here — it
+// lives on the admin surface; an account key can only reach its own mailbox.
 package webapi
 
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,7 +25,7 @@ import (
 	"github.com/mjl-/mox/smtp"
 )
 
-// Server serves the webapi. Submission enqueues outbound mail; Suppressions
+// Server serves the REST webapi. Submission enqueues outbound mail; Suppressions
 // manages the per-account suppression list.
 type Server struct {
 	Dir          directory.Directory
@@ -31,19 +33,34 @@ type Server struct {
 	Suppressions *deliverability.Suppressions
 }
 
-// Handler returns the HTTP handler mounting all webapi methods under /webapi/v0/.
+// Handler mounts the REST routes under /webapi/v0 using method+path patterns
+// (Go 1.22 ServeMux). Every route is authenticated in the handler via s.auth.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/webapi/v0/Send", s.method(s.send))
-	mux.HandleFunc("/webapi/v0/SuppressionList", s.method(s.suppressionList))
-	mux.HandleFunc("/webapi/v0/SuppressionAdd", s.method(s.suppressionAdd))
-	mux.HandleFunc("/webapi/v0/SuppressionRemove", s.method(s.suppressionRemove))
-	mux.HandleFunc("/webapi/v0/SuppressionPresent", s.method(s.suppressionPresent))
-	mux.HandleFunc("/webapi/v0/MessageGet", s.method(s.messageGet))
-	mux.HandleFunc("/webapi/v0/MessageRawGet", s.methodRaw(s.messageRawGet))
-	mux.HandleFunc("/webapi/v0/MessageDelete", s.method(s.messageDelete))
-	mux.HandleFunc("/webapi/v0/MessageFlagsAdd", s.method(s.messageFlagsAdd))
-	mux.HandleFunc("/webapi/v0/MessageFlagsRemove", s.method(s.messageFlagsRemove))
+	// Messages.
+	mux.HandleFunc("GET /webapi/v0/messages", s.h(s.listMessages))
+	mux.HandleFunc("POST /webapi/v0/messages", s.h(s.sendMessage))
+	mux.HandleFunc("GET /webapi/v0/messages/{id}", s.h(s.getMessage))
+	mux.HandleFunc("PATCH /webapi/v0/messages/{id}", s.h(s.patchMessage))
+	mux.HandleFunc("DELETE /webapi/v0/messages/{id}", s.h(s.deleteMessage))
+	mux.HandleFunc("GET /webapi/v0/messages/{id}/raw", s.hRaw(s.rawMessage))
+	mux.HandleFunc("POST /webapi/v0/messages/{id}/reply", s.h(s.replyMessage))
+	mux.HandleFunc("POST /webapi/v0/messages/{id}/reply-all", s.h(s.replyAllMessage))
+	mux.HandleFunc("POST /webapi/v0/messages/{id}/forward", s.h(s.forwardMessage))
+	// Threads.
+	mux.HandleFunc("GET /webapi/v0/threads/{id}", s.h(s.getThread))
+	// Drafts.
+	mux.HandleFunc("GET /webapi/v0/drafts", s.h(s.listDrafts))
+	mux.HandleFunc("POST /webapi/v0/drafts", s.h(s.createDraft))
+	mux.HandleFunc("POST /webapi/v0/drafts/{id}/send", s.h(s.sendDraft))
+	mux.HandleFunc("DELETE /webapi/v0/drafts/{id}", s.h(s.deleteDraft))
+	// Mailboxes.
+	mux.HandleFunc("GET /webapi/v0/mailboxes", s.h(s.listMailboxes))
+	// Suppressions.
+	mux.HandleFunc("GET /webapi/v0/suppressions", s.h(s.listSuppressions))
+	mux.HandleFunc("GET /webapi/v0/suppressions/{address}", s.h(s.getSuppression))
+	mux.HandleFunc("PUT /webapi/v0/suppressions/{address}", s.h(s.putSuppression))
+	mux.HandleFunc("DELETE /webapi/v0/suppressions/{address}", s.h(s.deleteSuppression))
 	return mux
 }
 
@@ -60,389 +77,132 @@ func (s *Server) auth(r *http.Request) (authCtx, error) {
 		token := strings.TrimPrefix(h, "Bearer ")
 		scope, princ, _, err := s.Dir.AuthenticateAPIKey(r.Context(), token)
 		if err != nil {
-			return authCtx{}, errUser("authentication failed")
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
 		}
 		addr, err := smtp.ParseAddress(princ.Login)
 		if err != nil {
-			return authCtx{}, errUser("bad login address")
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "bad login address")
 		}
 		acc, err := scope.AccountForAddress(r.Context(), addr.Path())
 		if err != nil {
-			return authCtx{}, errUser("no account for login")
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "no account for login")
 		}
 		return authCtx{acc: acc, scope: scope, login: princ.Login}, nil
 	}
 
 	login, password, ok := r.BasicAuth()
 	if !ok {
-		return authCtx{}, errUser("missing credentials")
+		return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "missing credentials")
 	}
 	addr, err := smtp.ParseAddress(login)
 	if err != nil {
-		return authCtx{}, errUser("bad login address")
+		return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "bad login address")
 	}
 	scope, _, err := s.Dir.AuthenticatePrincipal(r.Context(), login, directory.PasswordCredential(password))
 	if err != nil {
-		return authCtx{}, errUser("authentication failed")
+		return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
 	}
 	acc, err := scope.AccountForAddress(r.Context(), addr.Path())
 	if err != nil {
-		return authCtx{}, errUser("no account for login")
+		return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "no account for login")
 	}
 	return authCtx{acc: acc, scope: scope, login: login}, nil
 }
 
-// method wraps a JSON-in/JSON-out handler with auth + error mapping.
-func (s *Server) method(fn func(ctx context.Context, a authCtx, body []byte) (any, error)) http.HandlerFunc {
+// handler is a REST handler that returns (status, body) or an error. A nil body
+// with status 204 writes no content.
+type handler func(ctx context.Context, a authCtx, r *http.Request) (status int, body any, err error)
+
+// h wraps a handler with auth + JSON error mapping.
+func (s *Server) h(fn handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "protocol", "POST required")
-			return
-		}
 		a, err := s.auth(r)
 		if err != nil {
-			writeErr(w, http.StatusUnauthorized, "user", err.Error())
+			writeErr(w, err)
 			return
 		}
-		body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<20))
-		res, err := fn(r.Context(), a, body)
+		status, body, err := fn(r.Context(), a, r)
 		if err != nil {
-			if ue, ok := err.(apiError); ok {
-				writeErr(w, http.StatusOK, ue.code, ue.msg)
-				return
-			}
-			writeErr(w, http.StatusOK, "server", err.Error())
+			writeErr(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, res)
+		if status == http.StatusNoContent || body == nil {
+			w.WriteHeader(status)
+			return
+		}
+		writeJSON(w, status, body)
 	}
 }
 
-// methodRaw wraps a handler returning raw bytes (e.g. MessageRawGet).
-func (s *Server) methodRaw(fn func(ctx context.Context, a authCtx, body []byte) (io.ReadCloser, error)) http.HandlerFunc {
+// hRaw wraps a handler that streams raw bytes (message/rfc822).
+func (s *Server) hRaw(fn func(ctx context.Context, a authCtx, r *http.Request) (store.BlobReader, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "protocol", "POST required")
-			return
-		}
 		a, err := s.auth(r)
 		if err != nil {
-			writeErr(w, http.StatusUnauthorized, "user", err.Error())
+			writeErr(w, err)
 			return
 		}
-		body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
-		rc, err := fn(r.Context(), a, body)
+		rc, err := fn(r.Context(), a, r)
 		if err != nil {
-			writeErr(w, http.StatusOK, "user", err.Error())
+			writeErr(w, err)
 			return
 		}
 		defer rc.Close()
 		w.Header().Set("Content-Type", "message/rfc822")
-		_, _ = io.Copy(w, rc)
-	}
-}
-
-// --- Send ---
-
-type NameAddress struct {
-	Name    string `json:"Name,omitempty"`
-	Address string `json:"Address"`
-}
-
-type SendRequest struct {
-	From      NameAddress   `json:"From"`
-	To        []NameAddress `json:"To"`
-	Subject   string        `json:"Subject"`
-	Text      string        `json:"Text"`
-	MessageID string        `json:"MessageID,omitempty"`
-}
-
-type SendResult struct {
-	MessageID  string  `json:"MessageID"`
-	Submission []int64 `json:"Submission"`
-}
-
-func (s *Server) send(ctx context.Context, a authCtx, body []byte) (any, error) {
-	if s.Submission == nil {
-		return nil, errServer("submission not enabled")
-	}
-	var req SendRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, errUser("bad request json")
-	}
-	from := req.From.Address
-	if from == "" {
-		from = a.login
-	}
-	if len(req.To) == 0 {
-		return nil, errUser("at least one To addressee required")
-	}
-	var rcpts []string
-	var toHdr []string
-	for _, t := range req.To {
-		if t.Address == "" {
-			continue
+		w.WriteHeader(http.StatusOK)
+		buf := make([]byte, 32*1024)
+		for {
+			n, e := rc.Read(buf)
+			if n > 0 {
+				if _, we := w.Write(buf[:n]); we != nil {
+					return
+				}
+			}
+			if e != nil {
+				return
+			}
 		}
-		rcpts = append(rcpts, t.Address)
-		toHdr = append(toHdr, t.Address)
 	}
-	if len(rcpts) == 0 {
-		return nil, errUser("no valid recipients")
-	}
-	msgID := req.MessageID
-	if msgID == "" {
-		msgID = "<" + strconv.FormatInt(a.acc.ID(), 10) + "." + strings.ReplaceAll(from, "@", ".") + ".webapi@octo-mail>"
-	}
-	// Compose a minimal RFC822 message.
-	var b strings.Builder
-	b.WriteString("Message-ID: " + msgID + "\r\n")
-	b.WriteString("From: " + from + "\r\n")
-	b.WriteString("To: " + strings.Join(toHdr, ", ") + "\r\n")
-	b.WriteString("Subject: " + req.Subject + "\r\n")
-	b.WriteString("MIME-Version: 1.0\r\n")
-	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-	b.WriteString("\r\n")
-	b.WriteString(req.Text)
-	if !strings.HasSuffix(req.Text, "\n") {
-		b.WriteString("\r\n")
-	}
-
-	ids, err := s.Submission.Submit(ctx, a.scope.Tenant().ID, a.acc.ID(), from, rcpts, []byte(b.String()))
-	if err != nil {
-		return nil, errServer(err.Error())
-	}
-	return SendResult{MessageID: msgID, Submission: ids}, nil
 }
 
-// --- Suppression* ---
+// --- shared helpers ---
 
-type SuppressionListResult struct {
-	Suppressions []string `json:"Suppressions"`
+// decode reads and JSON-decodes the request body (capped) into v.
+func decode(r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 64<<20))
+	if err := dec.Decode(v); err != nil {
+		return errStatus(http.StatusBadRequest, "invalid_body", "invalid JSON body: "+err.Error())
+	}
+	return nil
 }
 
-func (s *Server) suppressionList(ctx context.Context, a authCtx, body []byte) (any, error) {
-	if s.Suppressions == nil {
-		return nil, errServer("suppressions not enabled")
+// parseEmailID decodes an "E<n>" message id to its effective email id.
+func parseEmailID(id string) (int64, bool) {
+	if len(id) < 2 || id[0] != 'E' {
+		return 0, false
 	}
-	list, err := s.Suppressions.List(ctx, a.acc.ID())
-	if err != nil {
-		return nil, errServer(err.Error())
-	}
-	if list == nil {
-		list = []string{}
-	}
-	return SuppressionListResult{Suppressions: list}, nil
+	n, err := strconv.ParseInt(id[1:], 10, 64)
+	return n, err == nil
 }
 
-type SuppressionAddRequest struct {
-	Address string `json:"Address"`
-	Reason  string `json:"Reason,omitempty"`
+func emailID(m store.Message) string {
+	return "E" + strconv.FormatInt(m.EffectiveEmailID(), 10)
 }
 
-func (s *Server) suppressionAdd(ctx context.Context, a authCtx, body []byte) (any, error) {
-	if s.Suppressions == nil {
-		return nil, errServer("suppressions not enabled")
+// loadGroup loads all live rows of a message (across mailboxes) by its "E<n>" id.
+func loadGroup(tx store.Tx, acc store.Account, id string) ([]store.Message, error) {
+	gid, ok := parseEmailID(id)
+	if !ok {
+		return nil, errStatus(http.StatusBadRequest, "invalid_id", "invalid message id")
 	}
-	var req SuppressionAddRequest
-	if err := json.Unmarshal(body, &req); err != nil || req.Address == "" {
-		return nil, errUser("Address required")
-	}
-	if err := s.Suppressions.Add(ctx, a.scope.Tenant().ID, a.acc.ID(), req.Address, req.Reason); err != nil {
-		return nil, errServer(err.Error())
-	}
-	return map[string]any{"Added": true}, nil
-}
-
-type SuppressionRemoveRequest struct {
-	Address string `json:"Address"`
-}
-
-func (s *Server) suppressionRemove(ctx context.Context, a authCtx, body []byte) (any, error) {
-	if s.Suppressions == nil {
-		return nil, errServer("suppressions not enabled")
-	}
-	var req SuppressionRemoveRequest
-	if err := json.Unmarshal(body, &req); err != nil || req.Address == "" {
-		return nil, errUser("Address required")
-	}
-	if err := s.Suppressions.Remove(ctx, a.acc.ID(), req.Address); err != nil {
-		return nil, errServer(err.Error())
-	}
-	return map[string]any{"Removed": true}, nil
-}
-
-type SuppressionPresentRequest struct {
-	Address string `json:"Address"`
-}
-
-func (s *Server) suppressionPresent(ctx context.Context, a authCtx, body []byte) (any, error) {
-	if s.Suppressions == nil {
-		return nil, errServer("suppressions not enabled")
-	}
-	var req SuppressionPresentRequest
-	if err := json.Unmarshal(body, &req); err != nil || req.Address == "" {
-		return nil, errUser("Address required")
-	}
-	present, err := s.Suppressions.Suppressed(ctx, a.acc.ID(), req.Address)
-	if err != nil {
-		return nil, errServer(err.Error())
-	}
-	return map[string]any{"Present": present}, nil
-}
-
-// --- Message* ---
-
-// msgRef is the message identifier used by webapi: a mailbox name + UID.
-type msgRef struct {
-	Mailbox string `json:"Mailbox"`
-	UID     int64  `json:"UID"`
-}
-
-func (s *Server) resolve(ctx context.Context, a authCtx, ref msgRef) (store.Mailbox, store.Message, error) {
-	var mb store.Mailbox
-	var m store.Message
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
-		found, e := a.acc.MailboxFind(tx, ref.Mailbox)
-		if e != nil {
-			return e
-		}
-		if found == nil {
-			return errUser("no such mailbox")
-		}
-		mb = *found
-		msgs, e := tx.QueryMessage().FilterMailbox(mb.ID).FilterUIDRange(store.UID(ref.UID), store.UID(ref.UID)).List()
-		if e != nil {
-			return e
-		}
-		if len(msgs) == 0 {
-			return errUser("no such message")
-		}
-		m = msgs[0]
-		return nil
-	})
-	return mb, m, err
-}
-
-type MessageGetResult struct {
-	UID     int64    `json:"UID"`
-	Mailbox string   `json:"Mailbox"`
-	Size    int64    `json:"Size"`
-	Flags   []string `json:"Flags"`
-}
-
-func (s *Server) messageGet(ctx context.Context, a authCtx, body []byte) (any, error) {
-	var ref msgRef
-	if err := json.Unmarshal(body, &ref); err != nil {
-		return nil, errUser("bad request json")
-	}
-	mb, m, err := s.resolve(ctx, a, ref)
+	msgs, err := acc.MessagesByEmailID(tx, gid)
 	if err != nil {
 		return nil, err
 	}
-	return MessageGetResult{UID: int64(m.UID), Mailbox: mb.Name, Size: m.Size, Flags: flagList(m)}, nil
-}
-
-func (s *Server) messageRawGet(ctx context.Context, a authCtx, body []byte) (io.ReadCloser, error) {
-	var ref msgRef
-	if err := json.Unmarshal(body, &ref); err != nil {
-		return nil, errUser("bad request json")
+	if len(msgs) == 0 {
+		return nil, errStatus(http.StatusNotFound, "not_found", "no such message")
 	}
-	_, m, err := s.resolve(ctx, a, ref)
-	if err != nil {
-		return nil, err
-	}
-	return a.acc.MessageReader(m), nil
-}
-
-func (s *Server) messageDelete(ctx context.Context, a authCtx, body []byte) (any, error) {
-	var ref msgRef
-	if err := json.Unmarshal(body, &ref); err != nil {
-		return nil, errUser("bad request json")
-	}
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
-		found, e := a.acc.MailboxFind(tx, ref.Mailbox)
-		if e != nil {
-			return e
-		}
-		if found == nil {
-			return errUser("no such mailbox")
-		}
-		msgs, e := tx.QueryMessage().FilterMailbox(found.ID).FilterUIDRange(store.UID(ref.UID), store.UID(ref.UID)).List()
-		if e != nil {
-			return e
-		}
-		if len(msgs) == 0 {
-			return errUser("no such message")
-		}
-		_, _, e = a.acc.MessageRemove(tx, 0, found, store.RemoveOpts{Expunge: true}, msgs[0])
-		return e
-	})
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"Deleted": true}, nil
-}
-
-type MessageFlagsRequest struct {
-	Mailbox string   `json:"Mailbox"`
-	UID     int64    `json:"UID"`
-	Flags   []string `json:"Flags"`
-}
-
-func (s *Server) messageFlagsAdd(ctx context.Context, a authCtx, body []byte) (any, error) {
-	return s.messageFlags(ctx, a, body, true)
-}
-
-func (s *Server) messageFlagsRemove(ctx context.Context, a authCtx, body []byte) (any, error) {
-	return s.messageFlags(ctx, a, body, false)
-}
-
-func (s *Server) messageFlags(ctx context.Context, a authCtx, body []byte, add bool) (any, error) {
-	var req MessageFlagsRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, errUser("bad request json")
-	}
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
-		found, e := a.acc.MailboxFind(tx, req.Mailbox)
-		if e != nil {
-			return e
-		}
-		if found == nil {
-			return errUser("no such mailbox")
-		}
-		msgs, e := tx.QueryMessage().FilterMailbox(found.ID).FilterUIDRange(store.UID(req.UID), store.UID(req.UID)).List()
-		if e != nil {
-			return e
-		}
-		if len(msgs) == 0 {
-			return errUser("no such message")
-		}
-		m := msgs[0]
-		for _, f := range req.Flags {
-			setFlag(&m, f, add)
-		}
-		return tx.Update(&m)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"OK": true}, nil
-}
-
-// --- helpers ---
-
-func flagList(m store.Message) []string {
-	f := m.Flags.IMAPFlags(m.Keywords)
-	if f == nil {
-		f = []string{}
-	}
-	return f
-}
-
-func setFlag(m *store.Message, name string, v bool) {
-	// Canonical parser: sets a known system flag (\Seen, $Junk, ...); unknown
-	// names are ignored here (this endpoint does not manage free-form keywords).
-	m.Flags.SetByName(name, v)
+	return msgs, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -451,17 +211,34 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, map[string]any{"Error": map[string]string{"Code": code, "Message": msg}})
+// statusError carries an HTTP status + machine code + message.
+type statusError struct {
+	status int
+	code   string
+	msg    string
 }
 
-// apiError carries a webapi error code + message.
-type apiError struct {
-	code string
-	msg  string
+func (e *statusError) Error() string { return e.msg }
+
+func errStatus(status int, code, msg string) *statusError {
+	return &statusError{status: status, code: code, msg: msg}
 }
 
-func (e apiError) Error() string { return e.msg }
+// writeErr renders an error: a *statusError uses its status; anything else is 500.
+func writeErr(w http.ResponseWriter, err error) {
+	se, ok := err.(*statusError)
+	if !ok {
+		se = errStatus(http.StatusInternalServerError, "internal", err.Error())
+	}
+	writeJSON(w, se.status, map[string]any{
+		"error": map[string]string{"code": se.code, "message": se.msg},
+	})
+}
 
-func errUser(msg string) apiError   { return apiError{code: "user", msg: msg} }
-func errServer(msg string) apiError { return apiError{code: "server", msg: msg} }
+// senderDomain returns the account login's domain, for Message-ID generation.
+func (a authCtx) senderDomain() string {
+	if i := strings.LastIndex(a.login, "@"); i >= 0 {
+		return a.login[i+1:]
+	}
+	return "localhost"
+}

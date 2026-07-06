@@ -408,6 +408,173 @@ func TestAPIKeyAuth(t *testing.T) {
 	t.Logf("API-KEY OK: Bearer omk_ key authenticates on JMAP (session + method call) as %s; garbage key rejected", login)
 }
 
+// TestRESTAPIFlow drives the resource-oriented REST surface (/webapi/v0) over
+// the deployed stack with a minted omk_ key: mailboxes → send → list → get →
+// reply → flag(PATCH) → thread, plus account isolation (a key for account A
+// cannot read account B's mail).
+func TestRESTAPIFlow(t *testing.T) {
+	waitHealthy(t)
+	ctx := context.Background()
+
+	loginA := "resta@restdom.test"
+	provisionAccount(t, "resta", "restdom.test", loginA, "rest-pw")
+	loginB := "restb@restdom2.test"
+	provisionAccount(t, "restb", "restdom2.test", loginB, "rest-pw2")
+
+	bs, err := blob.NewS3(blob.S3Config{Endpoint: s3Endpoint, Region: "us-east-1", Bucket: s3Bucket, AccessKey: s3Access, SecretKey: s3Secret})
+	if err != nil {
+		t.Fatalf("open s3: %v", err)
+	}
+	st, err := postgres.Open(ctx, pgDSN, bs)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer st.Close()
+	tokenA, err := st.NewDirectory().IssueAPIKey(ctx, loginA, "rest agent A")
+	if err != nil {
+		t.Fatalf("IssueAPIKey A: %v", err)
+	}
+	tokenB, err := st.NewDirectory().IssueAPIKey(ctx, loginB, "rest agent B")
+	if err != nil {
+		t.Fatalf("IssueAPIKey B: %v", err)
+	}
+
+	// Deliver a message to A via IMAP APPEND so the message resource has input.
+	rawA := "From: friend@remote.example\r\nTo: " + loginA + "\r\nSubject: rest hello\r\nMessage-ID: <rest-orig@remote.example>\r\n\r\nrest body\r\n"
+	{
+		c := imapDial(t, loginA, "rest-pw")
+		defer c.Close()
+		if _, err := c.Append("Inbox", imapclient.Append{Size: int64(len(rawA)), Data: strings.NewReader(rawA)}); err != nil {
+			t.Fatalf("A APPEND: %v", err)
+		}
+	}
+
+	// mailboxes: Inbox present.
+	mb := restJSON(t, "GET", tokenA, "/webapi/v0/mailboxes", "", 200)
+	if !restHasMailbox(mb["mailboxes"], "Inbox") {
+		t.Fatalf("mailboxes missing Inbox: %v", mb["mailboxes"])
+	}
+
+	// list: find the delivered message (retry until it lands).
+	var id string
+	for i := 0; i < 30 && id == ""; i++ {
+		lst := restJSON(t, "GET", tokenA, "/webapi/v0/messages", "", 200)
+		if msgs, _ := lst["messages"].([]any); len(msgs) > 0 {
+			id, _ = msgs[0].(map[string]any)["id"].(string)
+		}
+		if id == "" {
+			time.Sleep(time.Second)
+		}
+	}
+	if id == "" {
+		t.Fatal("delivered message never appeared in REST list")
+	}
+
+	// get: subject + body.
+	get := restJSON(t, "GET", tokenA, "/webapi/v0/messages/"+id, "", 200)
+	if get["subject"] != "rest hello" || !strings.Contains(fmt.Sprint(get["bodyText"]), "rest body") {
+		t.Fatalf("get unexpected: subject=%v body=%v", get["subject"], get["bodyText"])
+	}
+
+	// send: 202.
+	restJSON(t, "POST", tokenA, "/webapi/v0/messages",
+		`{"to":["dst@remote.example"],"subject":"outbound","text":"hi"}`, 202)
+
+	// reply: 202.
+	restJSON(t, "POST", tokenA, "/webapi/v0/messages/"+id+"/reply", `{"text":"thanks"}`, 202)
+
+	// flag via PATCH: \Seen → read.
+	restJSON(t, "PATCH", tokenA, "/webapi/v0/messages/"+id, `{"addKeywords":["\\Seen"]}`, 200)
+	get2 := restJSON(t, "GET", tokenA, "/webapi/v0/messages/"+id, "", 200)
+	if get2["unread"] != false {
+		t.Fatalf("after \\Seen, unread = %v, want false", get2["unread"])
+	}
+
+	// thread: if the message has a thread, it resolves.
+	if tid, _ := get2["threadId"].(string); tid != "" {
+		th := restJSON(t, "GET", tokenA, "/webapi/v0/threads/"+tid, "", 200)
+		if tmsgs, _ := th["messages"].([]any); len(tmsgs) < 1 {
+			t.Fatalf("thread returned no messages: %v", th)
+		}
+	}
+
+	// isolation: B's key must not read A's message → 404 (not in B's mailbox).
+	code := restStatus(t, "GET", tokenB, "/webapi/v0/messages/"+id, "")
+	if code != 404 {
+		t.Fatalf("account B reading A's message -> %d, want 404", code)
+	}
+	// And B's list must not contain A's message id.
+	blist := restJSON(t, "GET", tokenB, "/webapi/v0/messages", "", 200)
+	for _, m := range asSlice(blist["messages"]) {
+		if mm, ok := m.(map[string]any); ok && mm["id"] == id {
+			t.Fatalf("account B's list leaked A's message %s", id)
+		}
+	}
+
+	t.Logf("REST OK: mailboxes+list+get+send+reply+flag+thread as %s; %s isolated", loginA, loginB)
+}
+
+// restJSON issues an authenticated REST request, asserts the status, and returns
+// the decoded JSON object (nil for empty bodies).
+func restJSON(t *testing.T, method, token, path, body string, wantStatus int) map[string]any {
+	t.Helper()
+	var rd io.Reader
+	if body != "" {
+		rd = strings.NewReader(body)
+	}
+	req, _ := http.NewRequest(method, jmapURL+path, rd)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("%s %s -> %d, want %d: %s", method, path, resp.StatusCode, wantStatus, raw)
+	}
+	var out map[string]any
+	if len(bytes.TrimSpace(raw)) > 0 {
+		json.Unmarshal(raw, &out)
+	}
+	return out
+}
+
+// restStatus issues an authenticated REST request and returns just the status.
+func restStatus(t *testing.T, method, token, path, body string) int {
+	t.Helper()
+	var rd io.Reader
+	if body != "" {
+		rd = strings.NewReader(body)
+	}
+	req, _ := http.NewRequest(method, jmapURL+path, rd)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+func restHasMailbox(v any, name string) bool {
+	for _, x := range asSlice(v) {
+		if mb, ok := x.(map[string]any); ok && mb["name"] == name {
+			return true
+		}
+	}
+	return false
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
 // bearerGet does a GET with an Authorization: Bearer header; fails on non-200.
 func bearerGet(t *testing.T, url, token string) []byte {
 	t.Helper()

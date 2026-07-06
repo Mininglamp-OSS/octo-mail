@@ -21,11 +21,11 @@ import (
 
 const testDSN = "postgres://octo_mail:octo_mail@localhost:55432/octo_mail"
 
-// TestWebAPIEndToEnd proves P3 webapi (production-parity HTTP/JSON RPC over the kernel):
-// per-account auth; Send enqueues to the shared outbound queue; Suppression*
-// add/present/list/remove; and Message* get/flags/delete over a real delivered
-// message — all over real HTTP.
-func TestWebAPIEndToEnd(t *testing.T) {
+// TestRESTAPI exercises the resource-oriented REST surface (/webapi/v0) end to
+// end over real HTTP against a real PostgreSQL: per-account auth (401 without
+// credentials), send (202 → outbound queue), list/get/raw, flag via PATCH,
+// thread get, suppression PUT/GET/list/DELETE, and message DELETE (204 → 404).
+func TestRESTAPI(t *testing.T) {
 	ctx := context.Background()
 	bs, err := blob.NewFS(t.TempDir())
 	if err != nil {
@@ -50,13 +50,13 @@ func TestWebAPIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Deliver one message so Message* has something to operate on.
+	// Deliver one message so the message resource has something to operate on.
 	addr, _ := smtp.ParseAddress("u1@example.com")
 	target, err := dir.ResolveInbound(ctx, addr.Path())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := target.Deliver(ctx, &store.Message{}, mem("Subject: hi\r\n\r\nbody here\r\n")); err != nil {
+	if _, err := target.Deliver(ctx, &store.Message{}, mem("From: friend@remote.example\r\nTo: u1@example.com\r\nSubject: hi\r\nMessage-ID: <orig@remote.example>\r\n\r\nbody here\r\n")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,108 +68,214 @@ func TestWebAPIEndToEnd(t *testing.T) {
 	hs := httptest.NewServer(srv.Handler())
 	defer hs.Close()
 
-	call := func(method string, reqBody string) map[string]any {
-		req, _ := http.NewRequest("POST", hs.URL+"/webapi/v0/"+method, strings.NewReader(reqBody))
+	// do issues an authenticated request and returns (status, decoded-json).
+	do := func(method, path, body string) (int, map[string]any) {
+		var rd io.Reader
+		if body != "" {
+			rd = strings.NewReader(body)
+		}
+		req, _ := http.NewRequest(method, hs.URL+path, rd)
 		req.SetBasicAuth("u1@example.com", "pw")
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			t.Fatalf("%s: %v", method, err)
+			t.Fatalf("%s %s: %v", method, path, err)
 		}
 		defer resp.Body.Close()
 		var out map[string]any
-		json.NewDecoder(resp.Body).Decode(&out)
-		if e, ok := out["Error"].(map[string]any); ok {
-			t.Fatalf("%s returned error: %v", method, e)
+		raw, _ := io.ReadAll(resp.Body)
+		if len(bytes.TrimSpace(raw)) > 0 {
+			json.Unmarshal(raw, &out)
 		}
-		return out
+		if e, ok := out["error"]; ok {
+			t.Fatalf("%s %s → %d error: %v", method, path, resp.StatusCode, e)
+		}
+		return resp.StatusCode, out
 	}
 
 	// --- auth: no credentials → 401. ---
 	{
-		resp, _ := http.Post(hs.URL+"/webapi/v0/SuppressionList", "application/json", strings.NewReader("{}"))
+		resp, _ := http.Get(hs.URL + "/webapi/v0/mailboxes")
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("unauthenticated request status = %d, want 401", resp.StatusCode)
 		}
 		resp.Body.Close()
 	}
 
-	// --- Send: enqueues to the shared outbound queue. ---
-	sendRes := call("Send", `{"From":{"Address":"u1@example.com"},"To":[{"Address":"dst@remote.example"}],"Subject":"hello","Text":"greetings"}`)
-	sub, ok := sendRes["Submission"].([]any)
-	if !ok || len(sub) != 1 {
-		t.Fatalf("Send did not enqueue exactly one message: %v", sendRes["Submission"])
+	// --- mailboxes: Inbox present. ---
+	st, mb := do("GET", "/webapi/v0/mailboxes", "")
+	if st != http.StatusOK {
+		t.Fatalf("GET mailboxes status = %d, want 200", st)
 	}
-	var qn int
-	scan(t, s, ctx, `SELECT count(*) FROM queue`, &qn)
-	if qn != 1 {
-		t.Fatalf("queue rows = %d, want 1 after Send", qn)
+	if !hasMailbox(mb["mailboxes"], "Inbox") {
+		t.Fatalf("mailboxes missing Inbox: %v", mb["mailboxes"])
 	}
 
-	// --- Suppression add / present / list / remove. ---
-	call("SuppressionAdd", `{"Address":"bad@remote.example","Reason":"bounce"}`)
-	pres := call("SuppressionPresent", `{"Address":"bad@remote.example"}`)
-	if pres["Present"] != true {
-		t.Fatalf("SuppressionPresent = %v, want true", pres["Present"])
+	// --- list: the delivered message shows up; capture its id. ---
+	st, lst := do("GET", "/webapi/v0/messages", "")
+	if st != http.StatusOK {
+		t.Fatalf("GET messages status = %d, want 200", st)
 	}
-	lst := call("SuppressionList", `{}`)
-	sups, _ := lst["Suppressions"].([]any)
-	if len(sups) != 1 || sups[0] != "bad@remote.example" {
-		t.Fatalf("SuppressionList = %v, want [bad@remote.example]", lst["Suppressions"])
+	msgs, _ := lst["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("list returned %d messages, want 1", len(msgs))
 	}
-	call("SuppressionRemove", `{"Address":"bad@remote.example"}`)
-	pres2 := call("SuppressionPresent", `{"Address":"bad@remote.example"}`)
-	if pres2["Present"] != false {
-		t.Fatalf("SuppressionPresent after remove = %v, want false", pres2["Present"])
+	m0 := msgs[0].(map[string]any)
+	id, _ := m0["id"].(string)
+	if id == "" || id[0] != 'E' {
+		t.Fatalf("message id = %q, want E<n>", id)
 	}
-
-	// --- Message get / flags add / raw get / delete. ---
-	get := call("MessageGet", `{"Mailbox":"Inbox","UID":1}`)
-	if get["Size"] == nil || get["Mailbox"] != "Inbox" {
-		t.Fatalf("MessageGet unexpected: %v", get)
-	}
-	call("MessageFlagsAdd", `{"Mailbox":"Inbox","UID":1,"Flags":["\\Seen"]}`)
-	get2 := call("MessageGet", `{"Mailbox":"Inbox","UID":1}`)
-	flags, _ := get2["Flags"].([]any)
-	sawSeen := false
-	for _, f := range flags {
-		if f == `\Seen` {
-			sawSeen = true
-		}
-	}
-	if !sawSeen {
-		t.Fatalf("MessageFlagsAdd did not set \\Seen: %v", get2["Flags"])
+	if m0["unread"] != true {
+		t.Fatalf("new message should be unread: %v", m0)
 	}
 
-	// MessageRawGet returns the raw RFC822 (message/rfc822 content type).
+	// --- get: bodies + subject. ---
+	st, get := do("GET", "/webapi/v0/messages/"+id, "")
+	if st != http.StatusOK {
+		t.Fatalf("GET message status = %d, want 200", st)
+	}
+	if get["subject"] != "hi" || !strings.Contains(toString(get["bodyText"]), "body here") {
+		t.Fatalf("GET message unexpected: subject=%v body=%v", get["subject"], get["bodyText"])
+	}
+
+	// --- raw: message/rfc822 bytes. ---
 	{
-		req, _ := http.NewRequest("POST", hs.URL+"/webapi/v0/MessageRawGet", strings.NewReader(`{"Mailbox":"Inbox","UID":1}`))
+		req, _ := http.NewRequest("GET", hs.URL+"/webapi/v0/messages/"+id+"/raw", nil)
 		req.SetBasicAuth("u1@example.com", "pw")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if ct := resp.Header.Get("Content-Type"); ct != "message/rfc822" {
+			t.Fatalf("raw content-type = %q, want message/rfc822", ct)
+		}
 		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if !bytes.Contains(raw, []byte("body here")) {
-			t.Fatalf("MessageRawGet did not return the message body: %.60q", raw)
+			t.Fatalf("raw did not return body: %.60q", raw)
 		}
 	}
 
-	// Delete the message; MessageGet then fails (user error, not crash).
-	call("MessageDelete", `{"Mailbox":"Inbox","UID":1}`)
+	// --- send: 202 + submissionIds, one queue row. ---
 	{
-		req, _ := http.NewRequest("POST", hs.URL+"/webapi/v0/MessageGet", strings.NewReader(`{"Mailbox":"Inbox","UID":1}`))
+		req, _ := http.NewRequest("POST", hs.URL+"/webapi/v0/messages",
+			strings.NewReader(`{"to":["dst@remote.example"],"subject":"hello","text":"greetings"}`))
 		req.SetBasicAuth("u1@example.com", "pw")
-		resp, _ := http.DefaultClient.Do(req)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("POST messages status = %d, want 202", resp.StatusCode)
+		}
 		var out map[string]any
 		json.NewDecoder(resp.Body).Decode(&out)
 		resp.Body.Close()
-		if _, ok := out["Error"]; !ok {
-			t.Fatalf("MessageGet after delete should error, got %v", out)
+		if ids, _ := out["submissionIds"].([]any); len(ids) != 1 {
+			t.Fatalf("send submissionIds = %v, want 1", out["submissionIds"])
+		}
+	}
+	var qn int
+	scan(t, s, ctx, `SELECT count(*) FROM queue`, &qn)
+	if qn != 1 {
+		t.Fatalf("queue rows = %d, want 1 after send", qn)
+	}
+
+	// --- reply: derives recipient + threading, enqueues. ---
+	{
+		req, _ := http.NewRequest("POST", hs.URL+"/webapi/v0/messages/"+id+"/reply",
+			strings.NewReader(`{"text":"thanks"}`))
+		req.SetBasicAuth("u1@example.com", "pw")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("POST reply status = %d, want 202", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	scan(t, s, ctx, `SELECT count(*) FROM queue`, &qn)
+	if qn != 2 {
+		t.Fatalf("queue rows = %d, want 2 after reply", qn)
+	}
+
+	// --- flag via PATCH: add \Seen, becomes read. ---
+	do("PATCH", "/webapi/v0/messages/"+id, `{"addKeywords":["\\Seen"]}`)
+	_, get2 := do("GET", "/webapi/v0/messages/"+id, "")
+	if get2["unread"] != false {
+		t.Fatalf("after \\Seen PATCH, unread = %v, want false", get2["unread"])
+	}
+
+	// --- thread get: the message belongs to a thread. ---
+	if tid, _ := get2["threadId"].(string); tid != "" {
+		st, th := do("GET", "/webapi/v0/threads/"+tid, "")
+		if st != http.StatusOK {
+			t.Fatalf("GET thread status = %d, want 200", st)
+		}
+		if tmsgs, _ := th["messages"].([]any); len(tmsgs) < 1 {
+			t.Fatalf("thread returned no messages: %v", th)
 		}
 	}
 
-	t.Logf("OK: webapi auth + Send(enqueue) + Suppression add/present/list/remove + Message get/flags/raw/delete over real HTTP")
+	// --- suppressions: PUT (idempotent) / GET / list / DELETE. ---
+	st, _ = do("PUT", "/webapi/v0/suppressions/bad@remote.example", `{"reason":"bounce"}`)
+	if st != http.StatusOK {
+		t.Fatalf("PUT suppression status = %d, want 200", st)
+	}
+	st, _ = do("GET", "/webapi/v0/suppressions/bad@remote.example", "")
+	if st != http.StatusOK {
+		t.Fatalf("GET suppression presence status = %d, want 200", st)
+	}
+	_, sl := do("GET", "/webapi/v0/suppressions", "")
+	if sups, _ := sl["suppressions"].([]any); len(sups) != 1 || sups[0] != "bad@remote.example" {
+		t.Fatalf("suppression list = %v, want [bad@remote.example]", sl["suppressions"])
+	}
+	{
+		req, _ := http.NewRequest("DELETE", hs.URL+"/webapi/v0/suppressions/bad@remote.example", nil)
+		req.SetBasicAuth("u1@example.com", "pw")
+		resp, _ := http.DefaultClient.Do(req)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("DELETE suppression status = %d, want 204", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	// Absent now → 404.
+	{
+		req, _ := http.NewRequest("GET", hs.URL+"/webapi/v0/suppressions/bad@remote.example", nil)
+		req.SetBasicAuth("u1@example.com", "pw")
+		resp, _ := http.DefaultClient.Do(req)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET removed suppression status = %d, want 404", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	// --- delete message: 204, then GET → 404. ---
+	{
+		req, _ := http.NewRequest("DELETE", hs.URL+"/webapi/v0/messages/"+id, nil)
+		req.SetBasicAuth("u1@example.com", "pw")
+		resp, _ := http.DefaultClient.Do(req)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("DELETE message status = %d, want 204", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	{
+		req, _ := http.NewRequest("GET", hs.URL+"/webapi/v0/messages/"+id, nil)
+		req.SetBasicAuth("u1@example.com", "pw")
+		resp, _ := http.DefaultClient.Do(req)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET deleted message status = %d, want 404", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	t.Logf("OK: REST auth + mailboxes + list/get/raw + send/reply(enqueue) + PATCH flag + thread + suppressions + delete over real HTTP")
 }
 
 func scan(t *testing.T, s *postgres.Store, ctx context.Context, sql string, dst any, args ...any) {
@@ -177,6 +283,21 @@ func scan(t *testing.T, s *postgres.Store, ctx context.Context, sql string, dst 
 	if err := s.Pool.QueryRow(ctx, sql, args...).Scan(dst); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func hasMailbox(v any, name string) bool {
+	list, _ := v.([]any)
+	for _, x := range list {
+		if mb, ok := x.(map[string]any); ok && mb["name"] == name {
+			return true
+		}
+	}
+	return false
+}
+
+func toString(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func mem(s string) store.BlobReader {
