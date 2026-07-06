@@ -45,6 +45,12 @@ type Directory interface {
 	// exactly one tenant.
 	AuthenticatePrincipal(ctx context.Context, login string, cred Credential) (TenantScope, Principal, error)
 
+	// AuthenticateAPIKey verifies a bearer API key (form omk_<prefix>_<secret>)
+	// and returns the tenant scope, principal, and the account id the key acts as.
+	// It is the account-scoped equivalent of a login, used by the JMAP/WebAPI
+	// HTTP surfaces for agent-facing Bearer auth.
+	AuthenticateAPIKey(ctx context.Context, token string) (TenantScope, Principal, int64, error)
+
 	// ResolveInbound is the ONLY unauthenticated resolver. Inbound SMTP arrives
 	// at a domain with no principal; this returns a delivery-only handle bound
 	// to a single account. It cannot be widened to read or list the mailbox.

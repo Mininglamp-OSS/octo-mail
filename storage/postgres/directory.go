@@ -2,7 +2,10 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -150,6 +153,126 @@ func (d *Directory) SetPassword(ctx context.Context, login, password string) err
 		return fmt.Errorf("no such principal %q", login)
 	}
 	return nil
+}
+
+// IssueAPIKey mints an account-scoped API key for a login and stores a hash of
+// its secret half. The full token (omk_<prefix>_<secret>) is returned once and
+// never recoverable afterward. login must be an email address that maps to an
+// account (the address the key will act as).
+func (d *Directory) IssueAPIKey(ctx context.Context, login, name string) (string, error) {
+	if name == "" {
+		name = "api key"
+	}
+	var principalID, tenantID int64
+	err := d.s.Pool.QueryRow(ctx,
+		`SELECT id, tenant_id FROM principals WHERE login=$1`, login).Scan(&principalID, &tenantID)
+	if err == pgx.ErrNoRows {
+		return "", fmt.Errorf("no such principal %q", login)
+	}
+	if err != nil {
+		return "", err
+	}
+	addr, err := smtp.ParseAddress(login)
+	if err != nil {
+		return "", fmt.Errorf("login must be an email address: %w", err)
+	}
+	var accountID int64
+	err = d.s.Pool.QueryRow(ctx,
+		`SELECT a.account_id
+		 FROM addresses a
+		 JOIN domains dom ON dom.id = a.domain_id
+		 WHERE a.tenant_id=$1 AND dom.domain=$2 AND a.localpart=$3`,
+		tenantID, addr.Domain.Name(), string(addr.Localpart)).Scan(&accountID)
+	if err == pgx.ErrNoRows {
+		return "", fmt.Errorf("no account for address %q", login)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	prefix, secret, err := newAPIKeyToken()
+	if err != nil {
+		return "", err
+	}
+	cred, err := auth.HashAPIKey(secret)
+	if err != nil {
+		return "", err
+	}
+	credJSON, err := cred.Marshal()
+	if err != nil {
+		return "", err
+	}
+	if _, err := d.s.Pool.Exec(ctx,
+		`INSERT INTO api_keys (tenant_id, account_id, login, name, key_prefix, cred)
+		 VALUES ($1,$2,$3,$4,$5,$6)`,
+		tenantID, accountID, login, name, prefix, credJSON); err != nil {
+		return "", err
+	}
+	return "omk_" + prefix + "_" + secret, nil
+}
+
+// AuthenticateAPIKey verifies a bearer API key and returns the tenant scope,
+// principal, and account id it acts as. Token form omk_<prefix>_<secret>: lookup
+// by the indexed prefix among non-revoked keys, then constant-time verify the
+// secret. Failure is uniform (does not leak key existence).
+func (d *Directory) AuthenticateAPIKey(ctx context.Context, token string) (directory.TenantScope, directory.Principal, int64, error) {
+	fail := fmt.Errorf("authentication failed")
+	prefix, secret, ok := parseAPIKeyToken(token)
+	if !ok {
+		return nil, directory.Principal{}, 0, fail
+	}
+	var (
+		keyID, tenantID, accountID int64
+		login                      string
+		credJSON                   []byte
+	)
+	err := d.s.Pool.QueryRow(ctx,
+		`SELECT id, tenant_id, account_id, login, cred FROM api_keys
+		 WHERE key_prefix=$1 AND revoked_at IS NULL`, prefix).
+		Scan(&keyID, &tenantID, &accountID, &login, &credJSON)
+	if err == pgx.ErrNoRows {
+		return nil, directory.Principal{}, 0, fail
+	}
+	if err != nil {
+		return nil, directory.Principal{}, 0, err
+	}
+	if !auth.VerifyAPIKey(credJSON, secret) {
+		return nil, directory.Principal{}, 0, fail
+	}
+	ts, err := d.tenantScope(ctx, tenantID)
+	if err != nil {
+		return nil, directory.Principal{}, 0, err
+	}
+	_, _ = d.s.Pool.Exec(ctx, `UPDATE api_keys SET last_used_at=now() WHERE id=$1`, keyID)
+	return ts, directory.Principal{TenantID: tenantID, Login: login}, accountID, nil
+}
+
+// newAPIKeyToken generates a random (prefix, secret) pair: prefix is a short
+// public lookup selector, secret is the high-entropy half that is hashed.
+func newAPIKeyToken() (prefix, secret string, err error) {
+	pb := make([]byte, 6)
+	sb := make([]byte, 24) // 192-bit secret
+	if _, err = rand.Read(pb); err != nil {
+		return "", "", err
+	}
+	if _, err = rand.Read(sb); err != nil {
+		return "", "", err
+	}
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
+	return strings.ToLower(enc.EncodeToString(pb)), strings.ToLower(enc.EncodeToString(sb)), nil
+}
+
+// parseAPIKeyToken splits an omk_<prefix>_<secret> token.
+func parseAPIKeyToken(token string) (prefix, secret string, ok bool) {
+	rest, found := strings.CutPrefix(token, "omk_")
+	if !found {
+		return "", "", false
+	}
+	prefix, secret, found = strings.Cut(rest, "_")
+	if !found || prefix == "" || secret == "" {
+		return "", "", false
+	}
+	return prefix, secret, true
 }
 
 func (d *Directory) tenantScope(ctx context.Context, tenantID int64) (*tenantScope, error) {

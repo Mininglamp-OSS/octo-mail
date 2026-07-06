@@ -39,6 +39,40 @@ func cmdPasswd(args []string) error {
 	return nil
 }
 
+// cmdAPIKey manages account-scoped API keys:
+//
+//	octo-mail apikey create <login> [name]
+//
+// It mints a bearer token (omk_...) that authenticates as the login's account on
+// the JMAP/WebAPI HTTP surfaces. The token is printed ONCE and is not
+// recoverable afterward.
+func cmdAPIKey(args []string) error {
+	if len(args) < 2 || args[0] != "create" {
+		return fmt.Errorf("usage: octo-mail apikey create <login> [name]")
+	}
+	login := args[1]
+	name := "api key"
+	if len(args) >= 3 {
+		name = args[2]
+	}
+	ctx := context.Background()
+	cfg := loadConfig()
+
+	// No blob store needed for key issuance (directory/DB only).
+	s, err := postgres.Open(ctx, cfg.dsn, nil)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	token, err := s.NewDirectory().IssueAPIKey(ctx, login, name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("api key created for %s (%q)\nsecret (shown once): %s\n", login, name, token)
+	return nil
+}
+
 // cmdGenDKIM generates a per-tenant DKIM key and prints the TXT record to
 // publish: octo-mail gendkim <tenantID> <domain> <selector>.
 func cmdGenDKIM(args []string) error {

@@ -28,12 +28,16 @@ const (
 // scramIterations is the PBKDF2 iteration count for SCRAM-SHA-256 verifiers.
 const scramIterations = 4096
 
-// Cred is the JSON structure stored in principals.cred.
+// Cred is the JSON structure stored in principals.cred (and api_keys.cred).
 type Cred struct {
 	Argon2id *Argon2idCred `json:"argon2id,omitempty"`
 	// ScramSHA256 is a salted verifier enabling the SASL SCRAM-SHA-256 exchange
 	// without the server ever holding the plaintext password.
 	ScramSHA256 *ScramCred `json:"scram_sha256,omitempty"`
+	// APIKeySHA256 is a hash of an API key's secret half. API keys are
+	// high-entropy random tokens, so a fast SHA-256 (constant-time compared) is
+	// sufficient and avoids the per-request cost of argon2.
+	APIKeySHA256 *APIKeyCred `json:"apikey_sha256,omitempty"`
 	// Future: TLS pubkey fingerprints, app passwords.
 }
 
@@ -52,6 +56,11 @@ type ScramCred struct {
 	Salt           string `json:"salt"`  // base64
 	SaltedPassword string `json:"spwd"`  // base64
 	Iterations     int    `json:"iters"` // PBKDF2 iterations
+}
+
+// APIKeyCred holds a SHA-256 hash of an API key's secret half.
+type APIKeyCred struct {
+	Hash string `json:"hash"` // base64 of sha256(secret)
 }
 
 // HashPassword produces a Cred for storage from a plaintext password. It stores
@@ -131,4 +140,35 @@ func SCRAMVerifier(credJSON []byte) (salt, saltedPassword []byte, iterations int
 		return nil, nil, 0, false
 	}
 	return salt, saltedPassword, sc.Iterations, true
+}
+
+// HashAPIKey produces a Cred storing a SHA-256 hash of an API key's secret half.
+// API keys are high-entropy random tokens, so a plain (fast) hash with a
+// constant-time compare is standard and appropriate — unlike passwords, they do
+// not need a slow KDF.
+func HashAPIKey(secret string) (Cred, error) {
+	if secret == "" {
+		return Cred{}, fmt.Errorf("empty api key secret")
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return Cred{
+		APIKeySHA256: &APIKeyCred{
+			Hash: base64.StdEncoding.EncodeToString(sum[:]),
+		},
+	}, nil
+}
+
+// VerifyAPIKey reports whether secret matches the stored API-key credential.
+// Constant-time; returns false (not an error) on any mismatch or missing hash.
+func VerifyAPIKey(credJSON []byte, secret string) bool {
+	var c Cred
+	if err := json.Unmarshal(credJSON, &c); err != nil || c.APIKeySHA256 == nil {
+		return false
+	}
+	want, err := base64.StdEncoding.DecodeString(c.APIKeySHA256.Hash)
+	if err != nil {
+		return false
+	}
+	got := sha256.Sum256([]byte(secret))
+	return subtle.ConstantTimeCompare(got[:], want) == 1
 }

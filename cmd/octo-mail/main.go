@@ -64,6 +64,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "apikey":
+			if err := cmdAPIKey(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "octo-mail apikey:", err)
+				os.Exit(1)
+			}
+			return
 		case "export":
 			if err := cmdExport(os.Args[2:]); err != nil {
 				fmt.Fprintln(os.Stderr, "octo-mail export:", err)
@@ -77,7 +83,7 @@ func main() {
 			}
 			return
 		default:
-			fmt.Fprintf(os.Stderr, "octo-mail: unknown subcommand %q (use: serve | passwd | gendkim | export | import)\n", os.Args[1])
+			fmt.Fprintf(os.Stderr, "octo-mail: unknown subcommand %q (use: serve | passwd | gendkim | apikey | export | import)\n", os.Args[1])
 			os.Exit(2)
 		}
 	}

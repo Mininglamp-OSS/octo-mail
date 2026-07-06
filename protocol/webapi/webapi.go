@@ -55,9 +55,27 @@ type authCtx struct {
 }
 
 func (s *Server) auth(r *http.Request) (authCtx, error) {
+	// API key first: Authorization: Bearer omk_<prefix>_<secret>.
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer omk_") {
+		token := strings.TrimPrefix(h, "Bearer ")
+		scope, princ, _, err := s.Dir.AuthenticateAPIKey(r.Context(), token)
+		if err != nil {
+			return authCtx{}, errUser("authentication failed")
+		}
+		addr, err := smtp.ParseAddress(princ.Login)
+		if err != nil {
+			return authCtx{}, errUser("bad login address")
+		}
+		acc, err := scope.AccountForAddress(r.Context(), addr.Path())
+		if err != nil {
+			return authCtx{}, errUser("no account for login")
+		}
+		return authCtx{acc: acc, scope: scope, login: princ.Login}, nil
+	}
+
 	login, password, ok := r.BasicAuth()
 	if !ok {
-		return authCtx{}, errUser("missing basic auth")
+		return authCtx{}, errUser("missing credentials")
 	}
 	addr, err := smtp.ParseAddress(login)
 	if err != nil {

@@ -177,12 +177,32 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-// authAccount extracts the account from HTTP Basic auth (login:anything) via the
-// directory. Credential verification is stubbed pending the auth path.
+// authAccount extracts the account from the request's credentials via the
+// directory. It accepts either an API key (Authorization: Bearer omk_...) or
+// HTTP Basic auth (login + password). Both resolve to the same
+// (account, scope, login) tuple, so every endpoint handles them uniformly.
 func (s *Server) authAccount(r *http.Request) (store.Account, directory.TenantScope, string, error) {
+	// API key first: Authorization: Bearer omk_<prefix>_<secret>.
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer omk_") {
+		token := strings.TrimPrefix(h, "Bearer ")
+		scope, princ, _, err := s.Dir.AuthenticateAPIKey(r.Context(), token)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		addr, err := smtp.ParseAddress(princ.Login)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		acc, err := scope.AccountForAddress(r.Context(), addr.Path())
+		if err != nil {
+			return nil, nil, "", err
+		}
+		return acc, scope, princ.Login, nil
+	}
+
 	login, password, ok := r.BasicAuth()
 	if !ok {
-		return nil, nil, "", fmt.Errorf("missing basic auth")
+		return nil, nil, "", fmt.Errorf("missing credentials")
 	}
 	addr, err := smtp.ParseAddress(login)
 	if err != nil {
