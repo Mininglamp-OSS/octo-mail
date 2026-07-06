@@ -185,21 +185,22 @@ or S3; the substrate has no knowledge of IMAP.
 
 ## Contributing
 
-Contributions are welcome. Please open an issue to discuss substantial changes before
-sending a pull request. Before submitting:
+Contributions are welcome. Please open an issue to discuss substantial changes
+before sending a pull request, and see **[CONTRIBUTING.md](CONTRIBUTING.md)** for
+the full workflow. Before submitting:
 
 ```sh
 make fmt && make vet && make test
 ```
 
-Keep changes consistent with the surrounding code and the architectural boundaries
-described above (protocol packages depend on `core` interfaces only, never on
-`storage`).
+Keep changes consistent with the surrounding code and the architectural
+boundaries described above (protocol packages depend on `core` interfaces only,
+never on `storage`).
 
 ## Security
 
-Please **do not** file public issues for security vulnerabilities. Instead, report them
-privately to the maintainers via
+Please **do not** file public issues for security vulnerabilities. See
+**[SECURITY.md](SECURITY.md)** — report privately via
 [GitHub security advisories](https://github.com/Mininglamp-OSS/octo-mail/security/advisories/new).
 
 ## License
