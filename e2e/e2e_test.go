@@ -360,3 +360,82 @@ func TestBlobGC(t *testing.T) {
 	}
 	t.Logf("HIGH-2 OK: expunged message's body reclaimed from MinIO (rows=%d blobs=%d) against the deployed stack", rows, blobs)
 }
+
+// TestAPIKeyAuth proves native API-key auth against the deployed stack: a key
+// minted via the store authenticates on the real JMAP HTTP surface with
+// Authorization: Bearer omk_..., equivalently to Basic — and a garbage key is
+// rejected.
+func TestAPIKeyAuth(t *testing.T) {
+	waitHealthy(t)
+	ctx := context.Background()
+
+	login := "keyagent@keydom.test"
+	provisionAccount(t, "keyagent", "keydom.test", login, "key-pw")
+
+	// Mint a key via the store (the operator/CLI path is octo-mail apikey create).
+	bs, err := blob.NewS3(blob.S3Config{Endpoint: s3Endpoint, Region: "us-east-1", Bucket: s3Bucket, AccessKey: s3Access, SecretKey: s3Secret})
+	if err != nil {
+		t.Fatalf("open s3: %v", err)
+	}
+	st, err := postgres.Open(ctx, pgDSN, bs)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer st.Close()
+	token, err := st.NewDirectory().IssueAPIKey(ctx, login, "e2e agent key")
+	if err != nil {
+		t.Fatalf("IssueAPIKey: %v", err)
+	}
+
+	// /jmap/session with Bearer must succeed and identify alice.
+	body := bearerGet(t, jmapURL+"/jmap/session", token)
+	if !bytes.Contains(body, []byte(login)) {
+		t.Fatalf("session with Bearer key did not identify %s: %s", login, body)
+	}
+
+	// A JMAP method call with Bearer must work too.
+	code := bearerPostStatus(t, jmapURL+"/jmap/api", token,
+		`{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":"any"},"c0"]]}`)
+	if code != 200 {
+		t.Fatalf("Bearer JMAP call -> %d, want 200", code)
+	}
+
+	// A garbage key must be rejected (401).
+	if c := bearerPostStatus(t, jmapURL+"/jmap/api", "omk_deadbeef_nope",
+		`{"using":["urn:ietf:params:jmap:core"],"methodCalls":[]}`); c != 401 {
+		t.Fatalf("garbage Bearer key -> %d, want 401", c)
+	}
+	t.Logf("API-KEY OK: Bearer omk_ key authenticates on JMAP (session + method call) as %s; garbage key rejected", login)
+}
+
+// bearerGet does a GET with an Authorization: Bearer header; fails on non-200.
+func bearerGet(t *testing.T, url, token string) []byte {
+	t.Helper()
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET %s -> %d: %s", url, resp.StatusCode, b)
+	}
+	return b
+}
+
+// bearerPostStatus POSTs a JSON body with a Bearer header and returns the status.
+func bearerPostStatus(t *testing.T, url, token, jsonBody string) int {
+	t.Helper()
+	req, _ := http.NewRequest("POST", url, strings.NewReader(jsonBody))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
