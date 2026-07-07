@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Start MinIO (S3)
         # The S3 blob tests point at localhost:29000 with these credentials and
@@ -59,7 +59,7 @@ jobs:
             "mc alias set local http://localhost:29000 octoadmin 70521a1a521a5dfd103ce85fe475d8cc && mc mb -p local/octo-mail-test"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.25"
           cache: true
