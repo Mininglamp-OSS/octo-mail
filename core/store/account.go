@@ -47,6 +47,12 @@ type BlobReader interface {
 type Account interface {
 	ID() int64
 
+	// TenantID returns the id of the tenant this account belongs to. Used to
+	// scope tenant-shared resources (e.g. the content-addressed blob store) to
+	// the authenticated tenant, so a client-supplied id can never name another
+	// tenant's namespace.
+	TenantID() int64
+
 	// Tx runs fn in a database transaction (read-write). The advisory writer
 	// lock is taken inside write transactions.
 	Tx(ctx context.Context, fn func(Tx) error) error

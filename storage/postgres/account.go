@@ -23,8 +23,9 @@ type account struct {
 	name     string
 }
 
-func (a *account) ID() int64    { return a.id }
-func (a *account) Close() error { return nil }
+func (a *account) ID() int64       { return a.id }
+func (a *account) TenantID() int64 { return a.tenantID }
+func (a *account) Close() error    { return nil }
 
 // pgTx is the store.Tx implementation: a live pgx transaction plus the write
 // state (accumulated changelog entries and the running modseq head).

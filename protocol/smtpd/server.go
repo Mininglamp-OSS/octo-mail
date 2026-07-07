@@ -164,6 +164,7 @@ type conn struct {
 	authed      bool
 	authTenant  int64
 	authAccount int64
+	authScope   directory.TenantScope // authenticated scope, for MAIL FROM ownership checks
 	subRcpts    []string
 }
 
@@ -421,6 +422,7 @@ func (c *conn) authPlain(arg string) {
 	c.authed = true
 	c.authTenant = scope.Tenant().ID
 	c.authAccount = acc.ID()
+	c.authScope = scope
 	c.writef("235 2.7.0 authenticated")
 }
 
@@ -498,6 +500,7 @@ func (c *conn) authSCRAM(ir string, plus bool) {
 	c.authed = true
 	c.authTenant = scope.Tenant().ID
 	c.authAccount = acc.ID()
+	c.authScope = scope
 	c.writef("235 2.7.0 authenticated")
 }
 
@@ -539,6 +542,25 @@ func (c *conn) saslChallenge(data []byte) ([]byte, bool) {
 	return b, true
 }
 
+// senderOwned reports whether the given MAIL FROM address belongs to the
+// authenticated account. It resolves the address through the authenticated
+// tenant scope and compares the account id, so a submission client cannot send
+// as an address it does not own.
+func (c *conn) senderOwned(mailFrom string) bool {
+	if c.authScope == nil {
+		return false
+	}
+	addr, err := smtp.ParseAddress(mailFrom)
+	if err != nil {
+		return false
+	}
+	owner, err := c.authScope.AccountForAddress(c.ctx, addr.Path())
+	if err != nil {
+		return false
+	}
+	return owner.ID() == c.authAccount
+}
+
 func (c *conn) cmdMail(rest string) {
 	addr, ok := parseAddrParam(rest, "FROM:")
 	if !ok {
@@ -554,6 +576,19 @@ func (c *conn) cmdMail(rest string) {
 	c.reset()
 	c.mailFrom = addr
 	c.haveFrom = true
+	// Submission authz: an authenticated sender may only use a MAIL FROM address
+	// that belongs to its own account. Without this, any authenticated account
+	// could spoof any sender (cross-tenant identity forgery) on the server's
+	// IP/DKIM reputation. Inbound MX traffic (not authed) legitimately carries
+	// arbitrary senders, so this only applies in submission mode. A null return
+	// path ("<>") is not a valid submission sender.
+	if c.authed && c.srv.Submission != nil {
+		if addr == "" || !c.senderOwned(addr) {
+			c.mailFrom, c.haveFrom = "", false
+			c.writef("550 5.7.1 sender %q is not an address of the authenticated account", addr)
+			return
+		}
+	}
 	// Capture DSN request parameters (RFC 3461): RET=FULL|HDRS, ENVID=<id>.
 	c.dsnRet = mailParamStr(rest, "RET")
 	c.dsnEnvID = mailParamStr(rest, "ENVID")
