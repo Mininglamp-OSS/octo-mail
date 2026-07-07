@@ -36,25 +36,27 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
-      # S3 blob tests point at localhost:29000 with these credentials/bucket and
-      # skip if absent; wiring MinIO exercises the real content-addressed S3 path.
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: octoadmin
-          MINIO_ROOT_PASSWORD: 70521a1a521a5dfd103ce85fe475d8cc
-          MINIO_DEFAULT_BUCKETS: octo-mail-test
-        ports:
-          - 29000:9000
-        options: >-
-          --health-cmd "mc ready local || curl -f http://localhost:9000/minio/health/live"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Start MinIO (S3)
+        # The S3 blob tests point at localhost:29000 with these credentials and
+        # skip if absent; running real MinIO exercises the content-addressed S3
+        # path. MinIO needs a `server` command, which GitHub service containers
+        # can't supply, so it runs as a step instead. The bucket is pre-created
+        # because the tests do not create it themselves.
+        run: |
+          docker run -d --name minio -p 29000:9000 \
+            -e MINIO_ROOT_USER=octoadmin \
+            -e MINIO_ROOT_PASSWORD=70521a1a521a5dfd103ce85fe475d8cc \
+            minio/minio server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:29000/minio/health/live && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint sh minio/mc -c \
+            "mc alias set local http://localhost:29000 octoadmin 70521a1a521a5dfd103ce85fe475d8cc && mc mb -p local/octo-mail-test"
 
       - name: Set up Go
         uses: actions/setup-go@v5
