@@ -45,6 +45,18 @@ func (pt *pgTx) Update(v any) error {
 	case *store.Message:
 		seq := pt.nextModSeq()
 		x.ModSeq = seq
+		// Read the prior seen state (account-scoped) so we can adjust the mailbox
+		// unseen/unread counters by the delta. This SELECT also doubles as the
+		// existence+ownership check (fail closed on a foreign/missing id).
+		var oldSeen bool
+		if err := pt.tx.QueryRow(pt.ctx,
+			`SELECT f_seen FROM messages WHERE id=$1 AND account_id=$2`,
+			x.ID, pt.acc.id).Scan(&oldSeen); err != nil {
+			if err == pgx.ErrNoRows {
+				return errNotFound
+			}
+			return err
+		}
 		ct, err := pt.tx.Exec(pt.ctx,
 			`UPDATE messages SET f_seen=$2,f_answered=$3,f_flagged=$4,f_forwarded=$5,f_junk=$6,
 				f_notjunk=$7,f_deleted=$8,f_draft=$9,f_phishing=$10,f_mdnsent=$11,keywords=$12,modseq=$13
@@ -54,10 +66,20 @@ func (pt *pgTx) Update(v any) error {
 		if err != nil {
 			return err
 		}
-		// Account-scoped: a foreign or nonexistent id updates no row. Fail closed
-		// (don't record a changelog entry for a message this account can't touch).
 		if ct.RowsAffected() == 0 {
 			return errNotFound
+		}
+		// Keep the mailbox unseen/unread projection in step with the flag change —
+		// otherwise IMAP STATUS(UNSEEN) and JMAP unreadEmails drift on the commonest
+		// operation (mark-read). unseen and unread share one counter. c_deleted is
+		// intentionally NOT maintained here: it has no reader (IMAP STATUS(DELETED)
+		// recomputes by scanning) and MessageRemove doesn't decrement it, so bumping
+		// it on Update would drift it upward asymmetrically.
+		dUnseen := boolInt(!x.Seen) - boolInt(!oldSeen)
+		if dUnseen != 0 {
+			if err := pt.bumpCounts(x.MailboxID, 0, 0, dUnseen, 0); err != nil {
+				return err
+			}
 		}
 		return pt.record(store.ChangeFlags{
 			MailboxID: x.MailboxID, UID: x.UID, ModSeq: seq, Flags: x.Flags, Mask: x.Flags, Keywords: x.Keywords,

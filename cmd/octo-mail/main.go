@@ -442,6 +442,29 @@ func run() error {
 	projCoord.Tick = func(ctx context.Context) { drainProjections(ctx, log, s, fts, threads) }
 	go projCoord.Run(ctx)
 
+	// Daily IP-warmup maintenance, when an egress pool is configured. This MUST be
+	// a cluster singleton (it resets/advances shared per-IP counters), so it is
+	// leader-gated via its own coordinator — never run per-node. Without it,
+	// sent_today never resets and every warming IP wedges at its stage-0 cap,
+	// deferring then bouncing all egress-pool deliveries within a day or two.
+	if cfg.egressPool {
+		ipr := &deliverability.IPRouter{Pool: s.Pool}
+		const warmupLeaderKey = int64(0x6f6d5f77726d70) // "om_wrmp"
+		warmCoord := ha.NewCoordinator(ha.New(s.Pool, warmupLeaderKey), time.Hour)
+		warmCoord.OnElected = func(context.Context) { log.Info("elected warmup-maintenance leader", "node", cfg.nodeID) }
+		warmCoord.Tick = func(ctx context.Context) {
+			// RunDailyMaintenance claims the day atomically and no-ops if already
+			// done, so this frequent tick (and any post-failover leader) runs the
+			// advance+reset exactly once per UTC day.
+			if ran, n, err := ipr.RunDailyMaintenance(ctx); err != nil {
+				log.Warn("warmup daily maintenance", "err", err)
+			} else if ran {
+				log.Info("warmup daily maintenance ran", "advanced_ips", n)
+			}
+		}
+		go warmCoord.Run(ctx)
+	}
+
 	// Webhook delivery worker.
 	whWorker := &deliverability.WebhookWorker{Pool: s.Pool, NodeID: cfg.nodeID, Batch: 50}
 	go runLoop(ctx, log, "webhook-worker", cfg.queueInterval, func() {

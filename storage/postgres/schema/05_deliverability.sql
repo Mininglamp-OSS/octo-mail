@@ -129,3 +129,11 @@ CREATE TABLE IF NOT EXISTS tlsrpt_reports (
 );
 CREATE INDEX IF NOT EXISTS tlsrpt_reports_domain_idx ON tlsrpt_reports (domain);
 
+-- Marker for once-per-day cluster-singleton maintenance (IP warmup advance +
+-- daily-counter reset). A single row; the leader's periodic tick only acts when
+-- the stored date is behind today's UTC date, so it runs exactly once per day
+-- regardless of tick frequency or which node is leader after a failover.
+CREATE TABLE IF NOT EXISTS maintenance_marker (
+    name     text PRIMARY KEY,
+    last_run date NOT NULL
+);

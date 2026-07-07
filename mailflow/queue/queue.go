@@ -306,6 +306,11 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		derr := w.Deliver(dctx, m)
 		dur := time.Since(start)
 		cancel()
+		// A real delivery attempt was made: count it now (not at claim time), so
+		// a lost lease / crash before delivery never burns the retry budget. This
+		// is the authoritative attempt number for the result log and the
+		// failure/backoff decision below.
+		m.Attempts++
 		if w.ObserveDelivery != nil {
 			result := "ok"
 			if derr != nil {
@@ -355,7 +360,7 @@ func (w *Worker) recordResult(ctx context.Context, m Msg, start time.Time, dur t
 // unleased or its lease has expired (the owning node is presumed dead).
 func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 	rows, err := w.Pool.Query(ctx,
-		`UPDATE queue SET leased_by=$1, lease_until=now()+$2::interval, attempts=attempts+1, last_attempt=now()
+		`UPDATE queue SET leased_by=$1, lease_until=now()+$2::interval, last_attempt=now()
 		 WHERE id IN (
 		     SELECT id FROM queue
 		     WHERE next_attempt <= now()
@@ -468,10 +473,10 @@ func (w *Worker) reschedule(ctx context.Context, m Msg, lastErr error) error {
 			     WHERE id=$1 AND leased_by=$2 FOR UPDATE
 			 )
 			 UPDATE queue q SET leased_by=NULL, lease_until=NULL, next_attempt=now()+$3::interval,
-			     last_error=$4, delayed_dsn=q.delayed_dsn OR $5
+			     last_error=$4, attempts=$6, delayed_dsn=q.delayed_dsn OR $5
 			 FROM prev WHERE q.id=prev.id
 			 RETURNING prev.old`,
-			m.ID, w.NodeID, backoff.String(), errStr, wantDelay).Scan(&wasDelayed)
+			m.ID, w.NodeID, backoff.String(), errStr, wantDelay, m.Attempts).Scan(&wasDelayed)
 		if err == pgx.ErrNoRows {
 			return nil // reclaimed/retired by another node; not ours anymore
 		}

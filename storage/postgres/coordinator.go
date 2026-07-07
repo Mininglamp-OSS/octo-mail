@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -23,7 +24,9 @@ import (
 const notifyChannel = "octo_mail_changelog"
 
 // StartCoordinator launches the cross-node LISTEN loop on a dedicated pooled
-// connection. Call once per node after Open. Runs until ctx is cancelled.
+// connection. Call once per node after Open. Runs until ctx is cancelled,
+// reconnecting (with backoff) across transient connection loss / PG restart /
+// failover so cross-node push is not permanently lost after a blip.
 func (s *Store) StartCoordinator(ctx context.Context) error {
 	conn, err := s.Pool.Acquire(ctx)
 	if err != nil {
@@ -34,8 +37,54 @@ func (s *Store) StartCoordinator(ctx context.Context) error {
 		return err
 	}
 	s.coordEnabled.Store(true)
-	go s.listenLoop(ctx, conn)
+	go s.superviseListen(ctx, conn)
 	return nil
+}
+
+// superviseListen runs listenLoop and, on any non-cancellation failure,
+// re-establishes the LISTEN on a fresh connection and forces a resync of local
+// subscribers (notifications during the outage were missed; truth is the log
+// offset, so replaying from each subscriber's last-seen catches them up).
+func (s *Store) superviseListen(ctx context.Context, conn *pgxpool.Conn) {
+	backoff := 100 * time.Millisecond
+	const maxBackoff = 30 * time.Second
+	for {
+		s.listenLoop(ctx, conn) // returns on ctx cancel or connection error
+		if ctx.Err() != nil {
+			return
+		}
+		// Connection dropped. Re-acquire + re-LISTEN with backoff, then resync.
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			c, err := s.Pool.Acquire(ctx)
+			if err != nil {
+				backoff = minDur(backoff*2, maxBackoff)
+				continue
+			}
+			if _, err := c.Exec(ctx, "LISTEN "+notifyChannel); err != nil {
+				c.Release()
+				backoff = minDur(backoff*2, maxBackoff)
+				continue
+			}
+			conn = c
+			backoff = 100 * time.Millisecond
+			// Missed notifications during the gap: replay every local subscriber
+			// from its last-seen so no change is silently lost.
+			s.resyncAll(ctx)
+			break
+		}
+	}
+}
+
+func minDur(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Store) listenLoop(ctx context.Context, conn *pgxpool.Conn) {
@@ -43,13 +92,32 @@ func (s *Store) listenLoop(ctx context.Context, conn *pgxpool.Conn) {
 	for {
 		n, err := conn.Conn().WaitForNotification(ctx)
 		if err != nil {
-			return // ctx cancelled or connection lost; node resyncs on reconnect
+			return // ctx cancelled or connection lost; supervisor reconnects + resyncs
 		}
 		accID, seq, ok := parseNotify(n.Payload)
 		if !ok {
 			continue
 		}
 		s.onRemoteChange(ctx, accID, seq)
+	}
+}
+
+// resyncAll replays the change-log for every account with local subscribers,
+// from each subscriber's last-seen offset. Used after a LISTEN reconnect to
+// recover notifications missed during the outage.
+func (s *Store) resyncAll(ctx context.Context) {
+	s.mu.Lock()
+	accts := make([]int64, 0, len(s.subs))
+	for accID := range s.subs {
+		accts = append(accts, accID)
+	}
+	s.mu.Unlock()
+	for _, accID := range accts {
+		head, err := s.headOf(accID)
+		if err != nil {
+			continue
+		}
+		s.onRemoteChange(ctx, accID, head)
 	}
 }
 
