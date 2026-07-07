@@ -91,5 +91,41 @@ func TestSubmissionSenderOwnership(t *testing.T) {
 		t.Fatalf("spoofed external MAIL FROM: got %q, want 550", r)
 	}
 
+	// --- Sequencing bypass (PR #26 review): MAIL FROM before AUTH must not
+	// survive a later AUTH. Fresh connection. ---
+	cli2, srv2 := net.Pipe()
+	go func() { _ = subSrv.Serve(ctx, srv2) }()
+	_ = cli2.SetDeadline(time.Now().Add(15 * time.Second))
+	br2 := bufio.NewReader(cli2)
+	rd2 := func() string { line, _ := br2.ReadString('\n'); return strings.TrimSpace(line) }
+	cmd2 := func(line string) string { cli2.Write([]byte(line + "\r\n")); return rd2() }
+
+	rd2() // greeting
+	cli2.Write([]byte("EHLO client\r\n"))
+	for {
+		line, _ := br2.ReadString('\n')
+		if strings.HasPrefix(line, "250 ") {
+			break
+		}
+	}
+	// Pre-auth MAIL FROM with a spoofed sender must be rejected outright
+	// (submission requires AUTH first).
+	if r := cmd2("MAIL FROM:<ceo@victim.example>"); !strings.HasPrefix(r, "530") {
+		t.Fatalf("pre-auth MAIL FROM: got %q, want 530 (auth required)", r)
+	}
+	// Authenticate as alice.
+	if r := cmd2("AUTH PLAIN " + tok); !strings.HasPrefix(r, "235") {
+		t.Fatalf("AUTH (seq test): got %q, want 235", r)
+	}
+	// The spoofed transaction must not have survived: RCPT with no valid MAIL
+	// must be refused, proving c.mailFrom was cleared.
+	if r := cmd2("RCPT TO:<target@remote.example>"); !strings.HasPrefix(r, "503") {
+		t.Fatalf("RCPT after pre-auth-spoof+AUTH: got %q, want 503 (need MAIL first)", r)
+	}
+	// And a fresh MAIL as the spoofed sender is still rejected on ownership.
+	if r := cmd2("MAIL FROM:<ceo@victim.example>"); !strings.HasPrefix(r, "550") {
+		t.Fatalf("post-auth spoofed MAIL FROM: got %q, want 550", r)
+	}
+
 	t.Logf("OK: submission MAIL FROM ownership enforced — own address 250, foreign/spoofed 550")
 }

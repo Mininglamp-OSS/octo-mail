@@ -45,7 +45,7 @@ func (pt *pgTx) Update(v any) error {
 	case *store.Message:
 		seq := pt.nextModSeq()
 		x.ModSeq = seq
-		_, err := pt.tx.Exec(pt.ctx,
+		ct, err := pt.tx.Exec(pt.ctx,
 			`UPDATE messages SET f_seen=$2,f_answered=$3,f_flagged=$4,f_forwarded=$5,f_junk=$6,
 				f_notjunk=$7,f_deleted=$8,f_draft=$9,f_phishing=$10,f_mdnsent=$11,keywords=$12,modseq=$13
 			 WHERE id=$1 AND account_id=$14`,
@@ -53,6 +53,11 @@ func (pt *pgTx) Update(v any) error {
 			x.Phishing, x.MDNSent, x.Keywords, int64(seq), pt.acc.id)
 		if err != nil {
 			return err
+		}
+		// Account-scoped: a foreign or nonexistent id updates no row. Fail closed
+		// (don't record a changelog entry for a message this account can't touch).
+		if ct.RowsAffected() == 0 {
+			return errNotFound
 		}
 		return pt.record(store.ChangeFlags{
 			MailboxID: x.MailboxID, UID: x.UID, ModSeq: seq, Flags: x.Flags, Mask: x.Flags, Keywords: x.Keywords,

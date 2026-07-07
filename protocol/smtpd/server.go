@@ -423,6 +423,7 @@ func (c *conn) authPlain(arg string) {
 	c.authTenant = scope.Tenant().ID
 	c.authAccount = acc.ID()
 	c.authScope = scope
+	c.reset() // discard any pre-auth transaction so a spoofed MAIL FROM can't survive AUTH
 	c.writef("235 2.7.0 authenticated")
 }
 
@@ -501,6 +502,7 @@ func (c *conn) authSCRAM(ir string, plus bool) {
 	c.authTenant = scope.Tenant().ID
 	c.authAccount = acc.ID()
 	c.authScope = scope
+	c.reset() // discard any pre-auth transaction so a spoofed MAIL FROM can't survive AUTH
 	c.writef("235 2.7.0 authenticated")
 }
 
@@ -576,13 +578,20 @@ func (c *conn) cmdMail(rest string) {
 	c.reset()
 	c.mailFrom = addr
 	c.haveFrom = true
-	// Submission authz: an authenticated sender may only use a MAIL FROM address
-	// that belongs to its own account. Without this, any authenticated account
-	// could spoof any sender (cross-tenant identity forgery) on the server's
-	// IP/DKIM reputation. Inbound MX traffic (not authed) legitimately carries
-	// arbitrary senders, so this only applies in submission mode. A null return
+	// Submission authz. In submission mode the sender must be authenticated
+	// FIRST, and may then only use a MAIL FROM address that belongs to its own
+	// account — otherwise any account could spoof any sender on the server's
+	// IP/DKIM reputation. Rejecting MAIL before AUTH also closes the sequencing
+	// bypass where MAIL FROM:<foreign> is sent pre-auth and the transaction
+	// survives a later AUTH. Inbound MX traffic (Submission==nil, never authed)
+	// legitimately carries arbitrary senders and is unaffected. A null return
 	// path ("<>") is not a valid submission sender.
-	if c.authed && c.srv.Submission != nil {
+	if c.srv.Submission != nil {
+		if !c.authed {
+			c.mailFrom, c.haveFrom = "", false
+			c.writef("%d 5.7.1 authentication required before MAIL", 530)
+			return
+		}
 		if addr == "" || !c.senderOwned(addr) {
 			c.mailFrom, c.haveFrom = "", false
 			c.writef("550 5.7.1 sender %q is not an address of the authenticated account", addr)
