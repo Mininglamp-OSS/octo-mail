@@ -609,10 +609,12 @@ func (c *conn) cmdMail(rest string) {
 		hu := mailParamStr(rest, "HOLDUNTIL")
 		switch {
 		case hasHF && hu != "":
+			c.reset()
 			c.writef("%d 5.5.4 HOLDFOR and HOLDUNTIL are mutually exclusive", smtp.C501BadParamSyntax)
 			return
 		case hasHF:
 			if hf < 0 || time.Duration(hf)*time.Second > maxFutureRelease {
+				c.reset()
 				c.writef("%d 5.5.4 HOLDFOR out of range", smtp.C501BadParamSyntax)
 				return
 			}
@@ -620,10 +622,12 @@ func (c *conn) cmdMail(rest string) {
 		case hu != "":
 			t, err := time.Parse(time.RFC3339, hu)
 			if err != nil {
+				c.reset()
 				c.writef("%d 5.5.4 bad HOLDUNTIL date-time", smtp.C501BadParamSyntax)
 				return
 			}
 			if t.After(time.Now().Add(maxFutureRelease)) {
+				c.reset()
 				c.writef("%d 5.5.4 HOLDUNTIL out of range", smtp.C501BadParamSyntax)
 				return
 			}

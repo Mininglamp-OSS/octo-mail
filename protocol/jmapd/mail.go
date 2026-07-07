@@ -711,13 +711,13 @@ func (s *Server) emailCreate(ctx context.Context, acc store.Account, obj map[str
 	if !ok {
 		return nil, false
 	}
-	// Isolation: the blobId carries a tenant id, but it is client-controlled.
-	// A blob may only be read within the authenticated account's own tenant —
-	// never the tenant named in the id — or one tenant could read another's
-	// stored bytes by guessing/reproducing a content hash. Reject a mismatch
-	// and always open under the authenticated tenant.
+	// Isolation: the blobId is client-controlled. (1) Its tenant component must
+	// equal the authenticated account's tenant — a blob is only ever read under
+	// the auth tenant, never the id's. (2) Its ref must be a canonical sha256
+	// content-address, so a crafted ref (e.g. containing "../") can't traverse
+	// out of the tenant key prefix. Both are also enforced in the blob store.
 	tenantID := acc.TenantID()
-	if blobTenant != tenantID {
+	if blobTenant != tenantID || !blob.Ref(ref).Valid() {
 		return nil, false
 	}
 	// Resolve target mailbox: first key of mailboxIds, else "Drafts".
