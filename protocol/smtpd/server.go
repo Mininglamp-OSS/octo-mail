@@ -164,6 +164,7 @@ type conn struct {
 	authed      bool
 	authTenant  int64
 	authAccount int64
+	authScope   directory.TenantScope // authenticated scope, for MAIL FROM ownership checks
 	subRcpts    []string
 }
 
@@ -421,6 +422,8 @@ func (c *conn) authPlain(arg string) {
 	c.authed = true
 	c.authTenant = scope.Tenant().ID
 	c.authAccount = acc.ID()
+	c.authScope = scope
+	c.reset() // discard any pre-auth transaction so a spoofed MAIL FROM can't survive AUTH
 	c.writef("235 2.7.0 authenticated")
 }
 
@@ -498,6 +501,8 @@ func (c *conn) authSCRAM(ir string, plus bool) {
 	c.authed = true
 	c.authTenant = scope.Tenant().ID
 	c.authAccount = acc.ID()
+	c.authScope = scope
+	c.reset() // discard any pre-auth transaction so a spoofed MAIL FROM can't survive AUTH
 	c.writef("235 2.7.0 authenticated")
 }
 
@@ -539,6 +544,25 @@ func (c *conn) saslChallenge(data []byte) ([]byte, bool) {
 	return b, true
 }
 
+// senderOwned reports whether the given MAIL FROM address belongs to the
+// authenticated account. It resolves the address through the authenticated
+// tenant scope and compares the account id, so a submission client cannot send
+// as an address it does not own.
+func (c *conn) senderOwned(mailFrom string) bool {
+	if c.authScope == nil {
+		return false
+	}
+	addr, err := smtp.ParseAddress(mailFrom)
+	if err != nil {
+		return false
+	}
+	owner, err := c.authScope.AccountForAddress(c.ctx, addr.Path())
+	if err != nil {
+		return false
+	}
+	return owner.ID() == c.authAccount
+}
+
 func (c *conn) cmdMail(rest string) {
 	addr, ok := parseAddrParam(rest, "FROM:")
 	if !ok {
@@ -554,6 +578,26 @@ func (c *conn) cmdMail(rest string) {
 	c.reset()
 	c.mailFrom = addr
 	c.haveFrom = true
+	// Submission authz. In submission mode the sender must be authenticated
+	// FIRST, and may then only use a MAIL FROM address that belongs to its own
+	// account — otherwise any account could spoof any sender on the server's
+	// IP/DKIM reputation. Rejecting MAIL before AUTH also closes the sequencing
+	// bypass where MAIL FROM:<foreign> is sent pre-auth and the transaction
+	// survives a later AUTH. Inbound MX traffic (Submission==nil, never authed)
+	// legitimately carries arbitrary senders and is unaffected. A null return
+	// path ("<>") is not a valid submission sender.
+	if c.srv.Submission != nil {
+		if !c.authed {
+			c.mailFrom, c.haveFrom = "", false
+			c.writef("%d 5.7.1 authentication required before MAIL", 530)
+			return
+		}
+		if addr == "" || !c.senderOwned(addr) {
+			c.mailFrom, c.haveFrom = "", false
+			c.writef("550 5.7.1 sender %q is not an address of the authenticated account", addr)
+			return
+		}
+	}
 	// Capture DSN request parameters (RFC 3461): RET=FULL|HDRS, ENVID=<id>.
 	c.dsnRet = mailParamStr(rest, "RET")
 	c.dsnEnvID = mailParamStr(rest, "ENVID")
@@ -565,10 +609,12 @@ func (c *conn) cmdMail(rest string) {
 		hu := mailParamStr(rest, "HOLDUNTIL")
 		switch {
 		case hasHF && hu != "":
+			c.reset()
 			c.writef("%d 5.5.4 HOLDFOR and HOLDUNTIL are mutually exclusive", smtp.C501BadParamSyntax)
 			return
 		case hasHF:
 			if hf < 0 || time.Duration(hf)*time.Second > maxFutureRelease {
+				c.reset()
 				c.writef("%d 5.5.4 HOLDFOR out of range", smtp.C501BadParamSyntax)
 				return
 			}
@@ -576,10 +622,12 @@ func (c *conn) cmdMail(rest string) {
 		case hu != "":
 			t, err := time.Parse(time.RFC3339, hu)
 			if err != nil {
+				c.reset()
 				c.writef("%d 5.5.4 bad HOLDUNTIL date-time", smtp.C501BadParamSyntax)
 				return
 			}
 			if t.After(time.Now().Add(maxFutureRelease)) {
+				c.reset()
 				c.writef("%d 5.5.4 HOLDUNTIL out of range", smtp.C501BadParamSyntax)
 				return
 			}

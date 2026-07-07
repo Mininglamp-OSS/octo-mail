@@ -25,6 +25,14 @@ CREATE TABLE IF NOT EXISTS principals (
     UNIQUE (tenant_id, login)
 );
 
+-- Login is a GLOBAL identity: every authentication path resolves a principal by
+-- login alone (WHERE login=$1), so a login must be unique across all tenants —
+-- otherwise a duplicate login in a second tenant would let a client authenticate
+-- into the wrong tenant (isolation break). This global unique index enforces
+-- that invariant; the composite UNIQUE(tenant_id, login) above is kept redundant
+-- but harmless.
+CREATE UNIQUE INDEX IF NOT EXISTS principals_login_global_key ON principals (login);
+
 CREATE TABLE IF NOT EXISTS accounts (
     id            bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     tenant_id     bigint NOT NULL REFERENCES tenants(id),

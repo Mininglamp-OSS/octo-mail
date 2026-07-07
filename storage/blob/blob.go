@@ -18,6 +18,27 @@ import (
 // Ref is a content-hash reference (hex sha256).
 type Ref string
 
+// ErrBadRef is returned when a ref is not a canonical sha256 hex string. Blob
+// refs are content-addresses, never client-chosen paths — validating the form
+// at the store boundary prevents a crafted ref (e.g. containing "../") from
+// escaping the tenant key prefix into a path/key traversal.
+var ErrBadRef = errors.New("blob: invalid content ref")
+
+// Valid reports whether r is a canonical sha256 content ref: exactly 64 chars,
+// all lowercase hex. This is the only ref shape Put ever produces.
+func (r Ref) Valid() bool {
+	if len(r) != 64 {
+		return false
+	}
+	for i := 0; i < len(r); i++ {
+		c := r[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 // Store persists and retrieves immutable blobs within a tenant namespace.
 type Store interface {
 	// Put stores data and returns its content-hash ref. Idempotent: storing the
@@ -101,6 +122,9 @@ func (s *fsStore) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 }
 
 func (s *fsStore) Open(ctx context.Context, tenantID int64, ref Ref) (Reader, error) {
+	if !ref.Valid() {
+		return nil, ErrBadRef
+	}
 	f, err := os.Open(s.path(tenantID, ref))
 	if err != nil {
 		return nil, err
@@ -114,6 +138,9 @@ func (s *fsStore) Open(ctx context.Context, tenantID int64, ref Ref) (Reader, er
 }
 
 func (s *fsStore) Delete(ctx context.Context, tenantID int64, ref Ref) error {
+	if !ref.Valid() {
+		return ErrBadRef
+	}
 	err := os.Remove(s.path(tenantID, ref))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

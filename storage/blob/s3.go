@@ -166,6 +166,9 @@ func (s *s3Store) head(ctx context.Context, key string) (bool, int64) {
 }
 
 func (s *s3Store) Open(ctx context.Context, tenantID int64, ref Ref) (Reader, error) {
+	if !ref.Valid() {
+		return nil, ErrBadRef
+	}
 	key := s.key(tenantID, ref)
 	ok, size := s.head(ctx, key)
 	if !ok {
@@ -175,6 +178,9 @@ func (s *s3Store) Open(ctx context.Context, tenantID int64, ref Ref) (Reader, er
 }
 
 func (s *s3Store) Delete(ctx context.Context, tenantID int64, ref Ref) error {
+	if !ref.Valid() {
+		return ErrBadRef
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.endpoint+"/"+s.bucket+"/"+s.key(tenantID, ref), nil)
 	if err != nil {
 		return err

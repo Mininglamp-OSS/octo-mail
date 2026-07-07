@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 	moxmessage "github.com/mjl-/mox/message"
+	"github.com/mjl-/mox/smtp"
 )
 
 // emailID encodes a message's JMAP Email id: "E<effectiveEmailID>". One Email
@@ -706,8 +707,17 @@ func (s *Server) emailCreate(ctx context.Context, acc store.Account, obj map[str
 	}
 	var blobID string
 	_ = json.Unmarshal(obj["blobId"], &blobID)
-	tenantID, ref, ok := parseUploadBlobID(blobID)
+	blobTenant, ref, ok := parseUploadBlobID(blobID)
 	if !ok {
+		return nil, false
+	}
+	// Isolation: the blobId is client-controlled. (1) Its tenant component must
+	// equal the authenticated account's tenant — a blob is only ever read under
+	// the auth tenant, never the id's. (2) Its ref must be a canonical sha256
+	// content-address, so a crafted ref (e.g. containing "../") can't traverse
+	// out of the tenant key prefix. Both are also enforced in the blob store.
+	tenantID := acc.TenantID()
+	if blobTenant != tenantID || !blob.Ref(ref).Valid() {
 		return nil, false
 	}
 	// Resolve target mailbox: first key of mailboxIds, else "Drafts".
@@ -1314,7 +1324,20 @@ func (s *Server) emailSubmissionSet(ctx context.Context, acc store.Account, scop
 			continue
 		}
 
-		if _, err := s.Submission.Submit(ctx, scope.Tenant().ID, acc.ID(), env.MailFrom.Email, rcpts, raw); err != nil {
+		// Authz: the envelope MailFrom must belong to the authenticated account.
+		// Without this check any authenticated account could send as any address
+		// (cross-tenant identity forgery), abusing the server's IP/DKIM
+		// reputation. Fall back to the authenticated login when MailFrom is empty.
+		mailFrom := env.MailFrom.Email
+		if mailFrom == "" {
+			mailFrom = login
+		}
+		if !s.senderOwnedBy(ctx, scope, acc, mailFrom) {
+			notCreated[cid] = map[string]any{"type": "forbiddenFrom", "description": "envelope mailFrom is not an address of the authenticated account"}
+			continue
+		}
+
+		if _, err := s.Submission.Submit(ctx, scope.Tenant().ID, acc.ID(), mailFrom, rcpts, raw); err != nil {
 			notCreated[cid] = map[string]any{"type": "serverFail", "description": err.Error()}
 			continue
 		}
@@ -1338,6 +1361,26 @@ func (s *Server) emailSubmissionSet(ctx context.Context, acc store.Account, scop
 
 // errNotFoundJMAP marks a referenced object as absent within a Tx closure.
 var errNotFoundJMAP = errNo("not found")
+
+// senderOwnedBy reports whether the envelope mailFrom address belongs to the
+// authenticated account. Empty (null return-path) is not a valid submission
+// sender here. It resolves the address through the authenticated tenant scope
+// and compares the resulting account id, so a client cannot send as an address
+// it does not own (cross-account/tenant identity forgery).
+func (s *Server) senderOwnedBy(ctx context.Context, scope directory.TenantScope, acc store.Account, mailFrom string) bool {
+	if mailFrom == "" {
+		return false
+	}
+	addr, err := smtp.ParseAddress(mailFrom)
+	if err != nil {
+		return false
+	}
+	owner, err := scope.AccountForAddress(ctx, addr.Path())
+	if err != nil {
+		return false
+	}
+	return owner.ID() == acc.ID()
+}
 
 // Identity/get (RFC 8621 §6): return the sending identities available to the
 // authenticated login. octo-mail models one identity per account — the login's own
