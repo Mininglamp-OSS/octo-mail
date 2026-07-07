@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a defect in octo-mail
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please do **not** report
+        security vulnerabilities here — see [SECURITY.md](../blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including expected vs. actual behavior.
+      placeholder: When I …, octo-mail did … but I expected …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, deterministic steps. Include requests, IMAP/JMAP/SMTP/REST commands, or a failing test where possible.
+      placeholder: |
+        1. Provision …
+        2. Send …
+        3. Observe …
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      description: Which part of octo-mail is involved?
+      options:
+        - IMAP
+        - JMAP
+        - SMTP
+        - REST WebAPI
+        - Admin API
+        - Storage / PostgreSQL
+        - Blob / S3
+        - Queue / delivery
+        - Webmail
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of the running build, or the commit SHA you built from.
+      placeholder: e.g. commit a486029
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Go version, OS, PostgreSQL version, S3 backend, and how you run octo-mail (Compose, binary, …).
+      placeholder: Go 1.25, Linux, PostgreSQL 17, MinIO, docker compose
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant logs, error messages, or stack traces. Redact any secrets or personal data.
+      render: text
+    validations:
+      required: false
