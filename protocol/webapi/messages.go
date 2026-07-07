@@ -368,15 +368,15 @@ func summarize(acc store.Account, m store.Message, mbNames map[int64]string) mes
 	br.Close()
 	env := parseEnvelope(data)
 	sum := messageSummary{
-		ID:         emailID(m),
-		Mailbox:    mbNames[m.MailboxID],
-		Subject:    env.subject,
-		From:       env.from,
-		To:         env.to,
-		Preview:    previewText(data),
-		Size:       m.Size,
-		Keywords:   m.Flags.IMAPFlags(m.Keywords),
-		Unread:     !m.Flags.Seen,
+		ID:       emailID(m),
+		Mailbox:  mbNames[m.MailboxID],
+		Subject:  env.subject,
+		From:     env.from,
+		To:       env.to,
+		Preview:  previewText(data),
+		Size:     m.Size,
+		Keywords: m.Flags.IMAPFlags(m.Keywords),
+		Unread:   !m.Flags.Seen,
 	}
 	if sum.Keywords == nil {
 		sum.Keywords = []string{}

@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. rapid PR pushes).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      # Tests hardcode this DSN (postgres://octo_mail:octo_mail@localhost:55432)
+      # and skip when it is unreachable — so CI must expose Postgres there or it
+      # would silently pass without running the storage-backed suites.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: octo_mail
+          POSTGRES_PASSWORD: octo_mail
+          POSTGRES_DB: octo_mail
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U octo_mail"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      # S3 blob tests point at localhost:29000 with these credentials/bucket and
+      # skip if absent; wiring MinIO exercises the real content-addressed S3 path.
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: octoadmin
+          MINIO_ROOT_PASSWORD: 70521a1a521a5dfd103ce85fe475d8cc
+          MINIO_DEFAULT_BUCKETS: octo-mail-test
+        ports:
+          - 29000:9000
+        options: >-
+          --health-cmd "mc ready local || curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: gofmt (check only)
+        run: |
+          # CI must not mutate the tree, so check instead of `make fmt` (-w).
+          files=$(gofmt -l -s ./cmd ./core ./storage ./projection ./protocol ./mailflow ./security ./ops ./webui ./junkfilter)
+          if [ -n "$files" ]; then
+            echo "The following files are not gofmt-ed (run 'make fmt'):"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: go vet
+        run: make vet
+
+      - name: go build
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: go test
+        env:
+          OCTO_MAIL_S3_ENDPOINT: http://localhost:29000
+          OCTO_MAIL_S3_BUCKET: octo-mail-test
+          OCTO_MAIL_S3_ACCESS: octoadmin
+          OCTO_MAIL_S3_SECRET: 70521a1a521a5dfd103ce85fe475d8cc
+        # Packages share one Postgres, so tests run one package at a time (-p 1).
+        run: go test -p 1 ./...

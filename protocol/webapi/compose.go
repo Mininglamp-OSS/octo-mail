@@ -241,4 +241,3 @@ func (m *memBlobReader) ReadAt(p []byte, off int64) (int, error) {
 
 func (m *memBlobReader) Close() error { return nil }
 func (m *memBlobReader) Size() int64  { return int64(len(m.data)) }
-
