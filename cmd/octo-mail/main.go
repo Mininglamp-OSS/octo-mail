@@ -452,6 +452,7 @@ func run() error {
 		const warmupLeaderKey = int64(0x6f6d5f77726d70) // "om_wrmp"
 		warmCoord := ha.NewCoordinator(ha.New(s.Pool, warmupLeaderKey), time.Hour)
 		warmCoord.OnElected = func(context.Context) { log.Info("elected warmup-maintenance leader", "node", cfg.nodeID) }
+		warmCoord.OnLost = func() { log.Info("lost warmup-maintenance leadership", "node", cfg.nodeID) }
 		warmCoord.Tick = func(ctx context.Context) {
 			// RunDailyMaintenance claims the day atomically and no-ops if already
 			// done, so this frequent tick (and any post-failover leader) runs the

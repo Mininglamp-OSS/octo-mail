@@ -232,20 +232,27 @@ func (w *Worker) deliveryTimeout() time.Duration {
 	return lease - margin
 }
 
-// renewLease resets this message's lease to a fresh full window, but only if
-// this node still holds it (leased_by = NodeID and not yet expired). It returns
-// held=false when the lease was lost to another node, signaling the caller to
-// skip delivery. This makes each message in a batch deliver on its own full
-// window instead of the shared, eroding window from the initial claim.
-func (w *Worker) renewLease(ctx context.Context, m Msg) (held bool, err error) {
-	tag, err := w.Pool.Exec(ctx,
-		`UPDATE queue SET lease_until=now()+$3::interval
-		 WHERE id=$1 AND leased_by=$2 AND lease_until > now()`,
-		m.ID, w.NodeID, w.lease().String())
-	if err != nil {
-		return false, err
+// renewLease refreshes this message's lease to a fresh full window AND, in the
+// same fenced UPDATE, durably records that a real delivery attempt is starting:
+// it increments attempts and stamps last_attempt. Doing this here (immediately
+// before Deliver, only if we still hold the lease) means the attempt count is
+// persisted and fenced BEFORE the external side effect — so a crash mid-delivery
+// cannot lose the increment and let a message exceed MaxAttempts, and a claim
+// whose lease was lost burns nothing (held=false → no increment). Returns the
+// new attempt number so the caller uses the authoritative persisted value.
+func (w *Worker) renewLease(ctx context.Context, m Msg) (held bool, attempts int, err error) {
+	err = w.Pool.QueryRow(ctx,
+		`UPDATE queue SET lease_until=now()+$3::interval, attempts=attempts+1, last_attempt=now()
+		 WHERE id=$1 AND leased_by=$2 AND lease_until > now()
+		 RETURNING attempts`,
+		m.ID, w.NodeID, w.lease().String()).Scan(&attempts)
+	if err == pgx.ErrNoRows {
+		return false, 0, nil // lease lost; another node owns this message now
 	}
-	return tag.RowsAffected() == 1, nil
+	if err != nil {
+		return false, 0, err
+	}
+	return true, attempts, nil
 }
 func (w *Worker) batch() int {
 	if w.Batch == 0 {
@@ -286,7 +293,7 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		// (a slow tick let it expire and another node reclaimed the row), skip
 		// delivery — that node now owns the outcome, and delivering here would be
 		// the double-send we are preventing.
-		held, rerr := w.renewLease(ctx, m)
+		held, attempts, rerr := w.renewLease(ctx, m)
 		if rerr != nil {
 			if firstErr == nil {
 				firstErr = rerr
@@ -296,6 +303,9 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		if !held {
 			continue
 		}
+		// renewLease durably recorded this real attempt (fenced by the lease);
+		// use the persisted count for the result log and the failure decision.
+		m.Attempts = attempts
 
 		// Bound the delivery to strictly less than the lease window so this node
 		// stops transmitting before lease_until can pass and another node reclaim
@@ -306,11 +316,6 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		derr := w.Deliver(dctx, m)
 		dur := time.Since(start)
 		cancel()
-		// A real delivery attempt was made: count it now (not at claim time), so
-		// a lost lease / crash before delivery never burns the retry budget. This
-		// is the authoritative attempt number for the result log and the
-		// failure/backoff decision below.
-		m.Attempts++
 		if w.ObserveDelivery != nil {
 			result := "ok"
 			if derr != nil {
@@ -473,10 +478,10 @@ func (w *Worker) reschedule(ctx context.Context, m Msg, lastErr error) error {
 			     WHERE id=$1 AND leased_by=$2 FOR UPDATE
 			 )
 			 UPDATE queue q SET leased_by=NULL, lease_until=NULL, next_attempt=now()+$3::interval,
-			     last_error=$4, attempts=$6, delayed_dsn=q.delayed_dsn OR $5
+			     last_error=$4, delayed_dsn=q.delayed_dsn OR $5
 			 FROM prev WHERE q.id=prev.id
 			 RETURNING prev.old`,
-			m.ID, w.NodeID, backoff.String(), errStr, wantDelay, m.Attempts).Scan(&wasDelayed)
+			m.ID, w.NodeID, backoff.String(), errStr, wantDelay).Scan(&wasDelayed)
 		if err == pgx.ErrNoRows {
 			return nil // reclaimed/retired by another node; not ours anymore
 		}
