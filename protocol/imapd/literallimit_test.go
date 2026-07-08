@@ -114,5 +114,34 @@ func TestIMAPLiteralLimit(t *testing.T) {
 		}
 	}
 
-	t.Logf("OK: APPENDLIMIT=%d advertised; oversized literal refused (NO, no continuation, no allocation); in-limit APPEND accepted", maxSize)
+	// MULTIAPPEND cumulative cap: two literals that each individually fit under
+	// MaxSize but TOGETHER exceed the per-command budget must be rejected — one
+	// connection must not accumulate N×MaxSize (the connection-cap invariant).
+	// Each part is ~⅔ MaxSize; the first passes, the second blows the budget.
+	part := strings.Repeat("x", (maxSize*2)/3)
+	// Use non-sync (LITERAL+) literals so the whole MULTIAPPEND is one write.
+	multi := "a5 APPEND INBOX {" + strconv.Itoa(len(part)) + "+}\r\n" + part +
+		" {" + strconv.Itoa(len(part)) + "+}\r\n" + part + "\r\n"
+	// Write in a goroutine: net.Pipe is unbuffered, and the server writes its
+	// rejection while the client is still mid-write, so a synchronous Write would
+	// deadlock against our own Read below.
+	go func() { _, _ = cc.Write([]byte(multi)) }()
+	for {
+		line, err := rc.r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read after MULTIAPPEND: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "+ ") {
+			continue // LITERAL+ shouldn't prompt, but tolerate
+		}
+		if strings.HasPrefix(line, "a5 ") {
+			if strings.Contains(line, "OK") {
+				t.Fatalf("MULTIAPPEND of 2×⅔MaxSize accepted — cumulative budget not enforced: %q", line)
+			}
+			break // NO/BAD: budget correctly rejected the second literal
+		}
+	}
+
+	t.Logf("OK: APPENDLIMIT=%d advertised; oversized literal refused (NO, no continuation, no allocation); MULTIAPPEND cumulative cap enforced; in-limit APPEND accepted", maxSize)
 }

@@ -10,9 +10,9 @@
 package jmapd
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -86,15 +86,19 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := scope.Tenant().ID
+	// Stream the (size-bounded) body straight into the blob store rather than
+	// buffering it all in memory first — Blob.Put content-addresses via a spooled
+	// temp file, so an upload costs no per-request 50 MB heap allocation.
 	r.Body = http.MaxBytesReader(w, r.Body, maxSizeUpload)
-	data, err := io.ReadAll(r.Body)
+	ref, size, err := s.Blob.Put(r.Context(), tenantID, r.Body)
 	if err != nil {
-		// Either a client read error or the body exceeded maxSizeUpload.
-		http.Error(w, "upload too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	ref, size, err := s.Blob.Put(r.Context(), tenantID, bytes.NewReader(data))
-	if err != nil {
+		// A MaxBytesReader overflow surfaces here (via Put's read) as a 413; any
+		// other error is a storage failure.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "upload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "store blob", http.StatusInternalServerError)
 		return
 	}

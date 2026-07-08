@@ -118,7 +118,8 @@ func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 	if err != nil {
 		return "", 0, err
 	}
-	defer func() { _ = os.Remove(tmp.Name()); _ = tmp.Close() }()
+	// Close before Remove: on some platforms an open file can't be removed.
+	defer func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }()
 
 	h := sha256.New()
 	size, err := io.Copy(io.MultiWriter(tmp, h), r)

@@ -111,6 +111,14 @@ type conn struct {
 
 	fatal error // set by handlers to force connection close
 
+	// cmdBudget is the remaining bytes a single command may RETAIN in memory,
+	// reset to srv.MaxSize before each command (0 = unlimited). readLiteral and
+	// CATENATE URL parts debit it, so a MULTIAPPEND or CATENATE that individually
+	// respects the per-literal cap still can't accumulate N×MaxSize on one
+	// connection — preserving the connection-cap sizing invariant (≈one message
+	// worth of buffer per connection).
+	cmdBudget int64
+
 	scope    directory.TenantScope
 	acc      store.Account
 	selected *store.Mailbox
@@ -177,6 +185,9 @@ func (c *conn) serve() error {
 		tag, rest := cut(line, " ")
 		cmd, args := cut(rest, " ")
 		cmd = strings.ToUpper(cmd)
+		// Reset the per-command memory budget: the total bytes this command may
+		// retain across all its literals/parts (MULTIAPPEND, CATENATE).
+		c.cmdBudget = c.srv.MaxSize
 
 		var done bool
 		func() {

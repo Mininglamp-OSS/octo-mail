@@ -61,6 +61,11 @@ func (c *conn) readCatenate(first string) ([]byte, string, error) {
 			if err != nil {
 				return nil, "", err
 			}
+			// URL parts bypass readLiteral, so charge them against the same
+			// per-command budget to bound total assembled size.
+			if !c.chargeBudget(int64(len(part))) {
+				return nil, "", errNo("[TOOBIG] CATENATE exceeds APPENDLIMIT")
+			}
 			buf = append(buf, part...)
 			rest = strings.TrimSpace(remainder)
 		default:

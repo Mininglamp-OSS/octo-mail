@@ -587,13 +587,14 @@ func (c *conn) readLiteral(spec string) ([]byte, error) {
 	if err != nil || n < 0 {
 		return nil, errNo("bad literal size")
 	}
-	// Bound the declared size before allocating: a client must not be able to
-	// force a multi-GB make([]byte, n) per connection (APPENDLIMIT / RFC 9051
-	// [TOOBIG]). For a synchronizing literal we reject before sending the "+"
-	// continuation so the oversized payload is never invited. For a non-sync
+	// Bound the bytes this command may RETAIN before allocating: not just this
+	// literal against MaxSize, but the running per-command budget, so a
+	// MULTIAPPEND/CATENATE can't accumulate N×MaxSize on one connection (APPENDLIMIT
+	// / RFC 9051 [TOOBIG]). For a synchronizing literal we reject before sending the
+	// "+" continuation so the oversized payload is never invited. For a non-sync
 	// (LITERAL+) literal the bytes are already inbound, so we drain them in a
 	// bounded loop to keep the command stream aligned, then reject.
-	if c.srv.MaxSize > 0 && int64(n) > c.srv.MaxSize {
+	if !c.chargeBudget(int64(n)) {
 		if !sync {
 			c.discard(int64(n))
 		}
@@ -622,6 +623,22 @@ func (c *conn) readLiteral(spec string) ([]byte, error) {
 // (the caller is already returning an error / tearing down the command).
 func (c *conn) discard(n int64) {
 	_, _ = io.CopyN(io.Discard, c.r, n)
+}
+
+// chargeBudget debits n bytes from the current command's retained-memory budget,
+// returning false (without debiting) if it would be exceeded. It bounds the TOTAL
+// bytes a single command holds in RAM across all its literals and assembled parts
+// — the per-literal cap alone doesn't stop a MULTIAPPEND or CATENATE from
+// accumulating N×MaxSize. A zero budget (srv.MaxSize == 0) means unlimited.
+func (c *conn) chargeBudget(n int64) bool {
+	if c.cmdBudget <= 0 { // unlimited (MaxSize==0)
+		return true
+	}
+	if n > c.cmdBudget {
+		return false
+	}
+	c.cmdBudget -= n
+	return true
 }
 
 // normalizeMailbox maps the IMAP "INBOX" special name to the kernel's "Inbox".
