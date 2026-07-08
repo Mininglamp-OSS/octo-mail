@@ -97,6 +97,18 @@ type Server struct {
 	// with the authenticated account id; ok is false on any validation failure.
 	// Injected as a func to avoid coupling smtpd to imapd/store URLAUTH logic.
 	BURLResolver func(ctx context.Context, accountID int64, authURL string) (data []byte, ok bool)
+
+	// BounceDomain, when set, is the VERP bounce/FBL domain. Inbound mail whose
+	// recipient domain equals it is routed to BounceHandler instead of normal
+	// mailbox delivery (it belongs to no account). Lowercase.
+	BounceDomain string
+
+	// BounceHandler, when set, processes a message delivered to BounceDomain: an
+	// ARF complaint or a DSN bounce addressed to a VERP recipient. verpLocalpart
+	// is the recipient localpart (the VERP token). It records the reputation
+	// event + suppresses the recipient. Errors are logged, never bounced (a bounce
+	// of a bounce would loop). Injected to avoid coupling smtpd to deliverability.
+	BounceHandler func(ctx context.Context, verpLocalpart string, raw []byte)
 }
 
 // JunkClassifier classifies a raw message for an account as spam or not.
@@ -167,6 +179,9 @@ type conn struct {
 	authAccount int64
 	authScope   directory.TenantScope // authenticated scope, for MAIL FROM ownership checks
 	subRcpts    []string
+	// bounceRcpts holds VERP recipient localparts for mail addressed to the
+	// bounce domain (ARF/DSN), routed to the bounce handler instead of a mailbox.
+	bounceRcpts []string
 }
 
 func (c *conn) writef(format string, a ...any) error {
@@ -320,6 +335,7 @@ func (c *conn) reset() {
 	c.rcpts = nil
 	c.rcptAddrs = nil
 	c.subRcpts = nil
+	c.bounceRcpts = nil
 	c.subNotify = nil
 	c.subORcpt = nil
 	c.dsnRet = ""
@@ -712,6 +728,14 @@ func (c *conn) cmdRcpt(rest string) {
 		c.writef("%d 2.1.5 OK", smtp.C250Completed)
 		return
 	}
+	// Mail to the VERP bounce/FBL domain belongs to no account: accept it and
+	// route to the bounce handler after DATA (complaint/bounce → suppression).
+	if c.srv.BounceDomain != "" && c.srv.BounceHandler != nil &&
+		strings.EqualFold(addr.Domain.ASCII, c.srv.BounceDomain) {
+		c.bounceRcpts = append(c.bounceRcpts, string(addr.Localpart))
+		c.writef("%d 2.1.5 OK", smtp.C250Completed)
+		return
+	}
 	target, err := c.srv.Dir.ResolveInbound(c.ctx, addr.Path())
 	if err != nil {
 		c.writef("%d 5.1.1 no such recipient", smtp.C550MailboxUnavail)
@@ -724,7 +748,7 @@ func (c *conn) cmdRcpt(rest string) {
 
 func (c *conn) cmdData() error {
 	submission := c.srv.Submission != nil
-	haveRcpt := len(c.rcpts) > 0
+	haveRcpt := len(c.rcpts) > 0 || len(c.bounceRcpts) > 0
 	if submission {
 		haveRcpt = len(c.subRcpts) > 0
 	}
@@ -838,6 +862,16 @@ func (c *conn) processData(data []byte) error {
 	if c.srv.MaxSize > 0 && int64(len(data)) > c.srv.MaxSize {
 		c.reset()
 		return c.writef("552 5.3.4 message too large")
+	}
+
+	// Mail to the VERP bounce/FBL domain: hand each VERP recipient to the bounce
+	// handler (complaint/bounce → suppression) and accept. Never bounce a bounce.
+	if len(c.bounceRcpts) > 0 && c.srv.BounceHandler != nil {
+		for _, lp := range c.bounceRcpts {
+			c.srv.BounceHandler(c.ctx, lp, data)
+		}
+		c.reset()
+		return c.writef("%d 2.0.0 accepted", smtp.C250Completed)
 	}
 
 	if submission {

@@ -69,6 +69,14 @@ type SMTPDeliverer struct {
 	// RecordSent, if set, records a successful send for reputation accounting.
 	RecordSent func(ctx context.Context, tenantID int64, remoteDomain string) error
 
+	// EnvelopeFrom, if set, computes the SMTP envelope MAIL FROM for a message —
+	// used for VERP: return bounces+<tenant>.<msg>@<bounceDomain> so bounces and
+	// FBL complaints route back to the exact sending tenant. The visible From
+	// header and DKIM signature are unchanged (DKIM keeps DMARC aligned via the
+	// tenant's own domain; SPF aligns on the bounce domain the operator publishes).
+	// Returning "" falls back to m.MailFrom. nil disables VERP entirely.
+	EnvelopeFrom func(m queue.Msg) string
+
 	// Suppressed, if set, is checked before each send; returning true blocks the
 	// send (recipient is on the account's suppression list) — the message is
 	// retired as a permanent failure without dialing.
@@ -214,7 +222,16 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, m queue.Msg) error {
 	}
 	defer cl.Close()
 
-	if err := cl.Deliver(ctx, m.MailFrom, m.RcptTo, bodySize, bodyReader, false, false, false); err != nil {
+	// Envelope MAIL FROM: VERP bounce address when configured, else the original
+	// sender. Only the transmitted envelope changes — m.MailFrom (retained in the
+	// queue row) still drives DSN/records.
+	envFrom := m.MailFrom
+	if d.EnvelopeFrom != nil {
+		if v := d.EnvelopeFrom(m); v != "" {
+			envFrom = v
+		}
+	}
+	if err := cl.Deliver(ctx, envFrom, m.RcptTo, bodySize, bodyReader, false, false, false); err != nil {
 		if d.OnSendError != nil {
 			d.OnSendError(ctx, m, err)
 		}

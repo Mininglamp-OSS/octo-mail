@@ -235,6 +235,34 @@ func run() error {
 				}
 			},
 		}
+		// VERP inbound: route bounce-domain mail (ARF complaints + DSN bounces) to
+		// reputation + suppression, attributed to the sending tenant via the VERP
+		// token. Enabled only when a bounce domain is configured.
+		if cfg.bounceDomain != "" {
+			mx.BounceDomain = cfg.bounceDomain
+			mx.BounceHandler = func(ctx context.Context, verpLocalpart string, raw []byte) {
+				c, ok, err := repo.IngestReport(ctx, verpLocalpart, cfg.verpKey, raw)
+				if err != nil {
+					log.WarnContext(ctx, "bounce ingest", "err", err)
+					return
+				}
+				if !ok {
+					// Forged/unauthenticated VERP recipient — attribute nothing.
+					log.WarnContext(ctx, "unauthenticated bounce/complaint to bounce domain", "verp", verpLocalpart)
+					return
+				}
+				// Attribution is authenticated (signed VERP token), so the tenant
+				// reputation event is trustworthy. We deliberately do NOT
+				// auto-suppress here: an ARF report only identifies the recipient
+				// DOMAIN, and honoring a domain-level suppression from a report would
+				// let one complaint silence a tenant's mail to a whole provider.
+				// Suppression stays driven by the delivery-time hard-bounce path.
+				if cfg.verpKey == nil {
+					log.WarnContext(ctx, "VERP signing key not set (OCTO_MAIL_VERP_KEY); bounce attribution is forgeable — set a key before production")
+				}
+				log.InfoContext(ctx, "bounce/complaint recorded", "tenant", c.TenantID, "kind", c.Kind)
+			}
+		}
 		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
 	}
 	// SMTP submission (:587).
@@ -352,6 +380,20 @@ func run() error {
 			_ = webhooks.Enqueue(ctx, m.TenantID, m.AccountID, cfg.webhookURL, "error",
 				map[string]any{"rcpt": m.RcptTo, "error": err.Error()})
 		},
+	}
+	// VERP: when a bounce domain is configured, rewrite the envelope MAIL FROM to
+	// a per-message VERP token so bounces + FBL complaints attribute to the exact
+	// sending tenant. The visible From + DKIM are unchanged (DMARC stays aligned
+	// via the tenant's own domain).
+	if cfg.bounceDomain != "" {
+		deliverer.EnvelopeFrom = func(m queue.Msg) string {
+			// Preserve the null sender (a bounce/notification has MAIL FROM:<>);
+			// only rewrite a real sender to the signed VERP return-path.
+			if m.MailFrom == "" {
+				return ""
+			}
+			return deliverability.SignedVERPToken(m.TenantID, m.ID, cfg.verpKey) + "@" + cfg.bounceDomain
+		}
 	}
 	worker := &queue.Worker{Pool: s.Pool, NodeID: cfg.nodeID, Deliver: deliverer.Deliver, Batch: 20,
 		Backoff: cfg.queueBackoff, DelayThreshold: cfg.queueDelayDSN, RetiredKeep: cfg.queueRetKeep,

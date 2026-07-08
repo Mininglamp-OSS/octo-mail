@@ -42,6 +42,12 @@ func ParseARF(raw []byte) (Complaint, bool) {
 	if err != nil || !strings.EqualFold(mediaType, "multipart/report") {
 		return Complaint{}, false
 	}
+	// Only a feedback-report is an ARF complaint. A DSN bounce is ALSO
+	// multipart/report (report-type=delivery-status); without this gate a hard
+	// bounce would be mis-recorded as a complaint (a far stricter threshold).
+	if !strings.EqualFold(params["report-type"], "feedback-report") {
+		return Complaint{}, false
+	}
 	boundary := params["boundary"]
 	if boundary == "" {
 		return Complaint{}, false
@@ -102,6 +108,31 @@ func (s *Service) RecordComplaint(ctx context.Context, raw []byte) (Complaint, e
 		return Complaint{}, err
 	}
 	return c, nil
+}
+
+// IngestReport handles an inbound message delivered to the bounce domain (an ARF
+// complaint or a DSN bounce). Attribution is taken from the SIGNED VERP token in
+// the recipient localpart the message was addressed to (verpLocalpart) -- our own
+// authenticated return-path -- NOT from attacker-controllable report contents, so
+// a forged report cannot attribute a bounce/complaint to a victim tenant. The
+// report body is used only to distinguish complaint (ARF) from bounce (DSN). key
+// is the VERP signing key; empty disables authentication (dev only). ok=false
+// when the recipient token does not authenticate.
+func (s *Service) IngestReport(ctx context.Context, verpLocalpart string, key, raw []byte) (Complaint, bool, error) {
+	tenantID, msgID, ok := ParseSignedVERP(verpLocalpart, key)
+	if !ok {
+		return Complaint{}, false, nil // unauthenticated/forged recipient token
+	}
+	// Complaint (ARF feedback-report) vs bounce (everything else, e.g. a DSN).
+	kind := KindBounce
+	if _, isARF := ParseARF(raw); isARF {
+		kind = KindComplaint
+	}
+	c := Complaint{TenantID: tenantID, MsgID: msgID, Kind: kind}
+	if err := s.RecordEvent(ctx, c.TenantID, 0, c.Kind, ""); err != nil {
+		return Complaint{}, false, err
+	}
+	return c, true, nil
 }
 
 // fieldValue extracts a header field value from raw header bytes (case-insensitive).

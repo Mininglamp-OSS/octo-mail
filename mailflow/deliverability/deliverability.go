@@ -9,6 +9,9 @@ package deliverability
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base32"
 	"fmt"
 	"strconv"
 	"strings"
@@ -129,21 +132,80 @@ func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, ki
 // message id, so bounces/complaints route back to the right tenant:
 //
 //	bounces+<tenantID>.<msgID>@<bounceDomain>
+//
+// Prefer SignedVERPToken in production: an unsigned token is forgeable (tenant
+// ids are small integers), which lets an unauthenticated sender attribute
+// bounces/complaints to a victim tenant. This form is retained for tests and for
+// deployments that have not configured a VERP key.
 func VERPToken(tenantID, msgID int64) string {
 	return "bounces+" + strconv.FormatInt(tenantID, 10) + "." + strconv.FormatInt(msgID, 10)
 }
 
 // ParseVERP decodes a VERP localpart back to (tenantID, msgID). Accepts the full
-// localpart (with or without the "bounces+" prefix).
+// localpart (with or without the "bounces+" prefix). It does NOT authenticate —
+// see ParseSignedVERP for the forgery-resistant form.
 func ParseVERP(localpart string) (tenantID, msgID int64, ok bool) {
 	lp := strings.TrimPrefix(localpart, "bounces+")
 	a, b, found := strings.Cut(lp, ".")
 	if !found {
 		return 0, 0, false
 	}
+	// Tolerate a trailing signature segment (bounces+T.M.SIG) so a signed token
+	// still yields (T,M) here; authentication is ParseSignedVERP's job.
+	if i := strings.IndexByte(b, '.'); i >= 0 {
+		b = b[:i]
+	}
 	ti, err1 := strconv.ParseInt(a, 10, 64)
 	mi, err2 := strconv.ParseInt(b, 10, 64)
 	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return ti, mi, true
+}
+
+// verpMAC computes the authentication tag for (tenantID, msgID) under key: the
+// first 10 bytes of HMAC-SHA256, lowercase base32 (no padding) — short enough
+// for a localpart, wide enough (80 bits) to make forgery infeasible.
+func verpMAC(tenantID, msgID int64, key []byte) string {
+	mac := hmac.New(sha256.New, key)
+	fmt.Fprintf(mac, "%d.%d", tenantID, msgID)
+	sum := mac.Sum(nil)[:10]
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum))
+}
+
+// SignedVERPToken builds an HMAC-authenticated VERP localpart:
+//
+//	bounces+<tenantID>.<msgID>.<mac>
+//
+// A recipient/attacker cannot forge a token for another tenant without key. When
+// key is empty it falls back to the unsigned VERPToken.
+func SignedVERPToken(tenantID, msgID int64, key []byte) string {
+	if len(key) == 0 {
+		return VERPToken(tenantID, msgID)
+	}
+	return "bounces+" + strconv.FormatInt(tenantID, 10) + "." + strconv.FormatInt(msgID, 10) + "." + verpMAC(tenantID, msgID, key)
+}
+
+// ParseSignedVERP decodes AND authenticates a VERP localpart against key. It
+// returns ok=false for a missing/invalid signature, so a forged token attributes
+// nothing. When key is empty it accepts the unsigned form (ParseVERP) — matching
+// SignedVERPToken's fallback so a keyless deployment still round-trips.
+func ParseSignedVERP(localpart string, key []byte) (tenantID, msgID int64, ok bool) {
+	if len(key) == 0 {
+		return ParseVERP(localpart)
+	}
+	lp := strings.TrimPrefix(localpart, "bounces+")
+	parts := strings.Split(lp, ".")
+	if len(parts) != 3 {
+		return 0, 0, false
+	}
+	ti, err1 := strconv.ParseInt(parts[0], 10, 64)
+	mi, err2 := strconv.ParseInt(parts[1], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	want := verpMAC(ti, mi, key)
+	if !hmac.Equal([]byte(parts[2]), []byte(want)) {
 		return 0, 0, false
 	}
 	return ti, mi, true

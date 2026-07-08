@@ -16,6 +16,17 @@ type config struct {
 	hostname string
 	maxSize  int64
 
+	// bounceDomain, when set, enables VERP: outbound deliveries use an envelope
+	// MAIL FROM of bounces+<tenant>.<msg>.<mac>@<bounceDomain>, and inbound mail to
+	// that domain is routed to complaint/bounce handling (ARF + DSN) → reputation.
+	// Requires the operator to publish SPF/MX for the bounce domain pointing at
+	// this server. Empty = VERP disabled (envelope unchanged).
+	bounceDomain string
+	// verpKey signs VERP tokens (HMAC) so an unauthenticated sender cannot forge a
+	// bounce/complaint attributed to a victim tenant. Strongly recommended when
+	// bounceDomain is set; empty falls back to unsigned tokens (dev only).
+	verpKey []byte
+
 	blobDir string // fs blob store dir (used when s3Endpoint is empty)
 
 	s3Endpoint string
@@ -68,10 +79,12 @@ type config struct {
 
 func loadConfig() config {
 	return config{
-		dsn:      envDefault("OCTO_MAIL_DSN", "postgres://octo_mail:octo_mail@localhost:55432/octo_mail"),
-		nodeID:   envDefault("OCTO_MAIL_NODE_ID", defaultNodeID()),
-		hostname: envDefault("OCTO_MAIL_HOSTNAME", "octo-mail.local"),
-		maxSize:  envInt64("OCTO_MAIL_MAX_SIZE", 50*1024*1024),
+		dsn:          envDefault("OCTO_MAIL_DSN", "postgres://octo_mail:octo_mail@localhost:55432/octo_mail"),
+		nodeID:       envDefault("OCTO_MAIL_NODE_ID", defaultNodeID()),
+		hostname:     envDefault("OCTO_MAIL_HOSTNAME", "octo-mail.local"),
+		bounceDomain: strings.ToLower(strings.TrimSpace(os.Getenv("OCTO_MAIL_BOUNCE_DOMAIN"))),
+		verpKey:      []byte(os.Getenv("OCTO_MAIL_VERP_KEY")),
+		maxSize:      envInt64("OCTO_MAIL_MAX_SIZE", 50*1024*1024),
 
 		blobDir: envDefault("OCTO_MAIL_BLOB_DIR", "./blobs"),
 
