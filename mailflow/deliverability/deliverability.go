@@ -191,10 +191,14 @@ func ParseVERP(localpart string) (tenantID, msgID int64, ok bool) {
 // verpMAC computes the authentication tag for (tenantID, msgID) under key: the
 // first 10 bytes of HMAC-SHA256, lowercase base32 (no padding) — short enough
 // for a localpart, wide enough (80 bits) to make forgery infeasible.
+// verpMAC computes the authentication tag for (tenantID, msgID) under key: the
+// first 12 bytes of HMAC-SHA256, lowercase base32 (no padding) — 96 bits, short
+// enough for a localpart (20 base32 chars) yet a wide margin against the bounce
+// MX being an online forgery oracle. Truncation of an HMAC is sound (RFC 2104).
 func verpMAC(tenantID, msgID int64, key []byte) string {
 	mac := hmac.New(sha256.New, key)
 	fmt.Fprintf(mac, "%d.%d", tenantID, msgID)
-	sum := mac.Sum(nil)[:10]
+	sum := mac.Sum(nil)[:12]
 	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum))
 }
 
