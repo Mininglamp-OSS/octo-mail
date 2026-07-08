@@ -354,6 +354,16 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 // dispatch runs one JMAP method call, returning the response name and args.
 func (s *Server) dispatch(ctx context.Context, acc store.Account, scope directory.TenantScope, login string, inv invocation) (string, any) {
+	// Enforce the advertised per-call object caps centrally, before any method
+	// runs, so no handler can drift from the maxObjectsInGet/Set the session
+	// advertises. A /get reads N ids; a /set mutates create+update+destroy
+	// objects. Exceeding the cap is RFC 8620 "requestTooLarge".
+	if n := invGetCount(inv); n > maxObjectsInGet {
+		return "error", map[string]any{"type": "requestTooLarge", "description": "too many objects requested"}
+	}
+	if n := invSetCount(inv); n > maxObjectsInSet {
+		return "error", map[string]any{"type": "requestTooLarge", "description": "too many objects in set"}
+	}
 	switch inv.name {
 	case "Mailbox/get":
 		return s.mailboxGet(ctx, acc, inv)
@@ -384,6 +394,37 @@ func (s *Server) dispatch(ctx context.Context, acc store.Account, scope director
 	default:
 		return "error", map[string]any{"type": "unknownMethod"}
 	}
+}
+
+// jsonLen counts the elements of a JSON array (for "ids") or the members of a
+// JSON object (for "create"/"update"/"destroy"), without materializing them —
+// so a huge id list is rejected before it is unmarshaled into a slice/map.
+// Returns 0 for absent/unparseable args.
+func jsonLen(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	// Arrays decode into []json.RawMessage; objects into map[string]json.RawMessage.
+	var arr []json.RawMessage
+	if json.Unmarshal(raw, &arr) == nil {
+		return len(arr)
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) == nil {
+		return len(obj)
+	}
+	return 0
+}
+
+// invGetCount returns the number of objects a /get-family call would fetch.
+func invGetCount(inv invocation) int {
+	return jsonLen(inv.args["ids"]) + jsonLen(inv.args["emailIds"])
+}
+
+// invSetCount returns the number of objects a /set-family call would mutate
+// (create + update + destroy).
+func invSetCount(inv invocation) int {
+	return jsonLen(inv.args["create"]) + jsonLen(inv.args["update"]) + jsonLen(inv.args["destroy"])
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

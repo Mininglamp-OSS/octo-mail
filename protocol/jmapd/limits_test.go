@@ -2,6 +2,7 @@ package jmapd_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -95,5 +96,47 @@ func TestJMAPRequestLimits(t *testing.T) {
 		t.Fatalf("50MB+1 upload → %d, want 413", upResp.StatusCode)
 	}
 
-	t.Logf("OK: api body/batch and upload bounded (413); in-limits request still 200")
+	// Per-object cap: an Email/get with > maxObjectsInGet (1000) ids is rejected
+	// with a method-level requestTooLarge error BEFORE any DB fetch — closing the
+	// single-call amplification vector (~1M ids fit under the 10 MiB body cap).
+	methodErr := func(body string) string {
+		req, _ := http.NewRequest("POST", hs.URL+"/jmap/api", strings.NewReader(body))
+		req.SetBasicAuth("u1@example.com", "x")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("api status %d, want 200 (method-level error)", resp.StatusCode)
+		}
+		var out struct {
+			MethodResponses [][3]json.RawMessage `json:"methodResponses"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out.MethodResponses) == 0 {
+			t.Fatalf("decode: %v", err)
+		}
+		var name string
+		_ = json.Unmarshal(out.MethodResponses[0][0], &name)
+		var args map[string]any
+		_ = json.Unmarshal(out.MethodResponses[0][1], &args)
+		if name == "error" {
+			if t, _ := args["type"].(string); t != "" {
+				return t
+			}
+		}
+		return name
+	}
+	ids := make([]string, 1001)
+	for i := range ids {
+		ids[i] = fmt.Sprintf(`"E%d"`, i+1)
+	}
+	overGet := `{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/get",{"accountId":"` +
+		itoa(accID) + `","ids":[` + strings.Join(ids, ",") + `]},"c0"]]}`
+	if got := methodErr(overGet); got != "requestTooLarge" {
+		t.Fatalf("Email/get with 1001 ids → %q, want requestTooLarge", got)
+	}
+
+	t.Logf("OK: api body/batch/upload bounded (413); per-object get cap enforced (requestTooLarge); in-limits request still 200")
 }

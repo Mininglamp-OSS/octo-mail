@@ -144,6 +144,17 @@ func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 		return "", 0, err
 	}
 	req.ContentLength = size
+	// Restore transport-level retry safety: with an *os.File body, net/http can't
+	// auto-populate GetBody (it does for bytes.Reader), so a PUT racing a
+	// server-closed idle keep-alive wouldn't be replayed. Reopen the temp file on
+	// demand; the object is content-addressed/idempotent, so a retry is safe.
+	req.GetBody = func() (io.ReadCloser, error) {
+		f, err := os.Open(tmp.Name())
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
 	payloadHash := hex.EncodeToString(sum)
 	if err := s.sign(req, payloadHash, nil); err != nil {
 		return "", 0, err
