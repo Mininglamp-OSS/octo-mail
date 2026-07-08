@@ -38,10 +38,10 @@ func arfReport(tenantID, msgID int64, rcptDomain string) []byte {
 	return []byte(body)
 }
 
-// TestFBLAttributionAndIsolation proves ARF/FBL parsing attributes complaints to
-// the exact sending tenant via the VERP return-path, and that pausing is
-// per-tenant: enough complaints against tenant A pause A for the complaining
-// domain, while tenant B (same domain) is untouched.
+// TestFBLAttributionAndIsolation proves ARF/FBL ingestion attributes complaints
+// to the exact sending tenant via the (authenticated) VERP recipient token, and
+// that pausing is per-tenant: enough complaints against tenant A pause A for the
+// complaining domain, while tenant B (same domain) is untouched.
 func TestFBLAttributionAndIsolation(t *testing.T) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dkimDSN)
@@ -87,15 +87,20 @@ func TestFBLAttributionAndIsolation(t *testing.T) {
 		}
 	}
 
-	// Feed 20 ARF complaints attributed (via VERP) to tenant A only.
+	// Feed 20 ARF complaints attributed (via the VERP recipient token) to tenant A
+	// only. The report is delivered to bounces+<A>.<msg>@bounce.example; ingestion
+	// takes the tenant from that authenticated recipient localpart and the domain
+	// from the report body.
 	for i := 0; i < 20; i++ {
-		raw := arfReport(tenantA, int64(1000+i), domain)
-		c, err := svc.RecordComplaint(ctx, raw)
+		msgID := int64(1000 + i)
+		verp := deliverability.VERPToken(tenantA, msgID)
+		raw := arfReport(tenantA, msgID, domain)
+		c, ok, err := svc.IngestReport(ctx, verp, nil, raw)
 		if err != nil {
-			t.Fatalf("record complaint %d: %v", i, err)
+			t.Fatalf("ingest complaint %d: %v", i, err)
 		}
-		if c.TenantID != tenantA {
-			t.Fatalf("complaint attributed to tenant %d, want A=%d", c.TenantID, tenantA)
+		if !ok || c.TenantID != tenantA {
+			t.Fatalf("complaint attributed to tenant %d (ok=%v), want A=%d", c.TenantID, ok, tenantA)
 		}
 		if c.RemoteDomain != domain {
 			t.Fatalf("complaint domain = %q, want %q", c.RemoteDomain, domain)
@@ -112,9 +117,10 @@ func TestFBLAttributionAndIsolation(t *testing.T) {
 		t.Fatalf("tenant B paused by tenant A's complaints — cross-tenant reputation leak")
 	}
 
-	// A garbage report without a VERP token is rejected, never attributed.
-	if _, err := svc.RecordComplaint(ctx, []byte("Subject: not an arf\r\n\r\nnope\r\n")); err == nil {
-		t.Fatalf("non-ARF message was accepted as a complaint")
+	// A report whose recipient token is not a VERP address is rejected, never
+	// attributed (ok=false, no event recorded).
+	if _, ok, err := svc.IngestReport(ctx, "postmaster", nil, []byte("Subject: not an arf\r\n\r\nnope\r\n")); err != nil || ok {
+		t.Fatalf("non-VERP recipient was accepted as a complaint (ok=%v err=%v)", ok, err)
 	}
 
 	t.Logf("OK: 20 ARF complaints attributed to tenant A via VERP → A paused for %s; tenant B unaffected (per-tenant FBL isolation)", domain)

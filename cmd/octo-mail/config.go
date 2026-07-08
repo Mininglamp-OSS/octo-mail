@@ -82,7 +82,7 @@ func loadConfig() config {
 		dsn:          envDefault("OCTO_MAIL_DSN", "postgres://octo_mail:octo_mail@localhost:55432/octo_mail"),
 		nodeID:       envDefault("OCTO_MAIL_NODE_ID", defaultNodeID()),
 		hostname:     envDefault("OCTO_MAIL_HOSTNAME", "octo-mail.local"),
-		bounceDomain: strings.ToLower(strings.TrimSpace(os.Getenv("OCTO_MAIL_BOUNCE_DOMAIN"))),
+		bounceDomain: envLower("OCTO_MAIL_BOUNCE_DOMAIN"),
 		verpKey:      []byte(os.Getenv("OCTO_MAIL_VERP_KEY")),
 		maxSize:      envInt64("OCTO_MAIL_MAX_SIZE", 50*1024*1024),
 
@@ -164,6 +164,12 @@ func envDefault(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envLower reads an env var and returns it trimmed and lowercased — used for
+// case-insensitive identifiers like a DNS domain read from operator config.
+func envLower(k string) string {
+	return strings.ToLower(strings.TrimSpace(os.Getenv(k)))
 }
 
 func envInt64(k string, def int64) int64 {

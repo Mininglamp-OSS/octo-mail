@@ -28,6 +28,11 @@ const (
 	KindDeferral  = 3
 )
 
+// verpPrefix is the localpart marker for a VERP return-path. It is the single
+// source of truth for the token layout shared by the (Signed)VERPToken builders
+// and the Parse(Signed)VERP parsers.
+const verpPrefix = "bounces+"
+
 // Thresholds beyond which a (tenant, domain) is auto-paused. Deliberately simple
 // and explicit; real deployments tune these per remote.
 const (
@@ -138,22 +143,18 @@ func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, ki
 // bounces/complaints to a victim tenant. This form is retained for tests and for
 // deployments that have not configured a VERP key.
 func VERPToken(tenantID, msgID int64) string {
-	return "bounces+" + strconv.FormatInt(tenantID, 10) + "." + strconv.FormatInt(msgID, 10)
+	return verpPrefix + strconv.FormatInt(tenantID, 10) + "." + strconv.FormatInt(msgID, 10)
 }
 
-// ParseVERP decodes a VERP localpart back to (tenantID, msgID). Accepts the full
-// localpart (with or without the "bounces+" prefix). It does NOT authenticate —
-// see ParseSignedVERP for the forgery-resistant form.
+// ParseVERP decodes an unsigned 2-part VERP localpart back to (tenantID, msgID).
+// Accepts the full localpart (with or without the "bounces+" prefix). It does NOT
+// authenticate — see ParseSignedVERP for the forgery-resistant form, which is the
+// only caller for a signed 3-part token.
 func ParseVERP(localpart string) (tenantID, msgID int64, ok bool) {
-	lp := strings.TrimPrefix(strings.ToLower(localpart), "bounces+")
+	lp := strings.TrimPrefix(strings.ToLower(localpart), verpPrefix)
 	a, b, found := strings.Cut(lp, ".")
 	if !found {
 		return 0, 0, false
-	}
-	// Tolerate a trailing signature segment (bounces+T.M.SIG) so a signed token
-	// still yields (T,M) here; authentication is ParseSignedVERP's job.
-	if i := strings.IndexByte(b, '.'); i >= 0 {
-		b = b[:i]
 	}
 	ti, err1 := strconv.ParseInt(a, 10, 64)
 	mi, err2 := strconv.ParseInt(b, 10, 64)
@@ -183,7 +184,7 @@ func SignedVERPToken(tenantID, msgID int64, key []byte) string {
 	if len(key) == 0 {
 		return VERPToken(tenantID, msgID)
 	}
-	return "bounces+" + strconv.FormatInt(tenantID, 10) + "." + strconv.FormatInt(msgID, 10) + "." + verpMAC(tenantID, msgID, key)
+	return VERPToken(tenantID, msgID) + "." + verpMAC(tenantID, msgID, key)
 }
 
 // ParseSignedVERP decodes AND authenticates a VERP localpart against key. It
@@ -201,33 +202,25 @@ func ParseSignedVERP(localpart string, key []byte) (tenantID, msgID int64, ok bo
 	if len(key) == 0 {
 		return ParseVERP(localpart)
 	}
-	lp := strings.TrimPrefix(strings.ToLower(localpart), "bounces+")
+	lp := strings.TrimPrefix(strings.ToLower(localpart), verpPrefix)
 	parts := strings.Split(lp, ".")
 	// Accept the 3-part signed form; also accept a 2-part legacy unsigned token so
 	// bounces for mail sent BEFORE a key was configured aren't dropped after a
 	// keyless→keyed rollout (they carry no MAC to verify — attribution still comes
 	// from the tenant/msg, which is not secret, only unauthenticated).
-	switch len(parts) {
-	case 3:
-		ti, ok1 := parseCanonInt(parts[0])
-		mi, ok2 := parseCanonInt(parts[1])
-		if !ok1 || !ok2 {
-			return 0, 0, false
-		}
-		if !hmac.Equal([]byte(parts[2]), []byte(verpMAC(ti, mi, key))) {
-			return 0, 0, false
-		}
-		return ti, mi, true
-	case 2:
-		ti, ok1 := parseCanonInt(parts[0])
-		mi, ok2 := parseCanonInt(parts[1])
-		if !ok1 || !ok2 {
-			return 0, 0, false
-		}
-		return ti, mi, true
-	default:
+	if len(parts) != 2 && len(parts) != 3 {
 		return 0, 0, false
 	}
+	ti, ok1 := parseCanonInt(parts[0])
+	mi, ok2 := parseCanonInt(parts[1])
+	if !ok1 || !ok2 {
+		return 0, 0, false
+	}
+	// A 3-part token carries a MAC that must verify; a 2-part legacy token has none.
+	if len(parts) == 3 && !hmac.Equal([]byte(parts[2]), []byte(verpMAC(ti, mi, key))) {
+		return 0, 0, false
+	}
+	return ti, mi, true
 }
 
 // parseCanonInt parses a canonical non-negative decimal (no sign, no leading
