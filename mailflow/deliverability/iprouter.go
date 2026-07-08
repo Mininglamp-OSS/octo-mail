@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -146,6 +147,49 @@ func (r *IPRouter) ResetDailyCounters(ctx context.Context) error {
 	return err
 }
 
+// RunDailyMaintenance performs the once-per-day warmup advance + daily-counter
+// reset, but only if it has not already run today (UTC). The whole operation —
+// claiming the day via the maintenance_marker row, advancing warmup, and
+// resetting sent_today — runs in ONE transaction, so a crash/leadership loss
+// mid-run rolls back the day-claim too (the marker is never left saying "done"
+// while the reset didn't happen). Safe to call on a frequent leader tick or from
+// a freshly-elected leader after failover. Returns (ran, advancedIPs, err); ran
+// is false when today was already done.
+func (r *IPRouter) RunDailyMaintenance(ctx context.Context) (ran bool, advanced int64, err error) {
+	err = pgx.BeginFunc(ctx, r.Pool, func(tx pgx.Tx) error {
+		// Atomically claim today. INSERT the marker if absent, else bump it only
+		// when behind today's date; RETURNING yields a row only when this txn won
+		// the day. A losing racer blocks on the row lock, re-evaluates the WHERE
+		// against the committed date, matches nothing → ErrNoRows.
+		var claimed bool
+		cerr := tx.QueryRow(ctx, `
+			INSERT INTO maintenance_marker (name, last_run)
+			VALUES ('ip_warmup', (now() AT TIME ZONE 'utc')::date)
+			ON CONFLICT (name) DO UPDATE SET last_run = EXCLUDED.last_run
+			WHERE maintenance_marker.last_run < (now() AT TIME ZONE 'utc')::date
+			RETURNING true`).Scan(&claimed)
+		if errors.Is(cerr, pgx.ErrNoRows) {
+			return nil // already ran today; ran stays false
+		}
+		if cerr != nil {
+			return cerr
+		}
+		n, aerr := advanceWarmupDue(ctx, tx)
+		if aerr != nil {
+			return aerr
+		}
+		if _, rerr := tx.Exec(ctx, `UPDATE ip_addresses SET sent_today = 0`); rerr != nil {
+			return rerr
+		}
+		ran, advanced = true, n
+		return nil
+	})
+	if err != nil {
+		return false, 0, err
+	}
+	return ran, advanced, nil
+}
+
 // AdvanceWarmup bumps an IP's warmup_stage by one (run daily for warming IPs
 // that met their cap), widening tomorrow's allowance until fully warmed.
 func (r *IPRouter) AdvanceWarmup(ctx context.Context, ipID int64) error {
@@ -157,6 +201,43 @@ func (r *IPRouter) AdvanceWarmup(ctx context.Context, ipID int64) error {
 		return fmt.Errorf("no ip_address id %d", ipID)
 	}
 	return nil
+}
+
+// AdvanceWarmupDue bumps warmup_stage by exactly one for every still-warming IP
+// that reached its current stage's cap today, so tomorrow's allowance widens. An
+// IP that did not hit its cap is left where it is (not ready to graduate).
+// Fully-warmed IPs (past the ramp table) are untouched. Returns the number
+// advanced. Intended to run once per day, leader-gated, right before
+// ResetDailyCounters.
+func (r *IPRouter) AdvanceWarmupDue(ctx context.Context) (int64, error) {
+	return advanceWarmupDue(ctx, r.Pool)
+}
+
+// execer is satisfied by both *pgxpool.Pool and pgx.Tx.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func advanceWarmupDue(ctx context.Context, db execer) (int64, error) {
+	// Single set-based UPDATE evaluated against each IP's CURRENT stage in one
+	// pass, so no IP is advanced more than one stage per call (a per-stage loop
+	// would cascade: bumping 0→1 then re-examining the same row at stage 1). The
+	// per-stage cap is a CASE built from the ramp table (still the single source
+	// of truth); rows at/after the last stage have no CASE arm (ELSE NULL) and
+	// never match, since `sent_today >= NULL` is never true.
+	var caseArms strings.Builder
+	args := make([]any, 0, len(warmupCaps))
+	for stage := 0; stage < len(warmupCaps); stage++ {
+		args = append(args, warmupCaps[stage])
+		fmt.Fprintf(&caseArms, " WHEN %d THEN $%d::bigint", stage, len(args))
+	}
+	q := `UPDATE ip_addresses SET warmup_stage = warmup_stage + 1
+	      WHERE sent_today >= CASE warmup_stage` + caseArms.String() + ` ELSE NULL END`
+	tag, err := db.Exec(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // EvictToPenalty moves an IP into the penalty pool (e.g. after a complaint
