@@ -145,7 +145,7 @@ func VERPToken(tenantID, msgID int64) string {
 // localpart (with or without the "bounces+" prefix). It does NOT authenticate —
 // see ParseSignedVERP for the forgery-resistant form.
 func ParseVERP(localpart string) (tenantID, msgID int64, ok bool) {
-	lp := strings.TrimPrefix(localpart, "bounces+")
+	lp := strings.TrimPrefix(strings.ToLower(localpart), "bounces+")
 	a, b, found := strings.Cut(lp, ".")
 	if !found {
 		return 0, 0, false
@@ -190,25 +190,55 @@ func SignedVERPToken(tenantID, msgID int64, key []byte) string {
 // returns ok=false for a missing/invalid signature, so a forged token attributes
 // nothing. When key is empty it accepts the unsigned form (ParseVERP) — matching
 // SignedVERPToken's fallback so a keyless deployment still round-trips.
+//
+// The localpart is lowercased first: SignedVERPToken emits an all-lowercase token
+// (digits, ".", and a lowercased base32 tag), but a bounce/DSN may return through
+// an intermediary that re-cases the localpart. Lowercasing makes verification
+// robust without weakening it (the token alphabet has no case significance). The
+// tenant/msg fields are parsed canonically (no leading zeros / sign), so one
+// logical token has exactly one valid string form.
 func ParseSignedVERP(localpart string, key []byte) (tenantID, msgID int64, ok bool) {
 	if len(key) == 0 {
 		return ParseVERP(localpart)
 	}
-	lp := strings.TrimPrefix(localpart, "bounces+")
+	lp := strings.TrimPrefix(strings.ToLower(localpart), "bounces+")
 	parts := strings.Split(lp, ".")
-	if len(parts) != 3 {
+	// Accept the 3-part signed form; also accept a 2-part legacy unsigned token so
+	// bounces for mail sent BEFORE a key was configured aren't dropped after a
+	// keyless→keyed rollout (they carry no MAC to verify — attribution still comes
+	// from the tenant/msg, which is not secret, only unauthenticated).
+	switch len(parts) {
+	case 3:
+		ti, ok1 := parseCanonInt(parts[0])
+		mi, ok2 := parseCanonInt(parts[1])
+		if !ok1 || !ok2 {
+			return 0, 0, false
+		}
+		if !hmac.Equal([]byte(parts[2]), []byte(verpMAC(ti, mi, key))) {
+			return 0, 0, false
+		}
+		return ti, mi, true
+	case 2:
+		ti, ok1 := parseCanonInt(parts[0])
+		mi, ok2 := parseCanonInt(parts[1])
+		if !ok1 || !ok2 {
+			return 0, 0, false
+		}
+		return ti, mi, true
+	default:
 		return 0, 0, false
 	}
-	ti, err1 := strconv.ParseInt(parts[0], 10, 64)
-	mi, err2 := strconv.ParseInt(parts[1], 10, 64)
-	if err1 != nil || err2 != nil {
-		return 0, 0, false
+}
+
+// parseCanonInt parses a canonical non-negative decimal (no sign, no leading
+// zeros beyond "0" itself), so a signed token has exactly one valid spelling and
+// can't be replayed as "007"/"+7".
+func parseCanonInt(s string) (int64, bool) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 || strconv.FormatInt(n, 10) != s {
+		return 0, false
 	}
-	want := verpMAC(ti, mi, key)
-	if !hmac.Equal([]byte(parts[2]), []byte(want)) {
-		return 0, 0, false
-	}
-	return ti, mi, true
+	return n, true
 }
 
 func nullIf0(v int64) any {

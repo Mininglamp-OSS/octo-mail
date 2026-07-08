@@ -239,6 +239,9 @@ func run() error {
 		// reputation + suppression, attributed to the sending tenant via the VERP
 		// token. Enabled only when a bounce domain is configured.
 		if cfg.bounceDomain != "" {
+			if len(cfg.verpKey) == 0 {
+				log.Warn("VERP signing key not set (OCTO_MAIL_VERP_KEY); bounce/complaint attribution is forgeable — set a key before production", "bounce_domain", cfg.bounceDomain)
+			}
 			mx.BounceDomain = cfg.bounceDomain
 			mx.BounceHandler = func(ctx context.Context, verpLocalpart string, raw []byte) {
 				c, ok, err := repo.IngestReport(ctx, verpLocalpart, cfg.verpKey, raw)
@@ -257,9 +260,6 @@ func run() error {
 				// DOMAIN, and honoring a domain-level suppression from a report would
 				// let one complaint silence a tenant's mail to a whole provider.
 				// Suppression stays driven by the delivery-time hard-bounce path.
-				if cfg.verpKey == nil {
-					log.WarnContext(ctx, "VERP signing key not set (OCTO_MAIL_VERP_KEY); bounce attribution is forgeable — set a key before production")
-				}
 				log.InfoContext(ctx, "bounce/complaint recorded", "tenant", c.TenantID, "kind", c.Kind)
 			}
 		}

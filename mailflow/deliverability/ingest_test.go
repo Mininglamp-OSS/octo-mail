@@ -58,16 +58,24 @@ func TestIngestReport(t *testing.T) {
 		return n
 	}
 
-	// --- DSN bounce path: a plain (non-ARF) message addressed to the VERP
-	// recipient. Attribution comes from the recipient localpart alone. ---
+	// --- DSN bounce path: a multipart/report delivery-status. Classified as a
+	// bounce (not a complaint); the failed-recipient domain is extracted from the
+	// delivery-status Final-Recipient so it feeds the per-domain reputation row. ---
 	dsn := []byte("From: mailer-daemon@remote.example\r\nTo: " + verp + "@bounces.example\r\n" +
-		"Subject: Delivery Status Notification (Failure)\r\n\r\n550 user unknown\r\n")
+		"Content-Type: multipart/report; report-type=delivery-status; boundary=\"d1\"\r\n\r\n" +
+		"--d1\r\nContent-Type: text/plain\r\n\r\n550 user unknown\r\n" +
+		"--d1\r\nContent-Type: message/delivery-status\r\n\r\n" +
+		"Final-Recipient: rfc822; user@failed.example\r\nAction: failed\r\nStatus: 5.1.1\r\n\r\n" +
+		"--d1--\r\n")
 	c, ok, err := svc.IngestReport(ctx, verp, key, dsn)
 	if err != nil {
 		t.Fatalf("IngestReport(dsn): %v", err)
 	}
 	if !ok || c.TenantID != tenantID || c.MsgID != msgID || c.Kind != deliverability.KindBounce {
 		t.Fatalf("DSN attribution wrong: ok=%v c=%+v", ok, c)
+	}
+	if c.RemoteDomain != "failed.example" {
+		t.Fatalf("DSN failed domain = %q, want failed.example", c.RemoteDomain)
 	}
 	if countKind(deliverability.KindBounce) != 1 {
 		t.Fatalf("expected 1 bounce event, got %d", countKind(deliverability.KindBounce))
@@ -88,6 +96,9 @@ func TestIngestReport(t *testing.T) {
 	}
 	if !ok2 || c2.TenantID != tenantID || c2.Kind != deliverability.KindComplaint {
 		t.Fatalf("ARF attribution wrong: ok=%v c=%+v", ok2, c2)
+	}
+	if c2.RemoteDomain != "complainer.example" {
+		t.Fatalf("ARF complained domain = %q, want complainer.example (must feed the per-domain reputation row)", c2.RemoteDomain)
 	}
 	if countKind(deliverability.KindComplaint) != 1 {
 		t.Fatalf("expected 1 complaint event, got %d", countKind(deliverability.KindComplaint))

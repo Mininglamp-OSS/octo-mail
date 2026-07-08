@@ -96,6 +96,61 @@ func ParseARF(raw []byte) (Complaint, bool) {
 	}, true
 }
 
+// reportKindAndDomain classifies an inbound report to the bounce domain and
+// extracts the affected recipient domain, so the reputation event lands in the
+// same (tenant, domain) row that outbound `sent` feeds (driving auto-pause). It
+// distinguishes an ARF complaint (report-type=feedback-report) from a DSN bounce
+// (report-type=delivery-status, or any non-ARF message). Domain is best-effort
+// ("" if the provider redacted it); classification never depends on a VERP
+// inside the embedded original (attribution comes from the signed recipient
+// token in IngestReport).
+func reportKindAndDomain(raw []byte) (kind int, domain string) {
+	msg, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		return KindBounce, ""
+	}
+	mediaType, params, _ := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	isReport := strings.EqualFold(mediaType, "multipart/report")
+	reportType := params["report-type"]
+	kind = KindBounce
+	if isReport && strings.EqualFold(reportType, "feedback-report") {
+		kind = KindComplaint
+	}
+	if !isReport || params["boundary"] == "" {
+		return kind, ""
+	}
+	mr := multipart.NewReader(msg.Body, params["boundary"])
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			break
+		}
+		pType, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		body, _ := io.ReadAll(part)
+		switch {
+		case strings.EqualFold(pType, "message/feedback-report"):
+			if d := addr.Domain(fieldValue(body, "Original-Rcpt-To")); d != "" {
+				return kind, d
+			}
+		case strings.EqualFold(pType, "message/delivery-status"):
+			// DSN: Final-Recipient: rfc822; user@failed.example
+			if fr := fieldValue(body, "Final-Recipient"); fr != "" {
+				if i := strings.LastIndexByte(fr, ';'); i >= 0 {
+					fr = fr[i+1:]
+				}
+				if d := addr.Domain(fr); d != "" {
+					return kind, d
+				}
+			}
+		case strings.EqualFold(pType, "message/rfc822"), strings.EqualFold(pType, "text/rfc822-headers"):
+			if d := addr.Domain(fieldValue(body, "To")); d != "" {
+				return kind, d
+			}
+		}
+	}
+	return kind, ""
+}
+
 // RecordComplaint parses an ARF report and records the complaint against the
 // attributed tenant. Returns the parsed complaint. It never attributes to the
 // platform: if no VERP token is found, it returns an error rather than guessing.
@@ -123,13 +178,13 @@ func (s *Service) IngestReport(ctx context.Context, verpLocalpart string, key, r
 	if !ok {
 		return Complaint{}, false, nil // unauthenticated/forged recipient token
 	}
-	// Complaint (ARF feedback-report) vs bounce (everything else, e.g. a DSN).
-	kind := KindBounce
-	if _, isARF := ParseARF(raw); isARF {
-		kind = KindComplaint
-	}
-	c := Complaint{TenantID: tenantID, MsgID: msgID, Kind: kind}
-	if err := s.RecordEvent(ctx, c.TenantID, 0, c.Kind, ""); err != nil {
+	// Classify (complaint vs bounce) and extract the affected recipient domain so
+	// the event lands in the same (tenant, domain) reputation row outbound `sent`
+	// feeds — which is what drives auto-pause. Attribution (tenant) already came
+	// from the authenticated recipient token above.
+	kind, domain := reportKindAndDomain(raw)
+	c := Complaint{TenantID: tenantID, MsgID: msgID, RemoteDomain: domain, Kind: kind}
+	if err := s.RecordEvent(ctx, c.TenantID, 0, c.Kind, c.RemoteDomain); err != nil {
 		return Complaint{}, false, err
 	}
 	return c, true, nil

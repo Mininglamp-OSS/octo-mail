@@ -81,3 +81,42 @@ func TestBounceDomainRouting(t *testing.T) {
 	}
 	t.Logf("OK: bounce-domain RCPT accepted and routed to handler (verp=%s), never re-bounced", gotVERP)
 }
+
+// TestBounceDomainNoMixedRecipients proves a bounce-domain recipient and a normal
+// recipient can't be combined in one transaction — otherwise the bounce
+// short-circuit in processData would silently drop the normal recipient while
+// answering 250 (silent mail loss).
+func TestBounceDomainNoMixedRecipients(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := &smtpd.Server{
+		Hostname:      "mx.example.com",
+		BounceDomain:  "bounces.example",
+		BounceHandler: func(ctx context.Context, verpLocalpart string, raw []byte) {},
+	}
+	cli, s := net.Pipe()
+	go func() { _ = srv.Serve(ctx, s) }()
+	_ = cli.SetDeadline(time.Now().Add(15 * time.Second))
+	br := bufio.NewReader(cli)
+	rd := func() string { line, _ := br.ReadString('\n'); return strings.TrimSpace(line) }
+	cmd := func(line string) string { cli.Write([]byte(line + "\r\n")); return rd() }
+
+	rd() // greeting
+	cli.Write([]byte("EHLO client\r\n"))
+	for {
+		line, _ := br.ReadString('\n')
+		if strings.HasPrefix(line, "250 ") {
+			break
+		}
+	}
+	cmd("MAIL FROM:<>")
+	if r := cmd("RCPT TO:<bounces+7.42@bounces.example>"); !strings.HasPrefix(r, "250") {
+		t.Fatalf("first bounce RCPT → %q, want 250", r)
+	}
+	// A normal recipient after a bounce recipient must be refused, not silently
+	// accepted-then-dropped.
+	if r := cmd("RCPT TO:<user@bounces.example.notthebounce>"); strings.HasPrefix(r, "250") {
+		t.Fatalf("mixed normal RCPT after bounce → %q, want a rejection (not 250)", r)
+	}
+	t.Logf("OK: mixing a normal recipient with a bounce recipient is rejected")
+}

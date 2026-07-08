@@ -1,6 +1,7 @@
 package deliverability_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/deliverability"
@@ -28,9 +29,21 @@ func TestSignedVERP(t *testing.T) {
 	if _, _, ok := deliverability.ParseSignedVERP("bounces+7.42.aaaaaaaaaaaaaaaa", key); ok {
 		t.Fatal("forged token with bogus MAC verified")
 	}
-	// An unsigned token must not verify when a key is required.
-	if _, _, ok := deliverability.ParseSignedVERP("bounces+7.42", key); ok {
-		t.Fatal("unsigned token verified when key was set")
+	// A legacy 2-part (unsigned) token IS accepted even when a key is set, so
+	// bounces for mail sent before the key was configured aren't dropped after a
+	// keyless→keyed rollout. It carries no MAC to verify — attribution is the
+	// (non-secret) tenant/msg. A 3-part token with a bad MAC is still rejected.
+	if _, _, ok := deliverability.ParseSignedVERP("bounces+7.42", key); !ok {
+		t.Fatal("legacy 2-part token should be accepted during key rollout")
+	}
+	// Case-insensitive: a re-cased localpart (an intermediary uppercased it) still
+	// verifies, since the token alphabet has no case significance.
+	if _, _, ok := deliverability.ParseSignedVERP(strings.ToUpper(tok), key); !ok {
+		t.Fatal("upper-cased signed token failed to verify (case-sensitivity break)")
+	}
+	// Non-canonical integer spellings must not verify (no leading-zero replay).
+	if _, _, ok := deliverability.ParseSignedVERP("bounces+007.42."+tok[len("bounces+7.42."):], key); ok {
+		t.Fatal("non-canonical tenant spelling verified")
 	}
 
 	// Tamper: changing the tenant id invalidates the MAC.

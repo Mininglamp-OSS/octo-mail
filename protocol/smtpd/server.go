@@ -709,7 +709,7 @@ func (c *conn) cmdRcpt(rest string) {
 		return
 	}
 	// LIMITS RCPTMAX (RFC 9422): reject once the per-message recipient cap is hit.
-	if len(c.rcpts)+len(c.subRcpts) >= c.srv.maxRcpt() {
+	if len(c.rcpts)+len(c.subRcpts)+len(c.bounceRcpts) >= c.srv.maxRcpt() {
 		c.writef("452 4.5.3 too many recipients (RCPTMAX=%d)", c.srv.maxRcpt())
 		return
 	}
@@ -729,11 +729,23 @@ func (c *conn) cmdRcpt(rest string) {
 		return
 	}
 	// Mail to the VERP bounce/FBL domain belongs to no account: accept it and
-	// route to the bounce handler after DATA (complaint/bounce → suppression).
-	if c.srv.BounceDomain != "" && c.srv.BounceHandler != nil &&
-		strings.EqualFold(addr.Domain.ASCII, c.srv.BounceDomain) {
+	// route to the bounce handler after DATA. A bounce transaction is handled
+	// wholesale (processData short-circuits on bounceRcpts), so it must not mix
+	// with normal recipients — otherwise the bounce short-circuit would silently
+	// drop the co-addressed mailbox recipients. Keep the two kinds exclusive.
+	isBounce := c.srv.BounceDomain != "" && c.srv.BounceHandler != nil &&
+		strings.EqualFold(addr.Domain.ASCII, c.srv.BounceDomain)
+	if isBounce {
+		if len(c.rcpts) > 0 {
+			c.writef("%d 5.5.1 cannot mix bounce-domain and normal recipients", smtp.C503BadCmdSeq)
+			return
+		}
 		c.bounceRcpts = append(c.bounceRcpts, string(addr.Localpart))
 		c.writef("%d 2.1.5 OK", smtp.C250Completed)
+		return
+	}
+	if len(c.bounceRcpts) > 0 {
+		c.writef("%d 5.5.1 cannot mix normal and bounce-domain recipients", smtp.C503BadCmdSeq)
 		return
 	}
 	target, err := c.srv.Dir.ResolveInbound(c.ctx, addr.Path())
@@ -798,7 +810,7 @@ func (c *conn) cmdBDAT(rest string) error {
 		return c.writef("%d 5.5.4 bad BDAT size", smtp.C501BadParamSyntax)
 	}
 	last := len(fields) >= 2 && strings.EqualFold(fields[1], "LAST")
-	if !c.haveFrom || (len(c.rcpts) == 0 && len(c.subRcpts) == 0) {
+	if !c.haveFrom || (len(c.rcpts) == 0 && len(c.subRcpts) == 0 && len(c.bounceRcpts) == 0) {
 		return c.writef("%d 5.5.1 need MAIL and RCPT first", smtp.C503BadCmdSeq)
 	}
 	// Reject an oversized chunk BEFORE allocating it — a client-controlled size
@@ -864,10 +876,16 @@ func (c *conn) processData(data []byte) error {
 		return c.writef("552 5.3.4 message too large")
 	}
 
-	// Mail to the VERP bounce/FBL domain: hand each VERP recipient to the bounce
-	// handler (complaint/bounce → suppression) and accept. Never bounce a bounce.
+	// Mail to the VERP bounce/FBL domain: hand each distinct VERP recipient to the
+	// bounce handler and accept. Dedup so one physical report addressed to the same
+	// token twice records a single reputation event. Never bounce a bounce.
 	if len(c.bounceRcpts) > 0 && c.srv.BounceHandler != nil {
+		seen := make(map[string]bool, len(c.bounceRcpts))
 		for _, lp := range c.bounceRcpts {
+			if seen[lp] {
+				continue
+			}
+			seen[lp] = true
 			c.srv.BounceHandler(c.ctx, lp, data)
 		}
 		c.reset()
