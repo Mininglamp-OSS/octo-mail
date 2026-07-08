@@ -117,6 +117,12 @@ type conn struct {
 	// respects the per-literal cap still can't accumulate N×MaxSize on one
 	// connection — preserving the connection-cap sizing invariant (≈one message
 	// worth of buffer per connection).
+	//
+	// Note this is a per-COMMAND cap, deliberately stricter than RFC 7889
+	// APPENDLIMIT (a per-MESSAGE limit): a MULTIAPPEND whose messages are each
+	// under APPENDLIMIT but together exceed MaxSize is rejected [TOOBIG]. That is a
+	// memory-safety tradeoff, not a bug — a client can split such a batch into
+	// separate APPEND commands.
 	cmdBudget int64
 
 	scope    directory.TenantScope
