@@ -92,13 +92,18 @@ func TestInboundDecision(t *testing.T) {
 		t.Fatalf("known-bad sender error = %v, want 550", err)
 	}
 
-	// --- Trusted sender: seed ham reputation, expect direct accept (no greylist). ---
+	// --- Trusted reputation WITHOUT authentication does NOT fast-track (H10). ---
+	// This server has no Auth, so inbound mail is not DMARC-aligned; the
+	// trusted-sender reputation shortcut is gated on authentication, so even a
+	// ham-heavy domain is still subject to greylist on first contact. (A spoofable
+	// MAIL FROM domain must not be able to leverage a trusted reputation.)
 	if _, err := s.Pool.Exec(ctx, `INSERT INTO inbound_reputation (account_id, sender_domain, ham_count) VALUES ($1,'good.example',10)`, accID); err != nil {
 		t.Fatal(err)
 	}
-	if err := deliver("alice@good.example"); err != nil {
-		t.Fatalf("trusted sender delivery failed: %v", err)
+	err = deliver("alice@good.example")
+	if err == nil || !strings.Contains(err.Error(), "451") {
+		t.Fatalf("unauthenticated trusted-reputation sender: err=%v, want 451 greylist (no trust fast-path without auth)", err)
 	}
 
-	t.Logf("OK: first-contact greylisted(451)→retry accepted; known-bad reputation rejected(550); trusted sender direct-accepted")
+	t.Logf("OK: first-contact greylisted(451)→retry accepted; known-bad reputation rejected(550); unauthenticated trusted-reputation still greylisted (H10 gate)")
 }

@@ -148,7 +148,20 @@ func (d *Decider) trustedHam() int64 {
 //  3. greylist first-seen triplet → Defer;
 //  4. content (bayesian): near-certain spam → Reject, spam → AcceptJunk;
 //  5. otherwise Accept.
-func (d *Decider) Decide(ctx context.Context, accountID int64, senderDomain string, clientIP net.IP, raw []byte, classify ClassifyFunc) Decision {
+//
+// authed reports whether senderDomain (the reputation key) is itself
+// authenticated for this message — i.e. the caller verified the exact
+// senderDomain (e.g. an SPF pass on that envelope domain), not merely some
+// aligned identity. Reputation is only credited/consulted for authenticated
+// domains: an unauthenticated MAIL FROM domain is trivially spoofable, so
+// letting it earn or leverage reputation would let an attacker bypass
+// greylist+content by forging a trusted domain (and let benign first-contacts
+// poison an unknown domain). When authed is false, unauthenticated mail still
+// flows through greylist + content scoring, but gets neither the trusted-sender
+// fast-path nor the reputation-tuned (lenient) junk threshold — only the neutral
+// base threshold. The known-bad REJECT is intentionally not auth-gated (see
+// decideCore): rejecting mail that claims a known-bad identity is always safe.
+func (d *Decider) Decide(ctx context.Context, accountID int64, senderDomain string, clientIP net.IP, raw []byte, authed bool, classify ClassifyFunc) Decision {
 	// 1. Rulesets: a per-account header match can force a destination mailbox and
 	//    (by default) accept unconditionally, bypassing reputation/content checks.
 	if rs, ok := d.matchRuleset(ctx, accountID, raw); ok {
@@ -165,21 +178,27 @@ func (d *Decider) Decide(ctx context.Context, accountID int64, senderDomain stri
 		// Non-force ruleset: run the checks once; on accept, route to the
 		// ruleset's mailbox. Return the single result either way — never re-run
 		// decideCore (it mutates greylist state and re-classifies).
-		dec := d.decideCore(ctx, accountID, senderDomain, clientIP, raw, classify)
+		dec := d.decideCore(ctx, accountID, senderDomain, clientIP, raw, authed, classify)
 		if dec.Verdict == Accept || dec.Verdict == AcceptJunk {
 			dec.Mailbox = rs.mailbox
 		}
 		return dec
 	}
-	return d.decideCore(ctx, accountID, senderDomain, clientIP, raw, classify)
+	return d.decideCore(ctx, accountID, senderDomain, clientIP, raw, authed, classify)
 }
 
 // decideCore is the reputation + greylist + content pipeline, with subjectpass
 // applied to would-be content rejections.
-func (d *Decider) decideCore(ctx context.Context, accountID int64, senderDomain string, clientIP net.IP, raw []byte, classify ClassifyFunc) Decision {
-	// 2. Reputation shortcut.
+func (d *Decider) decideCore(ctx context.Context, accountID int64, senderDomain string, clientIP net.IP, raw []byte, authed bool, classify ClassifyFunc) Decision {
+	// 2. Reputation shortcuts. The ACCEPT (trusted-sender) shortcut is gated on
+	//    authentication: an unauthenticated (spoofable) MAIL FROM domain must not
+	//    earn or leverage a "trusted" reputation, or an attacker could forge a
+	//    domain the recipient trusts to bypass greylist+content. The REJECT
+	//    (known-bad) shortcut is NOT gated: rejecting mail that claims a
+	//    known-bad domain is safe regardless of authentication (a spoofer picking
+	//    a known-bad identity only hurts itself), and keeps spam defense intact.
 	ham, junk := d.reputation(ctx, accountID, senderDomain)
-	if ham >= d.trustedHam() && junk == 0 {
+	if authed && ham >= d.trustedHam() && junk == 0 {
 		return Decision{Verdict: Accept, Reason: "trusted-sender"}
 	}
 	if junk >= 3 && ham == 0 {
@@ -196,11 +215,18 @@ func (d *Decider) decideCore(ctx context.Context, accountID int64, senderDomain 
 	// 4. Content-based bayesian scoring, with a per-domain adaptive junk threshold:
 	//    a domain with a strong ham history gets a more lenient threshold (harder
 	//    to file as junk), a mostly-junk domain a stricter one. Bounded so it never
-	//    crosses the reject threshold or drops below 0.5.
+	//    crosses the reject threshold or drops below 0.5. The history that tunes
+	//    the threshold is only used for an AUTHENTICATED sender domain — otherwise
+	//    a spoofer of a ham-heavy domain would inherit its leniency. Unauthenticated
+	//    mail gets the neutral base threshold.
+	repHam, repJunk := int64(0), int64(0)
+	if authed {
+		repHam, repJunk = ham, junk
+	}
 	if classify != nil {
 		prob, significant, _, err := classify(ctx, accountID, raw)
 		if err == nil && significant {
-			junkThr := d.adaptiveJunkThreshold(ham, junk)
+			junkThr := d.adaptiveJunkThreshold(repHam, repJunk)
 			if prob >= d.rejectThreshold() {
 				return d.maybeSubjectPass(raw, Decision{Verdict: Reject, Reason: "junk-content-strict"})
 			}
@@ -246,8 +272,14 @@ func (d *Decider) reputation(ctx context.Context, accountID int64, senderDomain 
 }
 
 // RecordOutcome updates inbound reputation after a message is filed: ham=true if
-// delivered to Inbox, false if to Junk. Called post-delivery.
-func (d *Decider) RecordOutcome(ctx context.Context, accountID int64, senderDomain string, ham bool) error {
+// delivered to Inbox, false if to Junk. Called post-delivery. Only records when
+// authed is true — reputation must be built from authenticated (DMARC-aligned /
+// DKIM-verified) mail only, so an unauthenticated spoofable domain can never
+// accrue a "trusted" (or "known-bad") history. A no-op when authed is false.
+func (d *Decider) RecordOutcome(ctx context.Context, accountID int64, senderDomain string, authed, ham bool) error {
+	if !authed {
+		return nil
+	}
 	col := "junk_count"
 	if ham {
 		col = "ham_count"
