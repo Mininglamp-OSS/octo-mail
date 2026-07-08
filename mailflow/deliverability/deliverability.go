@@ -86,12 +86,36 @@ func (s *Service) RecordSent(ctx context.Context, tenantID int64, remoteDomain s
 // RecordEvent logs a reputation event (bounce/complaint) and re-evaluates the
 // (tenant, domain) score, auto-pausing that tenant for that domain if it crosses
 // a threshold. Crucially scoped to one tenant — never touches others.
-func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, kind int, remoteDomain string) error {
+//
+// msgID is the originating outbound message id (from the signed VERP token) for
+// inbound bounce/complaint ingest; pass 0 when there is no single originating
+// message (e.g. a delivery-time hard bounce). When msgID > 0 the event is
+// idempotent per (tenant, msgID): a replayed/redelivered report inserts nothing
+// and does NOT bump the counters, so an attacker who captures a victim's
+// in-the-clear signed VERP address can't replay it to force auto-pause.
+func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, kind int, remoteDomain string, msgID int64) error {
 	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO reputation_events (tenant_id, account_id, kind, remote_domain)
-			 VALUES ($1,$2,$3,$4)`, tenantID, nullIf0(accountID), kind, remoteDomain); err != nil {
-			return err
+		// Insert the event. With a msgID, dedup on (tenant, msg_id): a replay
+		// conflicts and inserts zero rows, and we then stop before touching the
+		// counters. Without a msgID, every call is a distinct event (legacy path).
+		if msgID > 0 {
+			ct, err := tx.Exec(ctx,
+				`INSERT INTO reputation_events (tenant_id, account_id, kind, remote_domain, msg_id)
+				 VALUES ($1,$2,$3,$4,$5)
+				 ON CONFLICT (tenant_id, msg_id) WHERE msg_id IS NOT NULL DO NOTHING`,
+				tenantID, nullIf0(accountID), kind, remoteDomain, msgID)
+			if err != nil {
+				return err
+			}
+			if ct.RowsAffected() == 0 {
+				return nil // replay/redelivery of an already-recorded report — no-op
+			}
+		} else {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO reputation_events (tenant_id, account_id, kind, remote_domain)
+				 VALUES ($1,$2,$3,$4)`, tenantID, nullIf0(accountID), kind, remoteDomain); err != nil {
+				return err
+			}
 		}
 		col := ""
 		switch kind {

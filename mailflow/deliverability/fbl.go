@@ -75,7 +75,10 @@ func (s *Service) IngestReport(ctx context.Context, verpLocalpart string, key, r
 	// back to "" (safe) if the send record has aged out of the queue log.
 	domain := s.sentDomain(ctx, tenantID, msgID)
 	c := Complaint{TenantID: tenantID, MsgID: msgID, RemoteDomain: domain, Kind: kind}
-	if err := s.RecordEvent(ctx, c.TenantID, 0, c.Kind, c.RemoteDomain); err != nil {
+	// Pass the signed msgID so ingest is idempotent: a replayed/redelivered report
+	// for the same (tenant, msgID) records at most one reputation event (closes the
+	// replay-to-auto-pause cross-tenant DoS).
+	if err := s.RecordEvent(ctx, c.TenantID, 0, c.Kind, c.RemoteDomain, c.MsgID); err != nil {
 		return Complaint{}, false, err
 	}
 	return c, true, nil

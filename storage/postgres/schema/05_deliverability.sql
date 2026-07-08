@@ -55,6 +55,18 @@ CREATE TABLE IF NOT EXISTS reputation_events (
 CREATE INDEX IF NOT EXISTS reputation_events_scope_idx
     ON reputation_events (tenant_id, remote_domain, at);
 
+-- msg_id ties a reputation event to the originating outbound message (the signed
+-- VERP token's msgID) so inbound bounce/complaint ingest is idempotent: a report
+-- delivered/replayed N times for the same (tenant, msg_id) records at most one
+-- event. Without this, an attacker who observes a victim's in-the-clear signed
+-- VERP bounce address could replay it to drive the victim to auto-pause (a
+-- cross-tenant reputation DoS via replay rather than forgery). NULL for events
+-- with no single originating message (delivery-time bounces), which are not
+-- deduped.
+ALTER TABLE reputation_events ADD COLUMN IF NOT EXISTS msg_id bigint;
+CREATE UNIQUE INDEX IF NOT EXISTS reputation_events_tenant_msg_uniq
+    ON reputation_events (tenant_id, msg_id) WHERE msg_id IS NOT NULL;
+
 -- Rolled-up per (tenant, remote domain) reputation the send gate consults.
 CREATE TABLE IF NOT EXISTS reputation_score (
     tenant_id      bigint NOT NULL REFERENCES tenants(id),

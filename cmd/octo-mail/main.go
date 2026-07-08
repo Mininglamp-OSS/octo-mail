@@ -420,7 +420,9 @@ func run() error {
 				dom = m.RcptTo[at+1:]
 			}
 			if dom != "" {
-				_ = repo.RecordEvent(ctx, m.TenantID, m.AccountID, deliverability.KindBounce, dom)
+				// Delivery-time hard bounce: no single signed msgID to dedup on, so
+				// pass 0 (non-idempotent — these are our own authenticated events).
+				_ = repo.RecordEvent(ctx, m.TenantID, m.AccountID, deliverability.KindBounce, dom, 0)
 			}
 			_ = webhooks.Enqueue(ctx, m.TenantID, m.AccountID, cfg.webhookURL, "bounced",
 				map[string]any{"rcpt": m.RcptTo, "msgid": m.ID})

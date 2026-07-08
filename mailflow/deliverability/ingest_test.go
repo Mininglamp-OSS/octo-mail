@@ -101,15 +101,24 @@ func TestIngestReport(t *testing.T) {
 	}
 
 	// --- ARF complaint path: classified as a complaint from the body; domain again
-	// from the authenticated send record, ignoring the report's Original-Rcpt-To. ---
-	arf := []byte("From: fbl@provider.example\r\nTo: " + verp + "@bounces.example\r\n" +
+	// from the authenticated send record, ignoring the report's Original-Rcpt-To.
+	// Uses a distinct msgID (43) — ingest is now idempotent per (tenant, msgID), so
+	// reusing 42 would dedup against the DSN above. ---
+	const arfMsgID = int64(43)
+	arfVerp := deliverability.SignedVERPToken(tenantID, arfMsgID, key)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO queue_log (queue_id, tenant_id, account_id, rcpt_to, kind) VALUES ($1,$2,0,'user2@sent.example','delivered')`,
+		arfMsgID, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	arf := []byte("From: fbl@provider.example\r\nTo: " + arfVerp + "@bounces.example\r\n" +
 		"Content-Type: multipart/report; report-type=feedback-report; boundary=\"b1\"\r\n\r\n" +
 		"--b1\r\nContent-Type: message/feedback-report\r\n\r\n" +
 		"Original-Rcpt-To: <victim@attacker-claimed.example>\r\n\r\n" +
 		"--b1\r\nContent-Type: message/rfc822\r\n\r\n" +
-		"Return-Path: <" + verp + "@bounces.example>\r\nSubject: our mail\r\n\r\nbody\r\n" +
+		"Return-Path: <" + arfVerp + "@bounces.example>\r\nSubject: our mail\r\n\r\nbody\r\n" +
 		"--b1--\r\n")
-	c2, ok2, err := svc.IngestReport(ctx, verp, key, arf)
+	c2, ok2, err := svc.IngestReport(ctx, arfVerp, key, arf)
 	if err != nil {
 		t.Fatalf("IngestReport(arf): %v", err)
 	}
@@ -121,6 +130,26 @@ func TestIngestReport(t *testing.T) {
 	}
 	if countKind(deliverability.KindComplaint) != 1 {
 		t.Fatalf("expected 1 complaint event, got %d", countKind(deliverability.KindComplaint))
+	}
+
+	// --- Replay: redelivering the SAME signed report (same tenant, msgID) must NOT
+	// record another event. Otherwise an attacker who observes a victim's
+	// in-the-clear signed VERP bounce address could replay it to drive the victim
+	// to auto-pause (cross-tenant reputation DoS via replay). Idempotent per
+	// (tenant, msgID) closes it. ---
+	for i := 0; i < 5; i++ {
+		if _, _, err := svc.IngestReport(ctx, verp, key, dsn); err != nil {
+			t.Fatalf("IngestReport(replay dsn): %v", err)
+		}
+		if _, _, err := svc.IngestReport(ctx, arfVerp, key, arf); err != nil {
+			t.Fatalf("IngestReport(replay arf): %v", err)
+		}
+	}
+	if got := countKind(deliverability.KindBounce); got != 1 {
+		t.Fatalf("after replays: %d bounce events, want 1 (replay not deduped)", got)
+	}
+	if got := countKind(deliverability.KindComplaint); got != 1 {
+		t.Fatalf("after replays: %d complaint events, want 1 (replay not deduped)", got)
 	}
 
 	// --- No send record (aged out / never logged): a valid signed token for a
