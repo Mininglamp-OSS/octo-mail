@@ -33,6 +33,7 @@ import (
 	"github.com/mjl-/mox/message"
 	"github.com/mjl-/mox/scram"
 	"github.com/mjl-/mox/smtp"
+	"github.com/mjl-/mox/spf"
 )
 
 // Server receives mail and delivers into the kernel via the directory.
@@ -909,6 +910,16 @@ func (c *conn) processData(data []byte) error {
 	if mf := parsePathOrZero(c.mailFrom); mf.IPDomain.Domain.ASCII != "" {
 		senderDomain = mf.IPDomain.Domain.ASCII
 	}
+	// repAuthed reports whether senderDomain (the envelope MAIL FROM domain, which
+	// inbound reputation is keyed on) is itself authenticated: an SPF pass whose
+	// checked domain equals senderDomain. This must attest the SAME domain
+	// reputation credits — not the From-header domain. DMARC alignment alone is
+	// insufficient here: a DKIM-aligned message can carry an unrelated, unverified
+	// envelope MAIL FROM, which would let an attacker build/leverage reputation on
+	// a domain they don't control. Only aligned+matching SPF proves the envelope
+	// domain, so only then may it earn or leverage a trusted reputation.
+	repAuthed := authenticated && authRes.SPF == spf.StatusPass &&
+		senderDomain != "" && strings.EqualFold(authRes.SPFDomain.ASCII, senderDomain)
 
 	for i, target := range c.rcpts {
 		m := &store.Message{}
@@ -925,7 +936,7 @@ func (c *conn) processData(data []byte) error {
 			if c.srv.Junk != nil {
 				classify = c.srv.Junk.Classify
 			}
-			dec := c.srv.Decider.Decide(c.ctx, target.AccountID(), senderDomain, c.remoteIP(), data, classify)
+			dec := c.srv.Decider.Decide(c.ctx, target.AccountID(), senderDomain, c.remoteIP(), data, repAuthed, classify)
 			switch dec.Verdict {
 			case inbound.Defer:
 				rcpt := c.rcptAddrs[i]
@@ -972,9 +983,11 @@ func (c *conn) processData(data []byte) error {
 			obs.InboundRejected.WithLabelValues("delivery_error").Inc()
 			return c.writef("%d 4.3.0 delivery failed for %s", smtp.C451LocalErr, c.rcptAddrs[i])
 		}
-		// Record inbound reputation outcome (junk only when filed to Junk).
+		// Record inbound reputation outcome (junk only when filed to Junk). Only
+		// for reputation-authenticated senders (see repAuthed) — unauthenticated
+		// mail must not build reputation.
 		if c.srv.Decider != nil && senderDomain != "" {
-			_ = c.srv.Decider.RecordOutcome(c.ctx, target.AccountID(), senderDomain, mailbox != "Junk")
+			_ = c.srv.Decider.RecordOutcome(c.ctx, target.AccountID(), senderDomain, repAuthed, mailbox != "Junk")
 		}
 		// Vacation auto-reply: only for real Inbox deliveries (not Junk/rulesets).
 		if c.srv.VacationResponder != nil && mailbox == "Inbox" && c.mailFrom != "" {

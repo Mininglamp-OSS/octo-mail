@@ -65,7 +65,7 @@ func TestAdaptiveThresholdAndForwarded(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO inbound_reputation (account_id, sender_domain, ham_count, junk_count) VALUES ($1,'hammy.example',90,10)`, acc); err != nil {
 		t.Fatal(err)
 	}
-	decHam := d.Decide(ctx, acc, "hammy.example", net.ParseIP("203.0.113.1"), msg, classify)
+	decHam := d.Decide(ctx, acc, "hammy.example", net.ParseIP("203.0.113.1"), msg, true, classify)
 	if decHam.Verdict != inbound.Accept {
 		t.Fatalf("hammy domain 0.90 → %v (%s), want Accept (adaptive lenient)", decHam.Verdict, decHam.Reason)
 	}
@@ -74,7 +74,7 @@ func TestAdaptiveThresholdAndForwarded(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO inbound_reputation (account_id, sender_domain, ham_count, junk_count) VALUES ($1,'junky.example',10,90)`, acc); err != nil {
 		t.Fatal(err)
 	}
-	decJunk := d.Decide(ctx, acc, "junky.example", net.ParseIP("203.0.113.2"), msg, classify)
+	decJunk := d.Decide(ctx, acc, "junky.example", net.ParseIP("203.0.113.2"), msg, true, classify)
 	if decJunk.Verdict != inbound.AcceptJunk {
 		t.Fatalf("junky domain 0.90 → %v (%s), want AcceptJunk (adaptive strict)", decJunk.Verdict, decJunk.Reason)
 	}
@@ -86,7 +86,7 @@ func TestAdaptiveThresholdAndForwarded(t *testing.T) {
 	}
 	// Without a ruleset: known-bad → Reject.
 	badMsg := []byte("From: relay@fwd.example\r\nTo: u1@example.com\r\nX-Forwarded-For-Account: u1\r\nSubject: fwd\r\n\r\nx\r\n")
-	if dec := d.Decide(ctx, acc, "fwd.example", net.ParseIP("203.0.113.3"), badMsg, classify); dec.Verdict != inbound.Reject {
+	if dec := d.Decide(ctx, acc, "fwd.example", net.ParseIP("203.0.113.3"), badMsg, true, classify); dec.Verdict != inbound.Reject {
 		t.Fatalf("known-bad fwd.example without ruleset → %v, want Reject", dec.Verdict)
 	}
 	// With an is_forward ruleset matching the forwarding header → Accept to Forwarded.
@@ -94,7 +94,7 @@ func TestAdaptiveThresholdAndForwarded(t *testing.T) {
 		`INSERT INTO rulesets (account_id, header_name, header_substr, mailbox, force_accept, is_forward) VALUES ($1,'X-Forwarded-For-Account','u1','Forwarded',false,true)`, acc); err != nil {
 		t.Fatal(err)
 	}
-	decFwd := d.Decide(ctx, acc, "fwd.example", net.ParseIP("203.0.113.3"), badMsg, classify)
+	decFwd := d.Decide(ctx, acc, "fwd.example", net.ParseIP("203.0.113.3"), badMsg, true, classify)
 	if decFwd.Verdict != inbound.Accept {
 		t.Fatalf("forwarded message → %v (%s), want Accept (bypass reputation reject)", decFwd.Verdict, decFwd.Reason)
 	}

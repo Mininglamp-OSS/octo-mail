@@ -20,8 +20,13 @@ func (a *account) MessageAdd(tx store.Tx, mb *store.Mailbox, m *store.Message, b
 
 	// Enforce quota BEFORE storing the body: reject if accepting this message
 	// would exceed the per-account or per-tenant byte limit. Checked inside the
-	// writer transaction (holding the advisory lock), so concurrent deliveries
-	// to the same account cannot race past the limit.
+	// writer transaction, which holds the per-ACCOUNT advisory lock — so
+	// concurrent deliveries to the same account cannot race past the ACCOUNT
+	// limit. The TENANT limit is a soft cap: two accounts in the same tenant hold
+	// different advisory locks, so their checks don't serialize on the shared
+	// tenant counter and can over-commit by at most (concurrent accounts) × (max
+	// message size). Making it hard would require a tenant-level lock or an
+	// atomic conditional counter update; the bounded slop is acceptable here.
 	incoming := body.Size() + int64(len(m.MsgPrefix))
 	if ok, _, err := a.CanAddMessageSize(tx, incoming); err != nil {
 		return nil, err
@@ -201,20 +206,66 @@ func (a *account) MessageReader(m store.Message) store.BlobReader {
 	}
 }
 
-// CanAddMessageSize checks per-account then per-tenant quota.
+// CanAddMessageSize enforces BOTH the per-account and the per-tenant byte quota
+// (0/NULL limit = unlimited at that scope). Returns (ok, effectiveLimit, err)
+// where effectiveLimit is the binding (smaller) configured limit, for reporting.
+// A message is admissible only if it fits under every configured scope — so a
+// tenant cap can't be exceeded by spreading messages across accounts.
 func (a *account) CanAddMessageSize(tx store.Tx, size int64) (bool, int64, error) {
 	pt := tx.(*pgTx)
-	var limit *int64
-	if err := pt.tx.QueryRow(pt.ctx, `SELECT quota_bytes FROM accounts WHERE id=$1`, a.id).Scan(&limit); err != nil {
+
+	check := func(limitSQL string, limitArg int64, scopeType int, scopeID int64) (ok bool, limit int64, err error) {
+		var lim *int64
+		if err = pt.tx.QueryRow(pt.ctx, limitSQL, limitArg).Scan(&lim); err != nil {
+			return false, 0, err
+		}
+		if lim == nil || *lim == 0 {
+			return true, 0, nil // unlimited at this scope
+		}
+		var used int64
+		// Fail closed on a counter read error rather than silently treating usage
+		// as 0 (which would bypass the quota on a transient DB error).
+		if err = pt.tx.QueryRow(pt.ctx,
+			`SELECT COALESCE(bytes_used,0) FROM quota_counters WHERE scope_type=$1 AND scope_id=$2`,
+			scopeType, scopeID).Scan(&used); err != nil && err != pgx.ErrNoRows {
+			return false, 0, err
+		}
+		return used+size <= *lim, *lim, nil
+	}
+
+	// Account scope (scope_type=1).
+	okAcc, accLimit, err := check(`SELECT quota_bytes FROM accounts WHERE id=$1`, a.id, 1, a.id)
+	if err != nil {
 		return false, 0, err
 	}
-	if limit == nil {
-		return true, 0, nil
+	if !okAcc {
+		return false, accLimit, nil
 	}
-	var used int64
-	_ = pt.tx.QueryRow(pt.ctx,
-		`SELECT bytes_used FROM quota_counters WHERE scope_type=1 AND scope_id=$1`, a.id).Scan(&used)
-	return used+size <= *limit, *limit, nil
+	// Tenant scope (scope_type=0).
+	okTen, tenLimit, err := check(`SELECT quota_bytes FROM tenants WHERE id=$1`, a.tenantID, 0, a.tenantID)
+	if err != nil {
+		return false, 0, err
+	}
+	if !okTen {
+		return false, tenLimit, nil
+	}
+	// Both pass. Report the binding (smaller non-zero) limit for the caller.
+	return true, minNonZero(accLimit, tenLimit), nil
+}
+
+// minNonZero returns the smaller of two limits treating 0 as "unlimited"
+// (i.e. not binding). Returns 0 only when both are unlimited.
+func minNonZero(a, b int64) int64 {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
 }
 
 // QuotaUsage returns used bytes, message count, and the account byte limit (0 =
