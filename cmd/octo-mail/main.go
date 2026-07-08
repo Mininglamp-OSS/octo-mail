@@ -239,8 +239,11 @@ func run() error {
 		// reputation + suppression, attributed to the sending tenant via the VERP
 		// token. Enabled only when a bounce domain is configured.
 		if cfg.bounceDomain != "" {
+			if err := checkVERPConfig(cfg); err != nil {
+				return err
+			}
 			if len(cfg.verpKey) == 0 {
-				log.Warn("VERP signing key not set (OCTO_MAIL_VERP_KEY); bounce/complaint attribution is forgeable — set a key before production", "bounce_domain", cfg.bounceDomain)
+				log.Warn("VERP signing key not set (OCTO_MAIL_VERP_KEY); bounce/complaint attribution is forgeable — dev-only unsigned path enabled via OCTO_MAIL_ALLOW_UNSIGNED_VERP", "bounce_domain", cfg.bounceDomain)
 			}
 			mx.BounceDomain = cfg.bounceDomain
 			mx.BounceHandler = func(ctx context.Context, verpLocalpart string, raw []byte) {
