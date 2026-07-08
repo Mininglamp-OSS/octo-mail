@@ -1,7 +1,6 @@
 package blob
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -9,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -109,29 +109,42 @@ func (s *s3Store) ensureBucket(ctx context.Context) error {
 }
 
 func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, int64, error) {
-	// Content-address requires the full bytes; read into memory (message bodies
-	// are bounded by MaxSize upstream). Hash, then PUT under the content key.
-	data, err := io.ReadAll(r)
+	// Content-addressing needs the SHA-256 of the whole body (it is both the object
+	// key and the SigV4 payload hash), so every byte must pass through the hasher.
+	// To avoid holding the whole (up to MaxSize) message in RAM per concurrent
+	// upload — a multiplier on the connection-cap OOM budget — spool to a temp file
+	// while hashing, then stream the PUT body from that file.
+	tmp, err := os.CreateTemp("", "octo-blob-*")
 	if err != nil {
 		return "", 0, err
 	}
-	sum := sha256.Sum256(data)
-	ref := Ref(hex.EncodeToString(sum[:]))
+	defer func() { _ = os.Remove(tmp.Name()); _ = tmp.Close() }()
+
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(tmp, h), r)
+	if err != nil {
+		return "", 0, err
+	}
+	sum := h.Sum(nil)
+	ref := Ref(hex.EncodeToString(sum))
 	key := s.key(tenantID, ref)
 
 	// Idempotent: skip if the object already exists.
 	if ok, _ := s.head(ctx, key); ok {
-		return ref, int64(len(data)), nil
+		return ref, size, nil
 	}
 
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return "", 0, err
+	}
 	url := s.endpoint + "/" + s.bucket + "/" + key
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, tmp)
 	if err != nil {
 		return "", 0, err
 	}
-	req.ContentLength = int64(len(data))
-	payloadHash := hex.EncodeToString(sum[:])
-	if err := s.sign(req, payloadHash, data); err != nil {
+	req.ContentLength = size
+	payloadHash := hex.EncodeToString(sum)
+	if err := s.sign(req, payloadHash, nil); err != nil {
 		return "", 0, err
 	}
 	resp, err := s.client.Do(req)
@@ -143,7 +156,7 @@ func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 		b, _ := io.ReadAll(resp.Body)
 		return "", 0, fmt.Errorf("s3 put: %s: %s", resp.Status, string(b))
 	}
-	return ref, int64(len(data)), nil
+	return ref, size, nil
 }
 
 func (s *s3Store) head(ctx context.Context, key string) (bool, int64) {

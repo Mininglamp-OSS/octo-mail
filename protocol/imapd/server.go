@@ -16,7 +16,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -51,6 +53,12 @@ type Server struct {
 	// spam; losing it (or leaving Junk) trains ham. This is the feedback loop that
 	// makes the bayesian filter learn from the user's corrections.
 	Junk JunkTrainer
+
+	// MaxSize bounds an accepted literal (APPEND/REPLACE/CATENATE/SETMETADATA), in
+	// bytes, and is advertised as APPENDLIMIT. A literal declaring a larger size is
+	// rejected before allocation, so a client can't force a multi-GB allocation per
+	// connection. 0 = unlimited (dev/tests). Mirrors smtpd.Server.MaxSize.
+	MaxSize int64
 }
 
 // JunkTrainer trains an account's junk filter on a message body.
@@ -129,7 +137,11 @@ func (c *conn) remoteIP() net.IP {
 // capString reports the CAPABILITY token list for the current connection state.
 // Before TLS on a TLS-required server, login is disabled and STARTTLS offered.
 func (c *conn) capString() string {
-	caps := []string{"IMAP4rev2", "IMAP4rev1", "UIDPLUS", "MOVE", "NAMESPACE", "ENABLE", "CONDSTORE", "QRESYNC", "QUOTA", "QUOTA=RES-STORAGE", "REPLACE", "METADATA", "BINARY", "UIDONLY", "NOTIFY", "ESEARCH", "SEARCHRES", "WITHIN", "STATUS=SIZE", "MULTIAPPEND", "ID", "SASL-IR", "LITERAL+", "UTF8=ACCEPT", "APPENDLIMIT=9223372036854775807", "LIST-EXTENDED", "LIST-STATUS", "LIST-METADATA", "SPECIAL-USE", "CREATE-SPECIAL-USE", "CHILDREN", "SORT", "THREAD=REFERENCES", "THREAD=ORDEREDSUBJECT", "SAVEDATE", "MULTISEARCH", "PREVIEW", "OBJECTID", "CATENATE", "URLAUTH", "INPROGRESS"}
+	appendLimit := int64(math.MaxInt64)
+	if c.srv.MaxSize > 0 {
+		appendLimit = c.srv.MaxSize
+	}
+	caps := []string{"IMAP4rev2", "IMAP4rev1", "UIDPLUS", "MOVE", "NAMESPACE", "ENABLE", "CONDSTORE", "QRESYNC", "QUOTA", "QUOTA=RES-STORAGE", "REPLACE", "METADATA", "BINARY", "UIDONLY", "NOTIFY", "ESEARCH", "SEARCHRES", "WITHIN", "STATUS=SIZE", "MULTIAPPEND", "ID", "SASL-IR", "LITERAL+", "UTF8=ACCEPT", "APPENDLIMIT=" + strconv.FormatInt(appendLimit, 10), "LIST-EXTENDED", "LIST-STATUS", "LIST-METADATA", "SPECIAL-USE", "CREATE-SPECIAL-USE", "CHILDREN", "SORT", "THREAD=REFERENCES", "THREAD=ORDEREDSUBJECT", "SAVEDATE", "MULTISEARCH", "PREVIEW", "OBJECTID", "CATENATE", "URLAUTH", "INPROGRESS"}
 	if !c.compress {
 		caps = append(caps, "COMPRESS=DEFLATE")
 	}

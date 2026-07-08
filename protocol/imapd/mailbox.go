@@ -2,6 +2,7 @@ package imapd
 
 import (
 	"bytes"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -586,6 +587,18 @@ func (c *conn) readLiteral(spec string) ([]byte, error) {
 	if err != nil || n < 0 {
 		return nil, errNo("bad literal size")
 	}
+	// Bound the declared size before allocating: a client must not be able to
+	// force a multi-GB make([]byte, n) per connection (APPENDLIMIT / RFC 9051
+	// [TOOBIG]). For a synchronizing literal we reject before sending the "+"
+	// continuation so the oversized payload is never invited. For a non-sync
+	// (LITERAL+) literal the bytes are already inbound, so we drain them in a
+	// bounded loop to keep the command stream aligned, then reject.
+	if c.srv.MaxSize > 0 && int64(n) > c.srv.MaxSize {
+		if !sync {
+			c.discard(int64(n))
+		}
+		return nil, errNo("[TOOBIG] literal exceeds APPENDLIMIT")
+	}
 	if sync {
 		c.writef("+ ready for literal")
 		c.flush()
@@ -601,6 +614,14 @@ func (c *conn) readLiteral(spec string) ([]byte, error) {
 		}
 	}
 	return buf, nil
+}
+
+// discard drains and throws away up to n bytes from the connection using a fixed
+// buffer, so an oversized non-synchronizing (LITERAL+) literal can be skipped
+// without allocating n bytes. Best-effort: a read error just stops the drain
+// (the caller is already returning an error / tearing down the command).
+func (c *conn) discard(n int64) {
+	_, _ = io.CopyN(io.Discard, c.r, n)
 }
 
 // normalizeMailbox maps the IMAP "INBOX" special name to the kernel's "Inbox".

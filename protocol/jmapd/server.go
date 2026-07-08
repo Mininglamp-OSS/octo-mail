@@ -40,6 +40,23 @@ type Server struct {
 	Blob blob.Store
 }
 
+// JMAP request limits (RFC 8620 §2.1). These are both advertised in the session
+// capabilities AND enforced on the request path, so they never drift: an
+// oversized upload or an over-long method batch is rejected instead of buffered.
+const (
+	// maxSizeUpload bounds a single /jmap/upload body (bytes).
+	maxSizeUpload = 50_000_000
+	// maxCallsInRequest bounds the number of method calls in one /jmap/api request.
+	maxCallsInRequest = 64
+	// maxObjectsInGet / maxObjectsInSet bound per-method object counts (advertised).
+	maxObjectsInGet = 1000
+	maxObjectsInSet = 1000
+	// maxAPIRequestSize bounds a /jmap/api request body. The body is a small JSON
+	// envelope of method calls (not blob data), so a tight cap is safe and blocks
+	// the multi-GB-body amplification vector.
+	maxAPIRequestSize = 10 << 20 // 10 MiB
+)
+
 // Handler returns an http.Handler serving /jmap/session and /jmap/api.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -69,9 +86,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := scope.Tenant().ID
+	r.Body = http.MaxBytesReader(w, r.Body, maxSizeUpload)
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
+		// Either a client read error or the body exceeded maxSizeUpload.
+		http.Error(w, "upload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	ref, size, err := s.Blob.Put(r.Context(), tenantID, bytes.NewReader(data))
@@ -240,10 +259,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	session := map[string]any{
 		"capabilities": map[string]any{
 			"urn:ietf:params:jmap:core": map[string]any{
-				"maxSizeUpload":     50_000_000,
-				"maxCallsInRequest": 64,
-				"maxObjectsInGet":   1000,
-				"maxObjectsInSet":   1000,
+				"maxSizeUpload":     maxSizeUpload,
+				"maxCallsInRequest": maxCallsInRequest,
+				"maxObjectsInGet":   maxObjectsInGet,
+				"maxObjectsInSet":   maxObjectsInSet,
 			},
 			"urn:ietf:params:jmap:mail":             map[string]any{},
 			"urn:ietf:params:jmap:vacationresponse": map[string]any{},
@@ -292,10 +311,22 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	body, _ := io.ReadAll(r.Body)
+	r.Body = http.MaxBytesReader(w, r.Body, maxAPIRequestSize)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		// MaxBytesReader trips this once the body exceeds the cap.
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	var req Request
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	// Enforce the advertised batch cap before dispatching any call, so a huge
+	// methodCalls array can't amplify into thousands of queries.
+	if len(req.MethodCalls) > maxCallsInRequest {
+		http.Error(w, "too many method calls", http.StatusRequestEntityTooLarge)
 		return
 	}
 

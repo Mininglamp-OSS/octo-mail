@@ -266,7 +266,7 @@ func run() error {
 				log.InfoContext(ctx, "bounce/complaint recorded", "tenant", c.TenantID, "kind", c.Kind)
 			}
 		}
-		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
+		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, cfg.maxConns, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
 	}
 	// SMTP submission (:587).
 	if cfg.submissionAddr != "" {
@@ -280,12 +280,12 @@ func run() error {
 			}
 			return imapd.ResolveURLAuth(ctx, acc, authURL)
 		}
-		go serveTCPListener(ctx, log, "smtp-submission", cfg.submissionAddr, prebound["smtp-submission"], errc, func(nc net.Conn) { _ = sub.Serve(ctx, nc) })
+		go serveTCPListener(ctx, log, "smtp-submission", cfg.submissionAddr, prebound["smtp-submission"], errc, cfg.maxConns, func(nc net.Conn) { _ = sub.Serve(ctx, nc) })
 	}
 	// IMAP (:143).
 	if cfg.imapAddr != "" {
-		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS}
-		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
+		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS, MaxSize: cfg.maxSize}
+		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, cfg.maxConns, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
 	}
 	// JMAP (HTTP) + webmail SPA (same origin, so the SPA's /jmap/* fetches work).
 	if cfg.jmapAddr != "" {
@@ -536,7 +536,7 @@ func run() error {
 // serveTCPListener serves on a pre-bound listener when ln != nil (used by the
 // privsep path, which binds privileged ports before dropping root); otherwise it
 // binds addr itself.
-func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, ln net.Listener, errc chan<- error, handle func(net.Conn)) {
+func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, ln net.Listener, errc chan<- error, maxConns int, handle func(net.Conn)) {
 	if ln == nil {
 		var err error
 		ln, err = net.Listen("tcp", addr)
@@ -547,6 +547,13 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 	}
 	log.Info("listening", "service", name, "addr", ln.Addr().String())
 	go func() { <-ctx.Done(); _ = ln.Close() }()
+	// sem bounds concurrent connections per listener so a flood of connections
+	// (each of which may buffer a whole message) can't exhaust memory/goroutines.
+	// A nil sem (maxConns <= 0) disables the cap.
+	var sem chan struct{}
+	if maxConns > 0 {
+		sem = make(chan struct{}, maxConns)
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -556,7 +563,22 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 			log.Warn("accept", "service", name, "err", err)
 			continue
 		}
-		go handle(conn)
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			default:
+				// At capacity: refuse fast rather than queue unboundedly.
+				log.Warn("connection cap reached, refusing", "service", name, "max", maxConns)
+				_ = conn.Close()
+				continue
+			}
+		}
+		go func() {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+			handle(conn)
+		}()
 	}
 }
 
