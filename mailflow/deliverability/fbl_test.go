@@ -55,12 +55,13 @@ func TestFBLAttributionAndIsolation(t *testing.T) {
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS reputation_events (id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY, tenant_id bigint NOT NULL, account_id bigint, kind smallint NOT NULL, remote_domain text NOT NULL, ip_id bigint, at timestamptz NOT NULL DEFAULT now())`,
 		`CREATE TABLE IF NOT EXISTS reputation_score (tenant_id bigint NOT NULL, remote_domain text NOT NULL, sent bigint NOT NULL DEFAULT 0, complaints bigint NOT NULL DEFAULT 0, bounces bigint NOT NULL DEFAULT 0, paused boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, remote_domain))`,
+		`CREATE TABLE IF NOT EXISTS queue_log (id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY, queue_id bigint NOT NULL, tenant_id bigint NOT NULL, account_id bigint NOT NULL DEFAULT 0, rcpt_to text NOT NULL DEFAULT '', kind text NOT NULL DEFAULT '', payload jsonb NOT NULL DEFAULT '{}', keep_until timestamptz, created_at timestamptz NOT NULL DEFAULT now())`,
 	} {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `TRUNCATE reputation_events, reputation_score RESTART IDENTITY`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE reputation_events, reputation_score, queue_log RESTART IDENTITY`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -89,12 +90,20 @@ func TestFBLAttributionAndIsolation(t *testing.T) {
 
 	// Feed 20 ARF complaints attributed (via the VERP recipient token) to tenant A
 	// only. The report is delivered to bounces+<A>.<msg>@bounce.example; ingestion
-	// takes the tenant from that authenticated recipient localpart and the domain
-	// from the report body.
+	// takes the tenant from that authenticated recipient localpart and the affected
+	// domain from the authenticated send record (queue_log), NOT the report body.
 	for i := 0; i < 20; i++ {
 		msgID := int64(1000 + i)
+		// Record that tenant A sent this msgID to gmail.com (the authenticated
+		// domain source). The ARF body deliberately claims a different domain to
+		// prove the body is not trusted for attribution.
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO queue_log (queue_id, tenant_id, account_id, rcpt_to, kind) VALUES ($1,$2,0,$3,'delivered')`,
+			msgID, tenantA, "victim@"+domain); err != nil {
+			t.Fatal(err)
+		}
 		verp := deliverability.VERPToken(tenantA, msgID)
-		raw := arfReport(tenantA, msgID, domain)
+		raw := arfReport(tenantA, msgID, "attacker-claimed.example")
 		c, ok, err := svc.IngestReport(ctx, verp, nil, raw)
 		if err != nil {
 			t.Fatalf("ingest complaint %d: %v", i, err)
@@ -103,7 +112,7 @@ func TestFBLAttributionAndIsolation(t *testing.T) {
 			t.Fatalf("complaint attributed to tenant %d (ok=%v), want A=%d", c.TenantID, ok, tenantA)
 		}
 		if c.RemoteDomain != domain {
-			t.Fatalf("complaint domain = %q, want %q", c.RemoteDomain, domain)
+			t.Fatalf("complaint domain = %q, want %q (authenticated send record, not report body)", c.RemoteDomain, domain)
 		}
 	}
 

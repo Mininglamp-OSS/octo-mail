@@ -192,6 +192,12 @@ func SignedVERPToken(tenantID, msgID int64, key []byte) string {
 // nothing. When key is empty it accepts the unsigned form (ParseVERP) — matching
 // SignedVERPToken's fallback so a keyless deployment still round-trips.
 //
+// When a key IS set, ONLY the signed 3-part form is accepted: a MAC-less 2-part
+// token is rejected. Accepting it would be a forgery bypass (an attacker just
+// omits the MAC to attribute a bounce/complaint to any victim tenant), and there
+// is no legitimate keyless→keyed rollout window to protect because the node
+// refuses to enable the bounce domain without a key (see checkVERPConfig).
+//
 // The localpart is lowercased first: SignedVERPToken emits an all-lowercase token
 // (digits, ".", and a lowercased base32 tag), but a bounce/DSN may return through
 // an intermediary that re-cases the localpart. Lowercasing makes verification
@@ -204,11 +210,10 @@ func ParseSignedVERP(localpart string, key []byte) (tenantID, msgID int64, ok bo
 	}
 	lp := strings.TrimPrefix(strings.ToLower(localpart), verpPrefix)
 	parts := strings.Split(lp, ".")
-	// Accept the 3-part signed form; also accept a 2-part legacy unsigned token so
-	// bounces for mail sent BEFORE a key was configured aren't dropped after a
-	// keyless→keyed rollout (they carry no MAC to verify — attribution still comes
-	// from the tenant/msg, which is not secret, only unauthenticated).
-	if len(parts) != 2 && len(parts) != 3 {
+	// With a key configured, require the signed 3-part form. A 2-part (MAC-less)
+	// token must NOT authenticate — accepting it would let anyone forge attribution
+	// for a victim tenant simply by dropping the MAC.
+	if len(parts) != 3 {
 		return 0, 0, false
 	}
 	ti, ok1 := parseCanonInt(parts[0])
@@ -216,8 +221,7 @@ func ParseSignedVERP(localpart string, key []byte) (tenantID, msgID int64, ok bo
 	if !ok1 || !ok2 {
 		return 0, 0, false
 	}
-	// A 3-part token carries a MAC that must verify; a 2-part legacy token has none.
-	if len(parts) == 3 && !hmac.Equal([]byte(parts[2]), []byte(verpMAC(ti, mi, key))) {
+	if !hmac.Equal([]byte(parts[2]), []byte(verpMAC(ti, mi, key))) {
 		return 0, 0, false
 	}
 	return ti, mi, true

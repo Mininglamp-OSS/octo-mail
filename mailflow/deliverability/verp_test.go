@@ -29,12 +29,13 @@ func TestSignedVERP(t *testing.T) {
 	if _, _, ok := deliverability.ParseSignedVERP("bounces+7.42.aaaaaaaaaaaaaaaa", key); ok {
 		t.Fatal("forged token with bogus MAC verified")
 	}
-	// A legacy 2-part (unsigned) token IS accepted even when a key is set, so
-	// bounces for mail sent before the key was configured aren't dropped after a
-	// keyless→keyed rollout. It carries no MAC to verify — attribution is the
-	// (non-secret) tenant/msg. A 3-part token with a bad MAC is still rejected.
-	if _, _, ok := deliverability.ParseSignedVERP("bounces+7.42", key); !ok {
-		t.Fatal("legacy 2-part token should be accepted during key rollout")
+	// A 2-part (MAC-less) token MUST be rejected when a key is set: accepting it
+	// would be a forgery bypass — an attacker just drops the MAC to attribute a
+	// bounce/complaint to any victim tenant. There is no keyless→keyed rollout
+	// window to protect (the node refuses to enable the bounce domain without a
+	// key), so the unsigned form is only valid in the keyless dev path below.
+	if _, _, ok := deliverability.ParseSignedVERP("bounces+7.42", key); ok {
+		t.Fatal("2-part MAC-less token accepted with a key set — forgery bypass")
 	}
 	// Case-insensitive: a re-cased localpart (an intermediary uppercased it) still
 	// verifies, since the token alphabet has no case significance.
