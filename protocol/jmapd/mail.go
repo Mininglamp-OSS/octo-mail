@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -134,6 +135,12 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 	sortProp, sortAsc := parseEmailSort(inv.args["sort"])
 	position := int(jsonNum(inv.args["position"]))
 	limit := int(jsonNum(inv.args["limit"]))
+	// Bound the result window: an absent/zero/oversized limit must not return the
+	// whole account in one response. maxObjectsInQuery caps it; clients page with
+	// position for more.
+	if limit <= 0 || limit > maxObjectsInQuery {
+		limit = maxObjectsInQuery
+	}
 
 	// Build the filter query in SQL: header substrings hit the denormalized
 	// summary columns, size/date/keyword hit their columns, text/body hits the fts
@@ -183,35 +190,107 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 		return q.SortReceivedDesc()
 	}
 
-	var ids []string
-	var total int
+	// A message not yet folded by the summary projection has empty summary columns,
+	// so the SQL header/keyword filters can't match it. To keep filtered search
+	// from silently dropping just-delivered mail, also evaluate the (small, recent)
+	// unfolded set live and merge it in. Only needed when a column-backed predicate
+	// is used; pure mailbox/size/date/fts filters already match unfolded rows.
+	needsLiveFallback := filt.from != "" || filt.to != "" || filt.subject != "" ||
+		filt.hasKeyword != "" || filt.notKeyword != ""
+
+	type qrow struct {
+		gid int64
+		rcv int64
+		sz  int64
+	}
+	var folded []qrow
+	var live []qrow
 	err := acc.Tx(ctx, func(tx store.Tx) error {
-		n, e := build(tx).Count()
+		// Folded matches: filtered + deduped + sorted in SQL, capped.
+		fq := sortIt(build(tx)).Limit(maxObjectsInQuery)
+		fmsgs, e := fq.List()
 		if e != nil {
 			return e
 		}
-		total = n
-		if position < 0 {
-			position = 0
+		for _, m := range fmsgs {
+			folded = append(folded, qrow{m.EffectiveEmailID(), m.Received.UnixNano(), m.Size})
 		}
-		q := sortIt(build(tx)).Offset(position)
-		if limit > 0 {
-			q = q.Limit(limit)
-		}
-		msgs, e := q.List()
-		if e != nil {
-			return e
-		}
-		for _, m := range msgs {
-			ids = append(ids, emailID(m))
+		if needsLiveFallback {
+			// Unfolded rows: apply the column-independent filters in SQL (mailbox/
+			// size/date), then match header/keyword predicates live per row.
+			uq := tx.QueryMessage().FilterUnfolded()
+			if filt.mailboxID != 0 {
+				uq = uq.FilterMailbox(filt.mailboxID)
+			}
+			if filt.after != "" || filt.before != "" {
+				uq = uq.FilterReceivedRange(filt.after, filt.before)
+			}
+			if filt.minSize > 0 || filt.maxSize > 0 {
+				uq = uq.FilterSizeRange(filt.minSize, filt.maxSize)
+			}
+			if filt.text != "" {
+				uq = uq.FilterFTS(filt.text)
+			}
+			umsgs, e := uq.Limit(maxObjectsInQuery).List()
+			if e != nil {
+				return e
+			}
+			seen := map[int64]bool{}
+			for _, m := range umsgs {
+				if !matchesLiveFilter(acc, m, filt) {
+					continue
+				}
+				gid := m.EffectiveEmailID()
+				if seen[gid] {
+					continue
+				}
+				seen[gid] = true
+				live = append(live, qrow{gid, m.Received.UnixNano(), m.Size})
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
 	}
-	if ids == nil {
-		ids = []string{}
+
+	// Merge folded + live, dedup by Email id (a row could be folded between the two
+	// reads), then sort and page in Go across the combined set.
+	seen := map[int64]bool{}
+	rows := make([]qrow, 0, len(folded)+len(live))
+	for _, r := range append(folded, live...) {
+		if seen[r.gid] {
+			continue
+		}
+		seen[r.gid] = true
+		rows = append(rows, r)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		var less bool
+		if sortProp == "size" {
+			less = rows[i].sz < rows[j].sz
+		} else {
+			less = rows[i].rcv < rows[j].rcv
+		}
+		if !sortAsc {
+			return !less
+		}
+		return less
+	})
+	total := len(rows)
+	if position < 0 {
+		position = 0
+	}
+	if position > len(rows) {
+		position = len(rows)
+	}
+	rows = rows[position:]
+	if limit > 0 && limit < len(rows) {
+		rows = rows[:limit]
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, "E"+strconv.FormatInt(r.gid, 10))
 	}
 
 	st, _ := accountState(ctx, acc)
@@ -269,6 +348,78 @@ func parseEmailFilter(raw json.RawMessage) emailFilter {
 		_ = json.Unmarshal(v, &f.maxSize)
 	}
 	return f
+}
+
+// matchesLiveFilter evaluates the header/keyword predicates of a filter against a
+// message's live-parsed envelope. Used only for the small set of not-yet-folded
+// rows in Email/query, so a filtered search doesn't miss just-delivered mail (the
+// column-backed filters can't match a row whose summary columns aren't populated
+// yet). Size/date/mailbox/fts are already applied in SQL by the caller.
+func matchesLiveFilter(acc store.Account, m store.Message, f emailFilter) bool {
+	if f.hasKeyword != "" && !hasKeyword(m, f.hasKeyword) {
+		return false
+	}
+	if f.notKeyword != "" && hasKeyword(m, f.notKeyword) {
+		return false
+	}
+	if f.from == "" && f.to == "" && f.subject == "" {
+		return true
+	}
+	br := acc.MessageReader(m)
+	data, _ := io.ReadAll(br)
+	br.Close()
+	part, _ := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
+	env := part.Envelope
+	if env == nil {
+		return false
+	}
+	if f.subject != "" && !strings.Contains(strings.ToLower(env.Subject), strings.ToLower(f.subject)) {
+		return false
+	}
+	if f.from != "" && !addrsContain(env.From, f.from) {
+		return false
+	}
+	if f.to != "" && !addrsContain(env.To, f.to) {
+		return false
+	}
+	return true
+}
+
+// addrsContain reports whether any address matches sub (case-insensitive), over
+// the display name + address — matching the folded from_addr/to_addrs content.
+func addrsContain(as []moxmessage.Address, sub string) bool {
+	sub = strings.ToLower(sub)
+	for _, a := range as {
+		if strings.Contains(strings.ToLower(a.Name+" "+a.User+"@"+a.Host), sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasKeyword reports whether a message has the given JMAP keyword ($seen etc.),
+// matching the keyword filter applied to folded rows in SQL.
+func hasKeyword(m store.Message, kw string) bool {
+	switch strings.ToLower(kw) {
+	case "$seen", `\seen`:
+		return m.Seen
+	case "$flagged", `\flagged`:
+		return m.Flagged
+	case "$answered", `\answered`:
+		return m.Answered
+	case "$draft", `\draft`:
+		return m.Draft
+	case "$deleted", `\deleted`:
+		return m.Deleted
+	case "$junk", `\junk`:
+		return m.Junk
+	}
+	for _, k := range m.Keywords {
+		if strings.EqualFold(k, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseEmailSort(raw json.RawMessage) (prop string, asc bool) {

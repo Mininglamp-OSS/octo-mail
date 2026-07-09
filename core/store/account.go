@@ -171,6 +171,10 @@ type MessageQuery interface {
 	FilterFTS(query string) MessageQuery
 	// FilterThread restricts to messages in the given thread (indexed).
 	FilterThread(id int64) MessageQuery
+	// FilterUnfolded restricts to rows the summary projection has not yet folded
+	// (summary_folded=false) — a small, recent set. Used to evaluate header
+	// filters live against just-delivered mail so filtered search isn't stale.
+	FilterUnfolded() MessageQuery
 	// FilterSubject/FilterFrom/FilterTo are case-insensitive substring matches on
 	// the denormalized summary columns (H13), so header searches run in SQL rather
 	// than parsing every body.

@@ -163,3 +163,69 @@ func TestEventSource(t *testing.T) {
 	}
 	t.Logf("OK: EventSource emitted initial state + push on delivery (SSE)")
 }
+
+// TestEmailQueryFilterUnfolded proves the H13 PR2 hybrid filter fallback: a
+// from/subject filter finds a message that has been delivered but NOT yet folded
+// by the summary projection (its summary columns are still empty). Without the
+// live fallback the SQL column filter would silently drop it.
+func TestEmailQueryFilterUnfolded(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	sc(t, s, ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`, &tenantID)
+	sc(t, s, ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, &accID, tenantID)
+	sc(t, s, ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, &domID, tenantID)
+	ex(t, s, ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	ex(t, s, ctx, `INSERT INTO principals (tenant_id, login) VALUES ($1,'u1@example.com')`, tenantID)
+	dir := s.NewDirectory()
+	if err := dir.SetPassword(ctx, "u1@example.com", "x"); err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, _ := dir.ResolveInbound(ctx, addr.Path())
+	// Deliver a message from a display-named sender, but DO NOT fold: summary
+	// columns stay empty, exercising the live fallback.
+	raw := "From: Alice Smith <alice@remote.example>\r\nTo: u1@example.com\r\nSubject: quarterly report\r\n\r\nbody\r\n"
+	if _, err := target.Deliver(ctx, &store.Message{}, mem(raw)); err != nil {
+		t.Fatal(err)
+	}
+
+	js := &jmapd.Server{Dir: dir, BaseURL: "http://jmap.test"}
+	hs := httptest.NewServer(js.Handler())
+	defer hs.Close()
+
+	// from-filter on the address must find the unfolded message.
+	q := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","filter":{"from":"alice@remote.example"}}, "c1"]`)
+	if ids := toStrings(q["ids"]); len(ids) != 1 || ids[0] != "E1" {
+		t.Fatalf("from filter on unfolded msg = %v, want [E1] (live fallback missing)", ids)
+	}
+	// subject filter likewise.
+	q2 := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","filter":{"subject":"quarterly"}}, "c2"]`)
+	if ids := toStrings(q2["ids"]); len(ids) != 1 || ids[0] != "E1" {
+		t.Fatalf("subject filter on unfolded msg = %v, want [E1]", ids)
+	}
+	// display-name filter: "Alice Smith" must match via the live envelope (name).
+	q3 := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","filter":{"from":"Alice Smith"}}, "c3"]`)
+	if ids := toStrings(q3["ids"]); len(ids) != 1 || ids[0] != "E1" {
+		t.Fatalf("display-name filter on unfolded msg = %v, want [E1]", ids)
+	}
+
+	// After folding, the same filters still match (now via columns) — no dupes.
+	tw := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 10}
+	if err := tw.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatal(err)
+	}
+	q4 := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","filter":{"from":"Alice Smith"}}, "c4"]`)
+	if ids := toStrings(q4["ids"]); len(ids) != 1 || ids[0] != "E1" {
+		t.Fatalf("after fold, display-name filter = %v, want [E1] (column path, no dupes)", ids)
+	}
+	t.Logf("OK: from/subject/display-name filters find an unfolded message (live fallback); same after fold, deduped")
+}

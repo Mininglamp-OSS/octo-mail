@@ -51,6 +51,10 @@ const (
 	// maxObjectsInGet / maxObjectsInSet bound per-method object counts (advertised).
 	maxObjectsInGet = 1000
 	maxObjectsInSet = 1000
+	// maxObjectsInQuery caps the number of ids one Email/query returns, so an
+	// absent/zero/oversized limit can't return the whole account; clients page
+	// with position.
+	maxObjectsInQuery = 1000
 	// maxAPIRequestSize bounds a /jmap/api request body. The body is a small JSON
 	// envelope of method calls (not blob data), so a tight cap is safe and blocks
 	// the multi-GB-body amplification vector.

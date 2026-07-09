@@ -202,24 +202,37 @@ func (w *ThreadWorker) parseMessage(ctx context.Context, tenantID int64, blobRef
 	if part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(full), int64(len(full))); err == nil || part.Envelope != nil {
 		if env := part.Envelope; env != nil {
 			sum.subject = env.Subject
-			if len(env.From) > 0 {
-				sum.from = env.From[0].User + "@" + env.From[0].Host
-			}
-			var tos []string
-			for _, a := range env.To {
-				tos = append(tos, a.User+"@"+a.Host)
-			}
-			sum.to = strings.Join(tos, " ")
+			sum.from = addrText(env.From)
+			sum.to = addrText(env.To)
 		}
 		sum.preview = previewOf(&part)
 	}
-	// Header-derived fields can contain invalid UTF-8 (malformed/encoded headers);
-	// a Postgres text column rejects it, which would fail the whole fold. Scrub to
-	// valid UTF-8 defensively (preview is already clean via previewOf).
+	// Every summary field is written to a Postgres text column, which rejects
+	// invalid UTF-8 (SQLSTATE 22021) — that would error the fold UPDATE and wedge
+	// the projection forever. Headers can carry invalid UTF-8 (malformed/encoded),
+	// and a body part may be a non-UTF-8 charset that the reader doesn't transcode
+	// (so even a short preview can be invalid). Scrub ALL of them unconditionally.
 	sum.subject = toValidUTF8(sum.subject)
 	sum.from = toValidUTF8(sum.from)
 	sum.to = toValidUTF8(sum.to)
+	sum.preview = toValidUTF8(sum.preview)
 	return refs, sum, nil
+}
+
+// addrText renders a header address list into a searchable string that includes
+// each display name AND the email address (space-joined), matching the old
+// on-the-fly filter which searched "Name User@Host" — so display-name search on
+// from/to keeps working after the pushdown.
+func addrText(as []moxmessage.Address) string {
+	var parts []string
+	for _, a := range as {
+		s := a.User + "@" + a.Host
+		if a.Name != "" {
+			s = a.Name + " " + s
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, " ")
 }
 
 // toValidUTF8 replaces invalid UTF-8 bytes so the value is safe for a text column.
