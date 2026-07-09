@@ -145,12 +145,30 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 		position = 0
 	}
 
+	// A message not yet folded by the summary projection has empty summary columns,
+	// so the SQL header filters can't match it. To keep filtered search from
+	// silently dropping just-delivered mail, also evaluate the (small, recent)
+	// unfolded set live. Only needed when a column-backed predicate is used; pure
+	// mailbox/size/date/fts filters already match unfolded rows.
+	//
+	// keyword filters are the subtle case: `keywords` is populated at delivery,
+	// independent of summary_folded, so the SQL keyword predicate DOES match
+	// unfolded rows — which would then be counted both in the SQL total and in the
+	// live set. So whenever we run the live fallback, we restrict the SQL side to
+	// folded rows (FilterFolded) so the two sets are provably disjoint.
+	needsLiveFallback := filt.from != "" || filt.to != "" || filt.subject != "" ||
+		filt.hasKeyword != "" || filt.notKeyword != ""
+
 	// Build the filter query in SQL: header substrings hit the denormalized
 	// summary columns, size/date/keyword hit their columns, text/body hits the fts
 	// projection — so no message body is parsed and the whole account is not
-	// loaded. Email-group dedup, sort, and paging are pushed down too.
+	// loaded. Email-group dedup, sort, and paging are pushed down too. When the
+	// live fallback is active, folded-only keeps the SQL set disjoint from live.
 	build := func(tx store.Tx) store.MessageQuery {
 		q := tx.QueryMessage().DistinctEmail()
+		if needsLiveFallback {
+			q = q.FilterFolded()
+		}
 		if filt.mailboxID != 0 {
 			q = q.FilterMailbox(filt.mailboxID)
 		}
@@ -192,14 +210,6 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 		}
 		return q.SortReceivedDesc()
 	}
-
-	// A message not yet folded by the summary projection has empty summary columns,
-	// so the SQL header/keyword filters can't match it. To keep filtered search
-	// from silently dropping just-delivered mail, also evaluate the (small, recent)
-	// unfolded set live. Only needed when a column-backed predicate is used; pure
-	// mailbox/size/date/fts filters already match unfolded rows.
-	needsLiveFallback := filt.from != "" || filt.to != "" || filt.subject != "" ||
-		filt.hasKeyword != "" || filt.notKeyword != ""
 
 	type qrow struct {
 		gid int64

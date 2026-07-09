@@ -477,7 +477,7 @@ func run() error {
 	// above are safe on every node (FOR UPDATE SKIP LOCKED leases), so they are
 	// not gated.
 	fts := &projection.FTSWorker{Pool: s.Pool, Blob: bs, Batch: 100}
-	threads := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100}
+	threads := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100, Log: log}
 	const projLeaderKey = int64(0x6f63746f6d61696c) // "octomail"
 	projCoord := ha.NewCoordinator(ha.New(s.Pool, projLeaderKey), cfg.projInterval)
 	projCoord.OnElected = func(context.Context) { log.Info("elected projection-drain leader", "node", cfg.nodeID) }

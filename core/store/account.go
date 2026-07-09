@@ -175,6 +175,11 @@ type MessageQuery interface {
 	// (summary_folded=false) — a small, recent set. Used to evaluate header
 	// filters live against just-delivered mail so filtered search isn't stale.
 	FilterUnfolded() MessageQuery
+	// FilterFolded restricts to rows the summary projection HAS folded
+	// (summary_folded=true) — the complement of FilterUnfolded. Used when a query
+	// also evaluates the unfolded set live, so the SQL (folded) and live (unfolded)
+	// result sets are provably disjoint and totals don't double-count.
+	FilterFolded() MessageQuery
 	// FilterSubject/FilterFrom/FilterTo are case-insensitive substring matches on
 	// the denormalized summary columns (H13), so header searches run in SQL rather
 	// than parsing every body.

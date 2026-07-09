@@ -364,3 +364,100 @@ func TestBackfillSummaries(t *testing.T) {
 	}
 	t.Logf("OK: legacy folded-but-unbackfilled row repopulated (subject+from_search) by BackfillSummaries; idempotent")
 }
+
+// TestFoldQuarantinesMissingBlob proves B-B's fix: a message whose blob is
+// permanently gone must not wedge the projection. A poison row (missing blob,
+// lowest id) is quarantined — folded best-effort with an empty summary — so both
+// the forward fold and the backfill make progress on every higher-id row instead
+// of re-selecting the poison row forever.
+func TestFoldQuarantinesMissingBlob(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, fts, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`).Scan(&tenantID)
+	s.Pool.QueryRow(ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, tenantID).Scan(&accID)
+	s.Pool.QueryRow(ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, tenantID).Scan(&domID)
+	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	dir := s.NewDirectory()
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, err := dir.ResolveInbound(ctx, addr.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two messages: the first (lower id) will lose its blob; the second is healthy.
+	if _, err := target.Deliver(ctx, &store.Message{}, mem("Message-ID: <poison@example.com>\r\nFrom: Bad Sender <bad@remote.example>\r\nSubject: poison\r\n\r\ngone body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Deliver(ctx, &store.Message{}, mem("Message-ID: <good@example.com>\r\nFrom: Good Sender <good@remote.example>\r\nSubject: healthy\r\n\r\nfine body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete the FIRST message's blob from the store so parseMessage returns a
+	// permanent ErrNotFound for it (a genuinely missing content ref).
+	var poisonID int64
+	var poisonRef string
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT id, blob_ref FROM messages WHERE account_id=$1 ORDER BY id LIMIT 1`, accID).Scan(&poisonID, &poisonRef); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.Delete(ctx, tenantID, blob.Ref(poisonRef)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Forward fold must not wedge: it quarantines the poison row and folds the
+	// healthy one. (A leftover slog to os.Stderr is fine; no Log set here.)
+	w := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100}
+	if err := w.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatalf("forward drain wedged on missing blob: %v", err)
+	}
+	// Both rows must be folded (poison quarantined, healthy summarized).
+	var nUnfolded int
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM messages WHERE account_id=$1 AND NOT summary_folded`, accID).Scan(&nUnfolded); err != nil {
+		t.Fatal(err)
+	}
+	if nUnfolded != 0 {
+		t.Fatalf("after forward drain, %d rows still unfolded — poison row wedged the batch", nUnfolded)
+	}
+	// The healthy row got a real summary; the poison row got an empty one.
+	var goodSubject, poisonSubject string
+	s.Pool.QueryRow(ctx, `SELECT subject FROM messages WHERE account_id=$1 AND id=$2`, accID, poisonID).Scan(&poisonSubject)
+	s.Pool.QueryRow(ctx, `SELECT subject FROM messages WHERE account_id=$1 AND id<>$2`, accID, poisonID).Scan(&goodSubject)
+	if poisonSubject != "" {
+		t.Fatalf("poison row subject=%q, want empty (quarantined)", poisonSubject)
+	}
+	if goodSubject != "healthy" {
+		t.Fatalf("healthy row subject=%q, want 'healthy' (folded past the poison row)", goodSubject)
+	}
+
+	// Backfill path: reset both rows to unfolded and prove BackfillSummaries also
+	// makes progress past the poison row rather than wedging.
+	if _, err := s.Pool.Exec(ctx,
+		`UPDATE messages SET summary_folded=false, subject='', from_search='' WHERE account_id=$1`, accID); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.BackfillSummaries(ctx, tenantID, accID); err != nil {
+		t.Fatalf("backfill wedged on missing blob: %v", err)
+	}
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM messages WHERE account_id=$1 AND NOT summary_folded`, accID).Scan(&nUnfolded); err != nil {
+		t.Fatal(err)
+	}
+	if nUnfolded != 0 {
+		t.Fatalf("after backfill, %d rows still unfolded — poison row wedged the batch", nUnfolded)
+	}
+	s.Pool.QueryRow(ctx, `SELECT subject FROM messages WHERE account_id=$1 AND id<>$2`, accID, poisonID).Scan(&goodSubject)
+	if goodSubject != "healthy" {
+		t.Fatalf("after backfill, healthy row subject=%q, want 'healthy'", goodSubject)
+	}
+	t.Logf("OK: a permanently-missing blob is quarantined (folded, empty summary); both forward fold and backfill make progress past it")
+}

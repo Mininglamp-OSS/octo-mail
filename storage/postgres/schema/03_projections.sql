@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS messages_p3 PARTITION OF messages FOR VALUES WITH (MO
 CREATE INDEX IF NOT EXISTS messages_modseq_idx ON messages (account_id, mailbox_id, modseq);
 CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages (account_id, thread_id);
 CREATE INDEX IF NOT EXISTS messages_email_idx ON messages (account_id, email_id);
+-- Email-group dedup (JMAP Email/query, webapi list) sorts by COALESCE(email_id, id)
+-- for DISTINCT ON. The bare-column messages_email_idx can't back that expression,
+-- so this expression index lets the dedup sort be index-served on large mailboxes.
+CREATE INDEX IF NOT EXISTS messages_email_group_idx ON messages (account_id, (COALESCE(email_id, id)));
 
 -- H13: denormalized list-summary columns so list/query paths don't MIME-parse
 -- every message body per request. Populated asynchronously by the threading

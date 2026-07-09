@@ -175,6 +175,10 @@ func (q *msgQuery) FilterUnfolded() store.MessageQuery {
 	q.wheres = append(q.wheres, "NOT summary_folded")
 	return q
 }
+func (q *msgQuery) FilterFolded() store.MessageQuery {
+	q.wheres = append(q.wheres, "summary_folded")
+	return q
+}
 
 // ilikeContains adds a case-insensitive substring match on col, escaping the
 // LIKE metacharacters %, _ and \ in the user input so they match literally.

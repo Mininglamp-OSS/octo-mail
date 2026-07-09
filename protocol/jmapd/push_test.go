@@ -290,3 +290,76 @@ func TestEmailQueryTotalAndPaging(t *testing.T) {
 	}
 	t.Logf("OK: Email/query total accurate (%d) via Count; position/limit paging correct", n)
 }
+
+// TestEmailQueryKeywordTotalNoDoubleCount proves B-A's fix: with a keyword filter
+// spanning folded and unfolded rows, `total` counts each matching row once. The
+// keyword column is written at delivery (independent of summary_folded), so the
+// SQL keyword predicate matches unfolded rows too — before the fix those rows
+// were counted both in the SQL total and the live fallback, inflating `total`.
+func TestEmailQueryKeywordTotalNoDoubleCount(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	sc(t, s, ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`, &tenantID)
+	sc(t, s, ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, &accID, tenantID)
+	sc(t, s, ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, &domID, tenantID)
+	ex(t, s, ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	ex(t, s, ctx, `INSERT INTO principals (tenant_id, login) VALUES ($1,'u1@example.com')`, tenantID)
+	dir := s.NewDirectory()
+	if err := dir.SetPassword(ctx, "u1@example.com", "x"); err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, _ := dir.ResolveInbound(ctx, addr.Path())
+	const n = 4
+	for i := 0; i < n; i++ {
+		raw := "From: s@remote.example\r\nTo: u1@example.com\r\nSubject: m" + itoa(int64(i)) + "\r\n\r\nbody\r\n"
+		if _, err := target.Deliver(ctx, &store.Message{}, mem(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Put a custom keyword on ALL rows (written to the keywords array, independent
+	// of the summary projection).
+	if _, err := s.Pool.Exec(ctx,
+		`UPDATE messages SET keywords=ARRAY['important'] WHERE account_id=$1`, accID); err != nil {
+		t.Fatal(err)
+	}
+	// Fold only the FIRST 2 rows; leave 2 unfolded, so the query exercises both the
+	// SQL (folded) and live (unfolded) paths for the same keyword.
+	if _, err := s.Pool.Exec(ctx,
+		`UPDATE messages SET summary_folded=true WHERE account_id=$1 AND id IN (
+		    SELECT id FROM messages WHERE account_id=$1 ORDER BY id LIMIT 2)`, accID); err != nil {
+		t.Fatal(err)
+	}
+
+	js := &jmapd.Server{Dir: dir, BaseURL: "http://jmap.test"}
+	hs := httptest.NewServer(js.Handler())
+	defer hs.Close()
+
+	// hasKeyword: total must be exactly 4 (2 folded + 2 live), not 6 (double count),
+	// and ids must be the 4 distinct messages.
+	q := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","filter":{"hasKeyword":"important"}}, "c1"]`)
+	if tot := int(q["total"].(float64)); tot != n {
+		t.Fatalf("hasKeyword total = %d, want %d (unfolded keyword rows double-counted)", tot, n)
+	}
+	if ids := toStrings(q["ids"]); len(ids) != n {
+		t.Fatalf("hasKeyword ids = %d, want %d", len(ids), n)
+	}
+
+	// notKeyword worst case: no row has 'other', so all 4 match. Before the fix,
+	// matchesLiveFilter short-circuits true for every unfolded row → those 2 are
+	// double-counted → total 6.
+	q2 := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","filter":{"notKeyword":"other"}}, "c2"]`)
+	if tot := int(q2["total"].(float64)); tot != n {
+		t.Fatalf("notKeyword total = %d, want %d (unfolded rows double-counted on notKeyword)", tot, n)
+	}
+	t.Logf("OK: keyword filter total counts folded+unfolded rows once (no double count) for hasKeyword and notKeyword")
+}

@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/mail"
 	"strings"
 	"unicode/utf8"
@@ -32,6 +33,17 @@ type ThreadWorker struct {
 	Pool  *pgxpool.Pool
 	Blob  blob.Store
 	Batch int
+	// Log, if set, records quarantined rows (a permanently-missing/invalid blob
+	// folded best-effort so it can't wedge the projection). Optional.
+	Log *slog.Logger
+}
+
+// isPermanentBlobErr reports whether a parseMessage error is a PERMANENT blob
+// condition (missing/invalid content ref) rather than a transient I/O or network
+// error. Only permanent errors are quarantined; transient ones are returned so
+// the projection retries instead of silently dropping a message from the fold.
+func isPermanentBlobErr(err error) bool {
+	return errors.Is(err, blob.ErrNotFound) || errors.Is(err, blob.ErrBadRef)
 }
 
 const threadCursor = "threads"
@@ -90,7 +102,27 @@ func (w *ThreadWorker) RunOnceAccount(ctx context.Context, tenantID, accountID i
 	for _, m := range msgs {
 		refs, sum, err := w.parseMessage(ctx, tenantID, m.blobRef, m.prefix)
 		if err != nil {
-			return 0, err
+			if !isPermanentBlobErr(err) {
+				return 0, err // transient: retry this batch rather than skip
+			}
+			// Permanent blob failure (missing/invalid ref): quarantine so one poison
+			// row can't wedge the fold for every higher-id message. Thread to self,
+			// empty summary, mark folded, advance the cursor past it.
+			if w.Log != nil {
+				w.Log.Warn("thread fold: quarantining message with unreadable blob",
+					"account", accountID, "msg", m.id, "blob_ref", m.blobRef, "err", err)
+			}
+			if _, err := w.Pool.Exec(ctx,
+				`UPDATE messages SET thread_id=$1, summary_folded=true,
+				   subject='', from_addr='', to_addrs='', from_search='', to_search='', preview=''
+				 WHERE id=$2 AND account_id=$3`,
+				m.id, m.id, accountID); err != nil {
+				return 0, err
+			}
+			if m.seq > maxSeq {
+				maxSeq = m.seq
+			}
+			continue
 		}
 		threadID, err := w.assignThread(ctx, accountID, m.id, refs)
 		if err != nil {
@@ -409,7 +441,25 @@ func (w *ThreadWorker) BackfillSummaries(ctx context.Context, tenantID, accountI
 		for _, r := range todo {
 			_, sum, err := w.parseMessage(ctx, tenantID, r.blobRef, r.prefix)
 			if err != nil {
-				return err
+				if !isPermanentBlobErr(err) {
+					return err // transient: retry rather than skip
+				}
+				// Permanent blob failure: quarantine (empty summary, folded) so this
+				// poison row can't block backfilling every higher-id row. Leave
+				// thread_id alone — the forward fold owns threading; backfill only
+				// populates the summary columns.
+				if w.Log != nil {
+					w.Log.Warn("summary backfill: quarantining message with unreadable blob",
+						"account", accountID, "msg", r.id, "blob_ref", r.blobRef, "err", err)
+				}
+				if _, err := w.Pool.Exec(ctx,
+					`UPDATE messages SET subject='', from_addr='', to_addrs='',
+					   from_search='', to_search='', preview='', summary_folded=true
+					 WHERE id=$1 AND account_id=$2`,
+					r.id, accountID); err != nil {
+					return err
+				}
+				continue
 			}
 			if _, err := w.Pool.Exec(ctx,
 				`UPDATE messages SET subject=$2, from_addr=$3, to_addrs=$4,
