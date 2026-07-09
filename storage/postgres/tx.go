@@ -133,6 +133,7 @@ type msgQuery struct {
 	args   []any
 	order  string
 	limit  int
+	offset int
 }
 
 func (q *msgQuery) add(cond string, arg any) *msgQuery {
@@ -166,8 +167,17 @@ func (q *msgQuery) FilterFTS(query string) store.MessageQuery {
 		"id IN (SELECT message_id FROM fts WHERE account_id=messages.account_id AND tsv @@ plainto_tsquery('simple', "+pos+"))")
 	return q
 }
-func (q *msgQuery) SortUID() store.MessageQuery    { q.order = " ORDER BY uid"; return q }
-func (q *msgQuery) Limit(n int) store.MessageQuery { q.limit = n; return q }
+func (q *msgQuery) FilterThread(id int64) store.MessageQuery { return q.add("thread_id=", id) }
+func (q *msgQuery) SortUID() store.MessageQuery              { q.order = " ORDER BY uid"; return q }
+func (q *msgQuery) SortReceivedDesc() store.MessageQuery {
+	// received_at DESC, id DESC — a total order (id breaks received-time ties), so
+	// LIMIT/OFFSET paging is stable. Backed by no dedicated index today; the WHERE
+	// (account_id + mailbox_id) narrows the set first.
+	q.order = " ORDER BY received_at DESC, id DESC"
+	return q
+}
+func (q *msgQuery) Limit(n int) store.MessageQuery  { q.limit = n; return q }
+func (q *msgQuery) Offset(n int) store.MessageQuery { q.offset = n; return q }
 
 func (q *msgQuery) sql() string {
 	sb := strings.Builder{}
@@ -178,6 +188,9 @@ func (q *msgQuery) sql() string {
 	sb.WriteString(q.order)
 	if q.limit > 0 {
 		sb.WriteString(" LIMIT " + strconv.Itoa(q.limit))
+	}
+	if q.offset > 0 {
+		sb.WriteString(" OFFSET " + strconv.Itoa(q.offset))
 	}
 	return sb.String()
 }

@@ -18,15 +18,13 @@ func (s *Server) getThread(ctx context.Context, a authCtx, r *http.Request) (int
 	}
 	var out []messageSummary
 	err := a.acc.Tx(ctx, func(tx store.Tx) error {
-		msgs, e := tx.QueryMessage().SortUID().List()
+		// Push the thread filter into SQL (indexed) instead of scanning the account.
+		msgs, e := tx.QueryMessage().FilterThread(tid).SortUID().List()
 		if e != nil {
 			return e
 		}
 		mbNames := mailboxNames(tx, a.acc)
 		for _, m := range msgs {
-			if m.ThreadID != tid {
-				continue
-			}
 			out = append(out, summarize(a.acc, m, mbNames))
 		}
 		return nil
