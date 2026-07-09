@@ -2,13 +2,44 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mjl-/mox/dns"
+
+	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 )
+
+// openBlobStore builds the message blob store from config: S3 when an endpoint is
+// configured, else the local filesystem. It is the single source of truth so the
+// serve process (run) and every ops subcommand that touches bodies (export,
+// import, passwd) agree on the backend — otherwise a backup/restore on an S3
+// deployment silently reads/writes an empty local ./blobs.
+func openBlobStore(cfg config, log *slog.Logger) (blob.Store, error) {
+	if cfg.s3Endpoint != "" {
+		bs, err := blob.NewS3(blob.S3Config{
+			Endpoint:  cfg.s3Endpoint,
+			Region:    cfg.s3Region,
+			Bucket:    cfg.s3Bucket,
+			AccessKey: cfg.s3Access,
+			SecretKey: cfg.s3Secret,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("s3 blob store: %w", err)
+		}
+		log.Info("blob store", "backend", "s3", "endpoint", cfg.s3Endpoint, "bucket", cfg.s3Bucket)
+		return bs, nil
+	}
+	bs, err := blob.NewFS(cfg.blobDir)
+	if err != nil {
+		return nil, fmt.Errorf("fs blob store: %w", err)
+	}
+	log.Info("blob store", "backend", "fs", "dir", cfg.blobDir)
+	return bs, nil
+}
 
 // checkVERPConfig refuses a bounce domain configured without a signing key: that
 // combination accepts unsigned VERP tokens, which anyone can forge to attribute
@@ -98,6 +129,9 @@ type config struct {
 	egressPool bool
 
 	// ACME/autotls: when acmeDir URL is set, listeners use automatic certificates.
+	// NOTE: the ACME cache is node-local, so this is single-node only — multi-node
+	// deployments must terminate TLS at a shared proxy or provision certs
+	// externally (see H17; leader-gated cluster issuance is a tracked follow-up).
 	acmeDirectory string
 	acmeContact   string
 	acmeCacheDir  string

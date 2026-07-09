@@ -40,7 +40,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/protocol/webapi"
 	"github.com/Mininglamp-OSS/octo-mail/security/acme"
 	"github.com/Mininglamp-OSS/octo-mail/security/privsep"
-	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 	"github.com/Mininglamp-OSS/octo-mail/storage/postgres"
 	"github.com/Mininglamp-OSS/octo-mail/webui"
 	"github.com/mjl-/mox/dns"
@@ -115,26 +114,9 @@ func run() error {
 	defer stop()
 
 	// Blob store: S3 if configured, else local filesystem.
-	var bs blob.Store
-	var err error
-	if cfg.s3Endpoint != "" {
-		bs, err = blob.NewS3(blob.S3Config{
-			Endpoint:  cfg.s3Endpoint,
-			Region:    cfg.s3Region,
-			Bucket:    cfg.s3Bucket,
-			AccessKey: cfg.s3Access,
-			SecretKey: cfg.s3Secret,
-		})
-		if err != nil {
-			return fmt.Errorf("s3 blob store: %w", err)
-		}
-		log.Info("blob store", "backend", "s3", "endpoint", cfg.s3Endpoint, "bucket", cfg.s3Bucket)
-	} else {
-		bs, err = blob.NewFS(cfg.blobDir)
-		if err != nil {
-			return fmt.Errorf("fs blob store: %w", err)
-		}
-		log.Info("blob store", "backend", "fs", "dir", cfg.blobDir)
+	bs, err := openBlobStore(cfg, log)
+	if err != nil {
+		return err
 	}
 
 	s, err := postgres.Open(ctx, cfg.dsn, bs)
@@ -175,6 +157,15 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("privsep: %w", err)
 		}
+		// With the fs blob backend, the blob root was just created owned by root,
+		// but tenant/shard subdirs are made lazily at write time by the dropped
+		// unprivileged process — which can't MkdirAll inside a root-owned tree. Hand
+		// the tree to the target user before dropping. (S3 backend has no local dir.)
+		if cfg.s3Endpoint == "" {
+			if err := privsep.ChownTree(cfg.blobDir, ids); err != nil {
+				return fmt.Errorf("privsep: chown blob dir: %w", err)
+			}
+		}
 		addrs := map[string]string{
 			"smtp-mx":         cfg.smtpAddr,
 			"smtp-submission": cfg.submissionAddr,
@@ -205,6 +196,13 @@ func run() error {
 		}
 		acmeTLS = am.TLSConfig()
 		log.Info("ACME/autotls enabled", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts)
+		// H17: the ACME cache (account key + certs) is node-local, so built-in ACME
+		// is single-node only. Running it on multiple nodes makes each register its
+		// own account and race to order the same certs (Let's Encrypt rate limits),
+		// and tls-alpn-01 challenges can land on a node that didn't create the order.
+		// Multi-node deployments must terminate TLS at a shared front proxy or supply
+		// certs externally. Leader-gated cluster issuance is tracked as a follow-up.
+		log.Warn("built-in ACME is single-node only (node-local cert cache); for multi-node, terminate TLS at a shared proxy or provision certs externally")
 	}
 
 	// Inbound authenticator (SPF/DKIM/DMARC/iprev/DNSBL) for the MX listener.

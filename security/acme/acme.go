@@ -2,6 +2,15 @@
 // TLS-config source for the SMTP/IMAP/HTTPS listeners. It obtains and renews
 // certificates automatically for a set of allowed hostnames.
 //
+// Single-node only (H17): the cache backing the account key and issued certs is a
+// node-local directory. Running built-in ACME on multiple nodes of the stateless
+// cluster makes each node register its own account and independently order certs
+// for the same hostnames (Let's Encrypt rate limits), and a tls-alpn-01 challenge
+// may land on a node that did not create the order. Multi-node deployments must
+// terminate TLS at a shared front proxy or provision certs externally; leader-gated
+// cluster issuance (one node issues into shared storage, all read) is a tracked
+// follow-up.
+//
 // Honest boundary: real certificate issuance requires a reachable ACME directory
 // (Let's Encrypt or a local pebble) plus port 80/443 or DNS-01 provisioning for
 // the challenge. TestACMEManagerWiring unit-tests construction (a usable

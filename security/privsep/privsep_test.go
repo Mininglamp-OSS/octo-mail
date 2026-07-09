@@ -2,6 +2,8 @@ package privsep_test
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-mail/security/privsep"
@@ -92,5 +94,38 @@ func TestSequenceAbortsOnBindFailure(t *testing.T) {
 	}
 	if dropCalled {
 		t.Fatalf("privileges were dropped despite a bind failure (must fail closed)")
+	}
+}
+
+// TestChownTree covers the recursive hand-over helper without requiring root: a
+// missing dir is a no-op, and chowning an existing tree to the current uid/gid
+// (a valid no-op chown any user may perform) walks every entry without error.
+func TestChownTree(t *testing.T) {
+	// Missing dir: no error, nothing to do.
+	if err := privsep.ChownTree(filepath.Join(t.TempDir(), "does-not-exist"), privsep.Ids{UID: os.Getuid(), GID: os.Getgid()}); err != nil {
+		t.Fatalf("missing dir should be a no-op, got %v", err)
+	}
+
+	// Build a small tree: root/tenant/ab/cd/blob + root/tmp/x.
+	root := t.TempDir()
+	for _, d := range []string{
+		filepath.Join(root, "7", "ab", "cd"),
+		filepath.Join(root, "tmp"),
+	} {
+		if err := os.MkdirAll(d, 0o770); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{
+		filepath.Join(root, "7", "ab", "cd", "blob"),
+		filepath.Join(root, "tmp", "x"),
+	} {
+		if err := os.WriteFile(f, []byte("x"), 0o660); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Chown to our own uid/gid: a permitted no-op that still exercises the full walk.
+	if err := privsep.ChownTree(root, privsep.Ids{UID: os.Getuid(), GID: os.Getgid()}); err != nil {
+		t.Fatalf("ChownTree over existing tree: %v", err)
 	}
 }

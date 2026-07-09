@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/deliverability"
 	"github.com/Mininglamp-OSS/octo-mail/ops/mailboxops"
-	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 	"github.com/Mininglamp-OSS/octo-mail/storage/postgres"
 )
 
@@ -22,7 +22,7 @@ func cmdPasswd(args []string) error {
 	ctx := context.Background()
 	cfg := loadConfig()
 
-	bs, err := blob.NewFS(cfg.blobDir)
+	bs, err := openBlobStore(cfg, slog.Default())
 	if err != nil {
 		return err
 	}
@@ -116,7 +116,7 @@ func cmdExport(args []string) error {
 	}
 	ctx := context.Background()
 	cfg := loadConfig()
-	bs, err := blob.NewFS(cfg.blobDir)
+	bs, err := openBlobStore(cfg, slog.Default())
 	if err != nil {
 		return err
 	}
@@ -150,7 +150,7 @@ func cmdImport(args []string) error {
 	}
 	ctx := context.Background()
 	cfg := loadConfig()
-	bs, err := blob.NewFS(cfg.blobDir)
+	bs, err := openBlobStore(cfg, slog.Default())
 	if err != nil {
 		return err
 	}
