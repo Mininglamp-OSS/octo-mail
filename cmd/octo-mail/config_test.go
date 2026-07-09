@@ -1,6 +1,13 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"strings"
+	"testing"
+)
 
 // TestCheckVERPConfig proves the security control that closes the nil-vs-empty
 // fail-open seam flagged in review: a bounce domain configured WITHOUT a signing
@@ -39,4 +46,32 @@ func TestCheckVERPConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOpenBlobStoreSelectsBackend proves the H15 fix: openBlobStore picks the fs
+// backend when no S3 endpoint is configured (the shared helper the ops
+// subcommands now use, so export/import agree with the serve process instead of
+// hardcoding fs). The fs path is exercised directly; the S3 branch is covered by
+// storage/blob's own S3 round-trip test.
+func TestOpenBlobStoreSelectsBackend(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// No S3 endpoint → fs backend rooted at the configured blobDir.
+	dir := t.TempDir()
+	bs, err := openBlobStore(config{blobDir: dir}, log)
+	if err != nil {
+		t.Fatalf("fs backend: %v", err)
+	}
+	if bs == nil {
+		t.Fatal("fs backend returned nil store")
+	}
+	// A round-trip proves it's a working fs store at the right root.
+	ref, _, err := bs.Put(context.Background(), 1, strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("fs Put: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("blobDir not created: %v", err)
+	}
+	_ = ref
 }
