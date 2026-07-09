@@ -141,6 +141,9 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 	if limit <= 0 || limit > maxObjectsInQuery {
 		limit = maxObjectsInQuery
 	}
+	if position < 0 {
+		position = 0
+	}
 
 	// Build the filter query in SQL: header substrings hit the denormalized
 	// summary columns, size/date/keyword hit their columns, text/body hits the fts
@@ -193,8 +196,8 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 	// A message not yet folded by the summary projection has empty summary columns,
 	// so the SQL header/keyword filters can't match it. To keep filtered search
 	// from silently dropping just-delivered mail, also evaluate the (small, recent)
-	// unfolded set live and merge it in. Only needed when a column-backed predicate
-	// is used; pure mailbox/size/date/fts filters already match unfolded rows.
+	// unfolded set live. Only needed when a column-backed predicate is used; pure
+	// mailbox/size/date/fts filters already match unfolded rows.
 	needsLiveFallback := filt.from != "" || filt.to != "" || filt.subject != "" ||
 		filt.hasKeyword != "" || filt.notKeyword != ""
 
@@ -203,21 +206,14 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 		rcv int64
 		sz  int64
 	}
-	var folded []qrow
-	var live []qrow
+	var ids []string
+	var total int
 	err := acc.Tx(ctx, func(tx store.Tx) error {
-		// Folded matches: filtered + deduped + sorted in SQL, capped.
-		fq := sortIt(build(tx)).Limit(maxObjectsInQuery)
-		fmsgs, e := fq.List()
-		if e != nil {
-			return e
-		}
-		for _, m := range fmsgs {
-			folded = append(folded, qrow{m.EffectiveEmailID(), m.Received.UnixNano(), m.Size})
-		}
+		// Live matches: the small set of not-yet-folded rows evaluated per row.
+		// Collected first so they can be folded into both the total and the page.
+		var live []qrow
+		liveSeen := map[int64]bool{}
 		if needsLiveFallback {
-			// Unfolded rows: apply the column-independent filters in SQL (mailbox/
-			// size/date), then match header/keyword predicates live per row.
 			uq := tx.QueryMessage().FilterUnfolded()
 			if filt.mailboxID != 0 {
 				uq = uq.FilterMailbox(filt.mailboxID)
@@ -235,62 +231,95 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 			if e != nil {
 				return e
 			}
-			seen := map[int64]bool{}
 			for _, m := range umsgs {
 				if !matchesLiveFilter(acc, m, filt) {
 					continue
 				}
 				gid := m.EffectiveEmailID()
-				if seen[gid] {
+				if liveSeen[gid] {
 					continue
 				}
-				seen[gid] = true
+				liveSeen[gid] = true
 				live = append(live, qrow{gid, m.Received.UnixNano(), m.Size})
 			}
+		}
+
+		// Accurate total: folded matches counted in SQL (not capped) + the distinct
+		// live matches (which by definition aren't folded, so they don't overlap).
+		foldedTotal, e := build(tx).Count()
+		if e != nil {
+			return e
+		}
+		total = foldedTotal + len(live)
+
+		if len(live) == 0 {
+			// Fast path: no unfolded matches — page entirely in SQL, so total/paging
+			// are exact regardless of result-set size.
+			q := sortIt(build(tx)).Offset(position).Limit(limit)
+			msgs, e := q.List()
+			if e != nil {
+				return e
+			}
+			for _, m := range msgs {
+				ids = append(ids, emailID(m))
+			}
+			return nil
+		}
+
+		// Merge path: a few live rows exist. Fetch the folded page window plus enough
+		// context to interleave the live rows correctly, then sort+page in Go across
+		// the union. The folded fetch is bounded by position+limit+len(live).
+		foldedWindow := position + limit + len(live)
+		fmsgs, e := sortIt(build(tx)).Limit(foldedWindow).List()
+		if e != nil {
+			return e
+		}
+		rows := make([]qrow, 0, len(fmsgs)+len(live))
+		for _, m := range fmsgs {
+			rows = append(rows, qrow{m.EffectiveEmailID(), m.Received.UnixNano(), m.Size})
+		}
+		rows = append(rows, live...)
+		// Dedup (a row could fold between the count and this read).
+		seen := map[int64]bool{}
+		uniq := rows[:0]
+		for _, r := range rows {
+			if seen[r.gid] {
+				continue
+			}
+			seen[r.gid] = true
+			uniq = append(uniq, r)
+		}
+		rows = uniq
+		sort.SliceStable(rows, func(i, j int) bool {
+			var less bool
+			if sortProp == "size" {
+				less = rows[i].sz < rows[j].sz
+			} else {
+				less = rows[i].rcv < rows[j].rcv
+			}
+			if !sortAsc {
+				return !less
+			}
+			return less
+		})
+		if position < len(rows) {
+			rows = rows[position:]
+		} else {
+			rows = nil
+		}
+		if limit < len(rows) {
+			rows = rows[:limit]
+		}
+		for _, r := range rows {
+			ids = append(ids, "E"+strconv.FormatInt(r.gid, 10))
 		}
 		return nil
 	})
 	if err != nil {
 		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
 	}
-
-	// Merge folded + live, dedup by Email id (a row could be folded between the two
-	// reads), then sort and page in Go across the combined set.
-	seen := map[int64]bool{}
-	rows := make([]qrow, 0, len(folded)+len(live))
-	for _, r := range append(folded, live...) {
-		if seen[r.gid] {
-			continue
-		}
-		seen[r.gid] = true
-		rows = append(rows, r)
-	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		var less bool
-		if sortProp == "size" {
-			less = rows[i].sz < rows[j].sz
-		} else {
-			less = rows[i].rcv < rows[j].rcv
-		}
-		if !sortAsc {
-			return !less
-		}
-		return less
-	})
-	total := len(rows)
-	if position < 0 {
-		position = 0
-	}
-	if position > len(rows) {
-		position = len(rows)
-	}
-	rows = rows[position:]
-	if limit > 0 && limit < len(rows) {
-		rows = rows[:limit]
-	}
-	ids := make([]string, 0, len(rows))
-	for _, r := range rows {
-		ids = append(ids, "E"+strconv.FormatInt(r.gid, 10))
+	if ids == nil {
+		ids = []string{}
 	}
 
 	st, _ := accountState(ctx, acc)

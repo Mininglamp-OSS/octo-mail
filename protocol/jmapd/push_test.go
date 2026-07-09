@@ -229,3 +229,64 @@ func TestEmailQueryFilterUnfolded(t *testing.T) {
 	}
 	t.Logf("OK: from/subject/display-name filters find an unfolded message (live fallback); same after fold, deduped")
 }
+
+// TestEmailQueryTotalAndPaging proves Email/query reports an accurate total (via
+// Count, not a capped page length) and pages correctly with position/limit — the
+// regression where total was len(rows) over a 1000-capped set.
+func TestEmailQueryTotalAndPaging(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	sc(t, s, ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`, &tenantID)
+	sc(t, s, ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, &accID, tenantID)
+	sc(t, s, ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, &domID, tenantID)
+	ex(t, s, ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	ex(t, s, ctx, `INSERT INTO principals (tenant_id, login) VALUES ($1,'u1@example.com')`, tenantID)
+	dir := s.NewDirectory()
+	if err := dir.SetPassword(ctx, "u1@example.com", "x"); err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, _ := dir.ResolveInbound(ctx, addr.Path())
+	const n = 12
+	for i := 0; i < n; i++ {
+		raw := "From: s@remote.example\r\nTo: u1@example.com\r\nSubject: m" + itoa(int64(i)) + "\r\n\r\nbody\r\n"
+		if _, err := target.Deliver(ctx, &store.Message{}, mem(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tw := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100}
+	if err := tw.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatal(err)
+	}
+
+	js := &jmapd.Server{Dir: dir, BaseURL: "http://jmap.test"}
+	hs := httptest.NewServer(js.Handler())
+	defer hs.Close()
+
+	// Unfiltered query, limit 5: total must be the full 12 (Count), page = 5.
+	q := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","limit":5}, "c1"]`)
+	if tot := int(q["total"].(float64)); tot != n {
+		t.Fatalf("total = %d, want %d (accurate Count, not page length)", tot, n)
+	}
+	if ids := toStrings(q["ids"]); len(ids) != 5 {
+		t.Fatalf("page = %d ids, want 5", len(ids))
+	}
+	// Deep page: position 10, limit 5 → 2 remaining.
+	q2 := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","position":10,"limit":5}, "c2"]`)
+	if tot := int(q2["total"].(float64)); tot != n {
+		t.Fatalf("deep-page total = %d, want %d", tot, n)
+	}
+	if ids := toStrings(q2["ids"]); len(ids) != 2 {
+		t.Fatalf("position=10 page = %d ids, want 2", len(ids))
+	}
+	t.Logf("OK: Email/query total accurate (%d) via Count; position/limit paging correct", n)
+}
