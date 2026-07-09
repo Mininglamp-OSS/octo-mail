@@ -112,18 +112,22 @@ type conn struct {
 	fatal error // set by handlers to force connection close
 
 	// cmdBudget is the remaining bytes a single command may RETAIN in memory,
-	// reset to srv.MaxSize before each command (0 = unlimited). readLiteral and
-	// CATENATE URL parts debit it, so a MULTIAPPEND or CATENATE that individually
-	// respects the per-literal cap still can't accumulate N×MaxSize on one
-	// connection — preserving the connection-cap sizing invariant (≈one message
-	// worth of buffer per connection).
+	// reset to srv.MaxSize before each command. readLiteral and CATENATE URL parts
+	// debit it, so a MULTIAPPEND or CATENATE that individually respects the
+	// per-literal cap still can't accumulate N×MaxSize on one connection —
+	// preserving the connection-cap sizing invariant (≈one message worth of buffer
+	// per connection). cmdLimited records whether a limit is in force (MaxSize>0);
+	// it MUST be tracked separately from cmdBudget because a command can legitimately
+	// decrement cmdBudget to exactly 0 — overloading 0 as an "unlimited" sentinel
+	// would misread an exhausted budget as unlimited and reopen the aggregate cap.
 	//
 	// Note this is a per-COMMAND cap, deliberately stricter than RFC 7889
 	// APPENDLIMIT (a per-MESSAGE limit): a MULTIAPPEND whose messages are each
 	// under APPENDLIMIT but together exceed MaxSize is rejected [TOOBIG]. That is a
 	// memory-safety tradeoff, not a bug — a client can split such a batch into
 	// separate APPEND commands.
-	cmdBudget int64
+	cmdBudget  int64
+	cmdLimited bool
 
 	scope    directory.TenantScope
 	acc      store.Account
@@ -192,8 +196,11 @@ func (c *conn) serve() error {
 		cmd, args := cut(rest, " ")
 		cmd = strings.ToUpper(cmd)
 		// Reset the per-command memory budget: the total bytes this command may
-		// retain across all its literals/parts (MULTIAPPEND, CATENATE).
+		// retain across all its literals/parts (MULTIAPPEND, CATENATE). cmdLimited
+		// is captured separately so an exact-fit exhaustion (budget → 0) is not
+		// mistaken for "unlimited".
 		c.cmdBudget = c.srv.MaxSize
+		c.cmdLimited = c.srv.MaxSize > 0
 
 		var done bool
 		func() {

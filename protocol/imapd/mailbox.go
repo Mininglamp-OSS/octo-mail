@@ -629,9 +629,12 @@ func (c *conn) discard(n int64) {
 // returning false (without debiting) if it would be exceeded. It bounds the TOTAL
 // bytes a single command holds in RAM across all its literals and assembled parts
 // — the per-literal cap alone doesn't stop a MULTIAPPEND or CATENATE from
-// accumulating N×MaxSize. A zero budget (srv.MaxSize == 0) means unlimited.
+// accumulating N×MaxSize. When no limit is configured (srv.MaxSize == 0,
+// cmdLimited false) it always allows. cmdLimited is checked instead of
+// "cmdBudget <= 0" so a budget legitimately decremented to exactly 0 is treated
+// as exhausted (reject), not as the unlimited sentinel.
 func (c *conn) chargeBudget(n int64) bool {
-	if c.cmdBudget <= 0 { // unlimited (MaxSize==0)
+	if !c.cmdLimited { // no limit configured (MaxSize==0)
 		return true
 	}
 	if n > c.cmdBudget {

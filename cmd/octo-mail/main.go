@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -304,12 +305,7 @@ func run() error {
 		mux.Handle("/webmail", webui.Handler())
 		mux.Handle("/webmail/", webui.Handler())
 		srv := &http.Server{Addr: cfg.jmapAddr, Handler: mux}
-		go func() {
-			log.Info("listening", "service", "jmap+webmail", "addr", cfg.jmapAddr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- fmt.Errorf("jmap: %w", err)
-			}
-		}()
+		go serveHTTP(log, "jmap+webmail", srv, cfg.maxConns, errc)
 		go func() { <-ctx.Done(); _ = srv.Close() }()
 	}
 	// Admin/account API + healthz (HTTP).
@@ -320,12 +316,7 @@ func run() error {
 		as := &webadmin.Server{Pool: s.Pool, Dir: dir, Reputation: repo, AdminToken: cfg.adminToken,
 			QueueFailDSN: failDSN.Generate}
 		srv := &http.Server{Addr: cfg.adminAddr, Handler: as.Handler()}
-		go func() {
-			log.Info("listening", "service", "admin", "addr", cfg.adminAddr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- fmt.Errorf("admin: %w", err)
-			}
-		}()
+		go serveHTTP(log, "admin", srv, cfg.maxConns, errc)
 		go func() { <-ctx.Done(); _ = srv.Close() }()
 	}
 
@@ -589,6 +580,69 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 			handle(conn)
 		}()
 	}
+}
+
+// serveHTTP runs an http.Server behind the same per-listener connection cap as
+// the TCP front doors and with slowloris-defeating timeouts. The JMAP/webmail and
+// admin HTTP listeners would otherwise be the only entry doors without a
+// connection cap, and MaxBytesReader/body caps don't fire until a request fully
+// arrives — so a trickle of headers could hold goroutines/FDs indefinitely.
+func serveHTTP(log *slog.Logger, name string, srv *http.Server, maxConns int, errc chan<- error) {
+	// Timeouts bound how long a slow client can hold a connection before its
+	// request completes (headers, whole request, and idle keep-alive).
+	if srv.ReadHeaderTimeout == 0 {
+		srv.ReadHeaderTimeout = 10 * time.Second
+	}
+	if srv.ReadTimeout == 0 {
+		srv.ReadTimeout = 60 * time.Second
+	}
+	if srv.IdleTimeout == 0 {
+		srv.IdleTimeout = 120 * time.Second
+	}
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		errc <- fmt.Errorf("%s listen %s: %w", name, srv.Addr, err)
+		return
+	}
+	if maxConns > 0 {
+		ln = &limitListener{Listener: ln, sem: make(chan struct{}, maxConns)}
+	}
+	log.Info("listening", "service", name, "addr", ln.Addr().String())
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		errc <- fmt.Errorf("%s: %w", name, err)
+	}
+}
+
+// limitListener caps the number of concurrent accepted connections; a slot is
+// released when the connection is closed. Unlike the TCP front doors' refuse-fast
+// semaphore, an HTTP listener blocks in Accept when full (returning an error from
+// Accept would tear the server down), so excess connections wait for a slot.
+type limitListener struct {
+	net.Listener
+	sem chan struct{}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	l.sem <- struct{}{} // blocks until a slot is free
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: l.sem}, nil
+}
+
+// limitConn releases its listener slot exactly once, on Close.
+type limitConn struct {
+	net.Conn
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { <-c.release })
+	return err
 }
 
 // runLoop calls fn every interval until ctx is done.

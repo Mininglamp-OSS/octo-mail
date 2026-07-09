@@ -143,5 +143,30 @@ func TestIMAPLiteralLimit(t *testing.T) {
 		}
 	}
 
-	t.Logf("OK: APPENDLIMIT=%d advertised; oversized literal refused (NO, no continuation, no allocation); MULTIAPPEND cumulative cap enforced; in-limit APPEND accepted", maxSize)
+	// Exact-fit exhaustion boundary: a first literal of EXACTLY MaxSize drives the
+	// per-command budget to precisely 0, then a further 1-byte literal must still be
+	// rejected. Guards against the sentinel bug where budget==0 was misread as
+	// "unlimited" (which would reopen the aggregate cap on the default config).
+	full := strings.Repeat("y", maxSize)
+	exact := "a6 APPEND INBOX {" + strconv.Itoa(len(full)) + "+}\r\n" + full +
+		" {1+}\r\nz\r\n"
+	go func() { _, _ = cc.Write([]byte(exact)) }()
+	for {
+		line, err := rc.r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read after exact-fit MULTIAPPEND: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "+ ") {
+			continue
+		}
+		if strings.HasPrefix(line, "a6 ") {
+			if strings.Contains(line, "OK") {
+				t.Fatalf("MULTIAPPEND filling budget to exactly 0 then +1 byte accepted — sentinel/exhausted collision: %q", line)
+			}
+			break // correctly rejected: 0 budget means exhausted, not unlimited
+		}
+	}
+
+	t.Logf("OK: APPENDLIMIT=%d advertised; oversized literal refused (NO, no continuation, no allocation); MULTIAPPEND cumulative + exact-fit-exhaustion caps enforced; in-limit APPEND accepted", maxSize)
 }
