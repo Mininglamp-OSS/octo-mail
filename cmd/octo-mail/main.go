@@ -97,6 +97,19 @@ func run() error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	cfg := loadConfig()
+	// Validate VERP config once, up front, before ANY VERP wiring (inbound MX or
+	// outbound signer). Gating this inside the MX block would let a submission-/
+	// outbound-only node (smtpAddr="") enable a bounce domain without a key and
+	// silently emit unsigned, forgeable return-paths — the exact fail-open the
+	// control exists to prevent.
+	if err := checkVERPConfig(cfg); err != nil {
+		return err
+	}
+	if cfg.bounceDomain != "" && len(cfg.verpKey) == 0 {
+		// Reached only with the explicit dev escape hatch (else checkVERPConfig is
+		// fatal). Warn on every VERP-enabling topology, inbound or outbound-only.
+		log.Warn("VERP signing key not set (OCTO_MAIL_VERP_KEY); bounce/complaint attribution is forgeable — dev-only unsigned path enabled via OCTO_MAIL_ALLOW_UNSIGNED_VERP", "bounce_domain", cfg.bounceDomain)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -235,6 +248,31 @@ func run() error {
 				}
 			},
 		}
+		// VERP inbound: route bounce-domain mail (ARF complaints + DSN bounces) to
+		// reputation + suppression, attributed to the sending tenant via the VERP
+		// token. Enabled only when a bounce domain is configured.
+		if cfg.bounceDomain != "" {
+			mx.BounceDomain = cfg.bounceDomain
+			mx.BounceHandler = func(ctx context.Context, verpLocalpart string, raw []byte) {
+				c, ok, err := repo.IngestReport(ctx, verpLocalpart, cfg.verpKey, raw)
+				if err != nil {
+					log.WarnContext(ctx, "bounce ingest", "err", err)
+					return
+				}
+				if !ok {
+					// Forged/unauthenticated VERP recipient — attribute nothing.
+					log.WarnContext(ctx, "unauthenticated bounce/complaint to bounce domain", "verp", verpLocalpart)
+					return
+				}
+				// Attribution is authenticated (signed VERP token), so the tenant
+				// reputation event is trustworthy. We deliberately do NOT
+				// auto-suppress here: an ARF report only identifies the recipient
+				// DOMAIN, and honoring a domain-level suppression from a report would
+				// let one complaint silence a tenant's mail to a whole provider.
+				// Suppression stays driven by the delivery-time hard-bounce path.
+				log.InfoContext(ctx, "bounce/complaint recorded", "tenant", c.TenantID, "kind", c.Kind)
+			}
+		}
 		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
 	}
 	// SMTP submission (:587).
@@ -353,6 +391,20 @@ func run() error {
 				map[string]any{"rcpt": m.RcptTo, "error": err.Error()})
 		},
 	}
+	// VERP: when a bounce domain is configured, rewrite the envelope MAIL FROM to
+	// a per-message VERP token so bounces + FBL complaints attribute to the exact
+	// sending tenant. The visible From + DKIM are unchanged (DMARC stays aligned
+	// via the tenant's own domain).
+	if cfg.bounceDomain != "" {
+		deliverer.EnvelopeFrom = func(m queue.Msg) string {
+			// Preserve the null sender (a bounce/notification has MAIL FROM:<>);
+			// only rewrite a real sender to the signed VERP return-path.
+			if m.MailFrom == "" {
+				return ""
+			}
+			return deliverability.SignedVERPToken(m.TenantID, m.ID, cfg.verpKey) + "@" + cfg.bounceDomain
+		}
+	}
 	worker := &queue.Worker{Pool: s.Pool, NodeID: cfg.nodeID, Deliver: deliverer.Deliver, Batch: 20,
 		Backoff: cfg.queueBackoff, DelayThreshold: cfg.queueDelayDSN, RetiredKeep: cfg.queueRetKeep,
 		ObserveDelivery: func(d time.Duration, result string) {
@@ -375,7 +427,9 @@ func run() error {
 				dom = m.RcptTo[at+1:]
 			}
 			if dom != "" {
-				_ = repo.RecordEvent(ctx, m.TenantID, m.AccountID, deliverability.KindBounce, dom)
+				// Delivery-time hard bounce: no single signed msgID to dedup on, so
+				// pass 0 (non-idempotent — these are our own authenticated events).
+				_ = repo.RecordEvent(ctx, m.TenantID, m.AccountID, deliverability.KindBounce, dom, 0)
 			}
 			_ = webhooks.Enqueue(ctx, m.TenantID, m.AccountID, cfg.webhookURL, "bounced",
 				map[string]any{"rcpt": m.RcptTo, "msgid": m.ID})

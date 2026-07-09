@@ -9,6 +9,9 @@ package deliverability
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base32"
 	"fmt"
 	"strconv"
 	"strings"
@@ -24,6 +27,11 @@ const (
 	KindComplaint = 2
 	KindDeferral  = 3
 )
+
+// verpPrefix is the localpart marker for a VERP return-path. It is the single
+// source of truth for the token layout shared by the (Signed)VERPToken builders
+// and the Parse(Signed)VERP parsers.
+const verpPrefix = "bounces+"
 
 // Thresholds beyond which a (tenant, domain) is auto-paused. Deliberately simple
 // and explicit; real deployments tune these per remote.
@@ -78,12 +86,36 @@ func (s *Service) RecordSent(ctx context.Context, tenantID int64, remoteDomain s
 // RecordEvent logs a reputation event (bounce/complaint) and re-evaluates the
 // (tenant, domain) score, auto-pausing that tenant for that domain if it crosses
 // a threshold. Crucially scoped to one tenant — never touches others.
-func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, kind int, remoteDomain string) error {
+//
+// msgID is the originating outbound message id (from the signed VERP token) for
+// inbound bounce/complaint ingest; pass 0 when there is no single originating
+// message (e.g. a delivery-time hard bounce). When msgID > 0 the event is
+// idempotent per (tenant, msgID): a replayed/redelivered report inserts nothing
+// and does NOT bump the counters, so an attacker who captures a victim's
+// in-the-clear signed VERP address can't replay it to force auto-pause.
+func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, kind int, remoteDomain string, msgID int64) error {
 	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO reputation_events (tenant_id, account_id, kind, remote_domain)
-			 VALUES ($1,$2,$3,$4)`, tenantID, nullIf0(accountID), kind, remoteDomain); err != nil {
-			return err
+		// Insert the event. With a msgID, dedup on (tenant, msg_id): a replay
+		// conflicts and inserts zero rows, and we then stop before touching the
+		// counters. Without a msgID, every call is a distinct event (legacy path).
+		if msgID > 0 {
+			ct, err := tx.Exec(ctx,
+				`INSERT INTO reputation_events (tenant_id, account_id, kind, remote_domain, msg_id)
+				 VALUES ($1,$2,$3,$4,$5)
+				 ON CONFLICT (tenant_id, msg_id) WHERE msg_id IS NOT NULL DO NOTHING`,
+				tenantID, nullIf0(accountID), kind, remoteDomain, msgID)
+			if err != nil {
+				return err
+			}
+			if ct.RowsAffected() == 0 {
+				return nil // replay/redelivery of an already-recorded report — no-op
+			}
+		} else {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO reputation_events (tenant_id, account_id, kind, remote_domain)
+				 VALUES ($1,$2,$3,$4)`, tenantID, nullIf0(accountID), kind, remoteDomain); err != nil {
+				return err
+			}
 		}
 		col := ""
 		switch kind {
@@ -129,14 +161,21 @@ func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, ki
 // message id, so bounces/complaints route back to the right tenant:
 //
 //	bounces+<tenantID>.<msgID>@<bounceDomain>
+//
+// Prefer SignedVERPToken in production: an unsigned token is forgeable (tenant
+// ids are small integers), which lets an unauthenticated sender attribute
+// bounces/complaints to a victim tenant. This form is retained for tests and for
+// deployments that have not configured a VERP key.
 func VERPToken(tenantID, msgID int64) string {
-	return "bounces+" + strconv.FormatInt(tenantID, 10) + "." + strconv.FormatInt(msgID, 10)
+	return verpPrefix + strconv.FormatInt(tenantID, 10) + "." + strconv.FormatInt(msgID, 10)
 }
 
-// ParseVERP decodes a VERP localpart back to (tenantID, msgID). Accepts the full
-// localpart (with or without the "bounces+" prefix).
+// ParseVERP decodes an unsigned 2-part VERP localpart back to (tenantID, msgID).
+// Accepts the full localpart (with or without the "bounces+" prefix). It does NOT
+// authenticate — see ParseSignedVERP for the forgery-resistant form, which is the
+// only caller for a signed 3-part token.
 func ParseVERP(localpart string) (tenantID, msgID int64, ok bool) {
-	lp := strings.TrimPrefix(localpart, "bounces+")
+	lp := strings.TrimPrefix(strings.ToLower(localpart), verpPrefix)
 	a, b, found := strings.Cut(lp, ".")
 	if !found {
 		return 0, 0, false
@@ -147,6 +186,84 @@ func ParseVERP(localpart string) (tenantID, msgID int64, ok bool) {
 		return 0, 0, false
 	}
 	return ti, mi, true
+}
+
+// verpMAC computes the authentication tag for (tenantID, msgID) under key: the
+// first 10 bytes of HMAC-SHA256, lowercase base32 (no padding) — short enough
+// for a localpart, wide enough (80 bits) to make forgery infeasible.
+// verpMAC computes the authentication tag for (tenantID, msgID) under key: the
+// first 12 bytes of HMAC-SHA256, lowercase base32 (no padding) — 96 bits, short
+// enough for a localpart (20 base32 chars) yet a wide margin against the bounce
+// MX being an online forgery oracle. Truncation of an HMAC is sound (RFC 2104).
+func verpMAC(tenantID, msgID int64, key []byte) string {
+	mac := hmac.New(sha256.New, key)
+	fmt.Fprintf(mac, "%d.%d", tenantID, msgID)
+	sum := mac.Sum(nil)[:12]
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum))
+}
+
+// SignedVERPToken builds an HMAC-authenticated VERP localpart:
+//
+//	bounces+<tenantID>.<msgID>.<mac>
+//
+// A recipient/attacker cannot forge a token for another tenant without key. When
+// key is empty it falls back to the unsigned VERPToken.
+func SignedVERPToken(tenantID, msgID int64, key []byte) string {
+	if len(key) == 0 {
+		return VERPToken(tenantID, msgID)
+	}
+	return VERPToken(tenantID, msgID) + "." + verpMAC(tenantID, msgID, key)
+}
+
+// ParseSignedVERP decodes AND authenticates a VERP localpart against key. It
+// returns ok=false for a missing/invalid signature, so a forged token attributes
+// nothing. When key is empty it accepts the unsigned form (ParseVERP) — matching
+// SignedVERPToken's fallback so a keyless deployment still round-trips.
+//
+// When a key IS set, ONLY the signed 3-part form is accepted: a MAC-less 2-part
+// token is rejected. Accepting it would be a forgery bypass (an attacker just
+// omits the MAC to attribute a bounce/complaint to any victim tenant), and there
+// is no legitimate keyless→keyed rollout window to protect because the node
+// refuses to enable the bounce domain without a key (see checkVERPConfig).
+//
+// The localpart is lowercased first: SignedVERPToken emits an all-lowercase token
+// (digits, ".", and a lowercased base32 tag), but a bounce/DSN may return through
+// an intermediary that re-cases the localpart. Lowercasing makes verification
+// robust without weakening it (the token alphabet has no case significance). The
+// tenant/msg fields are parsed canonically (no leading zeros / sign), so one
+// logical token has exactly one valid string form.
+func ParseSignedVERP(localpart string, key []byte) (tenantID, msgID int64, ok bool) {
+	if len(key) == 0 {
+		return ParseVERP(localpart)
+	}
+	lp := strings.TrimPrefix(strings.ToLower(localpart), verpPrefix)
+	parts := strings.Split(lp, ".")
+	// With a key configured, require the signed 3-part form. A 2-part (MAC-less)
+	// token must NOT authenticate — accepting it would let anyone forge attribution
+	// for a victim tenant simply by dropping the MAC.
+	if len(parts) != 3 {
+		return 0, 0, false
+	}
+	ti, ok1 := parseCanonInt(parts[0])
+	mi, ok2 := parseCanonInt(parts[1])
+	if !ok1 || !ok2 {
+		return 0, 0, false
+	}
+	if !hmac.Equal([]byte(parts[2]), []byte(verpMAC(ti, mi, key))) {
+		return 0, 0, false
+	}
+	return ti, mi, true
+}
+
+// parseCanonInt parses a canonical non-negative decimal (no sign, no leading
+// zeros beyond "0" itself), so a signed token has exactly one valid spelling and
+// can't be replayed as "007"/"+7".
+func parseCanonInt(s string) (int64, bool) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 || strconv.FormatInt(n, 10) != s {
+		return 0, false
+	}
+	return n, true
 }
 
 func nullIf0(v int64) any {

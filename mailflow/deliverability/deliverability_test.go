@@ -56,7 +56,7 @@ func TestReputationIsolation(t *testing.T) {
 
 	// Tenant A racks up complaints past the 1% threshold (>0.5 on 50 sends).
 	for i := 0; i < 3; i++ {
-		if err := svc.RecordEvent(ctx, tenantA, 0, deliverability.KindComplaint, remote); err != nil {
+		if err := svc.RecordEvent(ctx, tenantA, 0, deliverability.KindComplaint, remote, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -86,7 +86,7 @@ func TestVERPAttribution(t *testing.T) {
 	}
 
 	// A complaint arrives addressed to the VERP token -> attributed to tenant A.
-	if err := svc.RecordEvent(ctx, gotTenant, 0, deliverability.KindComplaint, "yahoo.com"); err != nil {
+	if err := svc.RecordEvent(ctx, gotTenant, 0, deliverability.KindComplaint, "yahoo.com", 0); err != nil {
 		t.Fatal(err)
 	}
 

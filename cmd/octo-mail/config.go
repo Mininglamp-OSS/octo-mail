@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -9,12 +10,44 @@ import (
 	"github.com/mjl-/mox/dns"
 )
 
+// checkVERPConfig refuses a bounce domain configured without a signing key: that
+// combination accepts unsigned VERP tokens, which anyone can forge to attribute
+// bounces/complaints to a victim tenant (cross-tenant reputation DoS) — the exact
+// hole VERP exists to close. Rather than silently fail open, startup fails unless
+// the operator explicitly opts into the unsigned path (local dev). Returns nil
+// when VERP is disabled, signed, or the escape hatch is set.
+func checkVERPConfig(cfg config) error {
+	if cfg.bounceDomain == "" || len(cfg.verpKey) > 0 || cfg.allowUnsignedVERP {
+		return nil
+	}
+	return fmt.Errorf("OCTO_MAIL_BOUNCE_DOMAIN is set but OCTO_MAIL_VERP_KEY is empty: " +
+		"bounce/complaint attribution would be forgeable (cross-tenant reputation DoS). " +
+		"Set OCTO_MAIL_VERP_KEY, or set OCTO_MAIL_ALLOW_UNSIGNED_VERP=1 to allow the unsigned path (dev only)")
+}
+
 // config is the node's runtime configuration, loaded from the environment.
 type config struct {
 	dsn      string
 	nodeID   string
 	hostname string
 	maxSize  int64
+
+	// bounceDomain, when set, enables VERP: outbound deliveries use an envelope
+	// MAIL FROM of bounces+<tenant>.<msg>.<mac>@<bounceDomain>, and inbound mail to
+	// that domain is routed to complaint/bounce handling (ARF + DSN) → reputation.
+	// Requires the operator to publish SPF/MX for the bounce domain pointing at
+	// this server. Empty = VERP disabled (envelope unchanged).
+	bounceDomain string
+	// verpKey signs VERP tokens (HMAC) so an unauthenticated sender cannot forge a
+	// bounce/complaint attributed to a victim tenant. Strongly recommended when
+	// bounceDomain is set; empty falls back to unsigned tokens (dev only, and
+	// refused at startup unless allowUnsignedVERP is set — see below).
+	verpKey []byte
+	// allowUnsignedVERP is the explicit dev escape hatch that permits enabling the
+	// bounce domain WITHOUT a signing key. Without it, bounceDomain+empty verpKey
+	// is a fatal misconfiguration rather than a silent fail-open onto the forgeable
+	// unsigned attribution path (a security control, not a warning).
+	allowUnsignedVERP bool
 
 	blobDir string // fs blob store dir (used when s3Endpoint is empty)
 
@@ -68,10 +101,13 @@ type config struct {
 
 func loadConfig() config {
 	return config{
-		dsn:      envDefault("OCTO_MAIL_DSN", "postgres://octo_mail:octo_mail@localhost:55432/octo_mail"),
-		nodeID:   envDefault("OCTO_MAIL_NODE_ID", defaultNodeID()),
-		hostname: envDefault("OCTO_MAIL_HOSTNAME", "octo-mail.local"),
-		maxSize:  envInt64("OCTO_MAIL_MAX_SIZE", 50*1024*1024),
+		dsn:               envDefault("OCTO_MAIL_DSN", "postgres://octo_mail:octo_mail@localhost:55432/octo_mail"),
+		nodeID:            envDefault("OCTO_MAIL_NODE_ID", defaultNodeID()),
+		hostname:          envDefault("OCTO_MAIL_HOSTNAME", "octo-mail.local"),
+		bounceDomain:      envLower("OCTO_MAIL_BOUNCE_DOMAIN"),
+		verpKey:           []byte(os.Getenv("OCTO_MAIL_VERP_KEY")),
+		allowUnsignedVERP: os.Getenv("OCTO_MAIL_ALLOW_UNSIGNED_VERP") == "1",
+		maxSize:           envInt64("OCTO_MAIL_MAX_SIZE", 50*1024*1024),
 
 		blobDir: envDefault("OCTO_MAIL_BLOB_DIR", "./blobs"),
 
@@ -151,6 +187,12 @@ func envDefault(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envLower reads an env var and returns it trimmed and lowercased — used for
+// case-insensitive identifiers like a DNS domain read from operator config.
+func envLower(k string) string {
+	return strings.ToLower(strings.TrimSpace(os.Getenv(k)))
 }
 
 func envInt64(k string, def int64) int64 {
