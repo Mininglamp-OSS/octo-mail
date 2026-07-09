@@ -12,6 +12,10 @@ import (
 	moxmessage "github.com/mjl-/mox/message"
 )
 
+// maxListLimit caps the page size of a single list request, so an absent/zero/
+// oversized ?limit can't return the whole account in one response.
+const maxListLimit = 1000
+
 // messageSummary is the list-view shape of a message.
 type messageSummary struct {
 	ID         string   `json:"id"`
@@ -42,6 +46,15 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 	search := q.Get("search")
 	limit := atoiDefault(q.Get("limit"), 50)
 	offset := atoiDefault(q.Get("offset"), 0)
+	// Clamp the page size: a 0/negative/oversized limit (e.g. ?limit=0 or a huge
+	// value) must not return the whole account in one response. Clients page with
+	// offset for more.
+	if limit <= 0 || limit > maxListLimit {
+		limit = maxListLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
 
 	var out []messageSummary
 	var total int

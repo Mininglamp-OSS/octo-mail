@@ -400,7 +400,20 @@ func TestListPagingAndFold(t *testing.T) {
 	if s0 := m3[0].(map[string]any)["subject"]; s0 != "msg4" {
 		t.Fatalf("offset=20 page[0] subject = %v, want msg4", s0)
 	}
-	t.Logf("OK: accurate total(%d), newest-first, deep paging, column-sourced summaries", n)
+	// limit clamp: ?limit=0 and ?limit=<huge> must NOT return the whole account
+	// uncapped — they clamp to maxListLimit (1000), so with 25 messages both
+	// return all 25 (bounded, not unbounded), never more than the cap.
+	for _, path := range []string{"/webapi/v0/messages?limit=0", "/webapi/v0/messages?limit=999999999"} {
+		p := get(path)
+		mm, _ := p["messages"].([]any)
+		if len(mm) != n {
+			t.Fatalf("%s = %d messages, want %d (clamped, all returned)", path, len(mm), n)
+		}
+		if lim := int(p["limit"].(float64)); lim != 1000 {
+			t.Fatalf("%s echoed limit=%d, want 1000 (clamped)", path, lim)
+		}
+	}
+	t.Logf("OK: accurate total(%d), newest-first, deep paging, column-sourced summaries, limit clamp", n)
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
