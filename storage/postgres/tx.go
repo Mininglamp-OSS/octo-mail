@@ -97,7 +97,7 @@ func (pt *pgTx) getMessage(id int64) (store.Message, error) {
 const messageCols = `id, account_id, mailbox_id, uid, createseq, modseq, expunged,
 	f_seen, f_answered, f_flagged, f_forwarded, f_junk, f_notjunk, f_deleted, f_draft, f_phishing, f_mdnsent,
 	keywords, blob_ref, size, thread_id, email_id, received_at, save_date, msg_prefix,
-	subject, from_addr, to_addrs, preview, summary_folded`
+	subject, from_addr, to_addrs, from_search, to_search, preview, summary_folded`
 
 func scanMessage(row pgx.Row) (store.Message, error) {
 	var m store.Message
@@ -106,7 +106,7 @@ func scanMessage(row pgx.Row) (store.Message, error) {
 	err := row.Scan(&m.ID, &m.AccountID, &m.MailboxID, &m.UID, &m.CreateSeq, &m.ModSeq, &m.Expunged,
 		&m.Seen, &m.Answered, &m.Flagged, &m.Forwarded, &m.Junk, &m.Notjunk, &m.Deleted, &m.Draft, &m.Phishing, &m.MDNSent,
 		&m.Keywords, &m.BlobRef, &m.Size, &thread, &emailID, &m.Received, &m.SaveDate, &m.MsgPrefix,
-		&m.Subject, &m.FromAddr, &m.ToAddrs, &m.Preview, &m.SummaryFolded)
+		&m.Subject, &m.FromAddr, &m.ToAddrs, &m.FromSearch, &m.ToSearch, &m.Preview, &m.SummaryFolded)
 	if err != nil {
 		return store.Message{}, err
 	}
@@ -188,10 +188,10 @@ func (q *msgQuery) FilterSubject(substr string) store.MessageQuery {
 	return q.ilikeContains("subject", substr)
 }
 func (q *msgQuery) FilterFrom(substr string) store.MessageQuery {
-	return q.ilikeContains("from_addr", substr)
+	return q.ilikeContains("from_search", substr)
 }
 func (q *msgQuery) FilterTo(substr string) store.MessageQuery {
-	return q.ilikeContains("to_addrs", substr)
+	return q.ilikeContains("to_search", substr)
 }
 func (q *msgQuery) FilterReceivedRange(after, before string) store.MessageQuery {
 	if after != "" {

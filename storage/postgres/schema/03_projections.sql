@@ -86,8 +86,10 @@ CREATE INDEX IF NOT EXISTS messages_email_idx ON messages (account_id, email_id)
 -- for the (rare, recent) unfolded rows. ADD COLUMN cascades to the hash
 -- partitions.
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS subject        text NOT NULL DEFAULT '';
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS from_addr      text NOT NULL DEFAULT '';
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS to_addrs       text NOT NULL DEFAULT ''; -- space-joined recipient addrs, substring-filterable
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS from_addr      text NOT NULL DEFAULT ''; -- display: bare sender address
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS to_addrs       text NOT NULL DEFAULT ''; -- display: space-joined recipient addresses
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS from_search    text NOT NULL DEFAULT ''; -- filter: sender name + address, substring-searchable
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS to_search      text NOT NULL DEFAULT ''; -- filter: recipient names + addresses
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview        text NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS summary_folded boolean NOT NULL DEFAULT false;
 -- Received-desc list ordering + email-group dedup (DISTINCT ON) are the hot

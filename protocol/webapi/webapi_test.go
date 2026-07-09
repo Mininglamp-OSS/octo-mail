@@ -356,6 +356,12 @@ func TestListPagingAndFold(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// One message with display-named sender + two named recipients, to prove the
+	// display columns hold bare addresses (correct count) not name-shattered tokens.
+	named := "From: Alice Smith <alice@remote.example>\r\nTo: Bob Jones <bob@x.example>, Carol <carol@y.example>\r\nSubject: msg25\r\n\r\nbody25\r\n"
+	if _, err := target.Deliver(ctx, &store.Message{}, mem(named)); err != nil {
+		t.Fatal(err)
+	}
 	// Fold so summaries read from columns.
 	tw := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100}
 	if err := tw.DrainAccount(ctx, tenantID, accID); err != nil {
@@ -378,42 +384,53 @@ func TestListPagingAndFold(t *testing.T) {
 		return out
 	}
 
-	// Page 1: limit 10 → 10 messages, total 25 (accurate, not capped).
+	// Page 1: limit 10 → 10 messages, accurate total (not capped).
+	total := n + 1 // the 25 plain messages + the display-named one
 	p1 := get("/webapi/v0/messages?limit=10&offset=0")
-	if int(p1["total"].(float64)) != n {
-		t.Fatalf("total = %v, want %d", p1["total"], n)
+	if int(p1["total"].(float64)) != total {
+		t.Fatalf("total = %v, want %d", p1["total"], total)
 	}
 	m1, _ := p1["messages"].([]any)
 	if len(m1) != 10 {
 		t.Fatalf("page1 = %d messages, want 10", len(m1))
 	}
-	// Newest first: msg24 is first (delivered last).
-	if s0 := m1[0].(map[string]any)["subject"]; s0 != "msg24" {
-		t.Fatalf("page1[0] subject = %v, want msg24 (newest-first, from column)", s0)
+	// Newest first: the display-named msg25 is first (delivered last). Its display
+	// fields must be bare addresses, NOT name-shattered: from="alice@…" (no name),
+	// to=["bob@x.example","carol@y.example"] (2 recipients, not 4 name tokens).
+	top := m1[0].(map[string]any)
+	if top["subject"] != "msg25" {
+		t.Fatalf("page1[0] subject = %v, want msg25 (newest-first)", top["subject"])
 	}
-	// Deep page: offset 20, limit 10 → last 5 (msg4..msg0).
-	p3 := get("/webapi/v0/messages?limit=10&offset=20")
+	if top["from"] != "alice@remote.example" {
+		t.Fatalf("display from = %v, want bare 'alice@remote.example' (no display-name prefix)", top["from"])
+	}
+	toList, _ := top["to"].([]any)
+	if len(toList) != 2 || toList[0] != "bob@x.example" || toList[1] != "carol@y.example" {
+		t.Fatalf("display to = %v, want [bob@x.example carol@y.example] (not name-shattered)", toList)
+	}
+	// Deep page: offset 21, limit 10 → last 5 (msg4..msg0).
+	p3 := get("/webapi/v0/messages?limit=10&offset=21")
 	m3, _ := p3["messages"].([]any)
 	if len(m3) != 5 {
-		t.Fatalf("offset=20 page = %d messages, want 5 (deep paging past first pages)", len(m3))
+		t.Fatalf("offset=21 page = %d messages, want 5 (deep paging)", len(m3))
 	}
 	if s0 := m3[0].(map[string]any)["subject"]; s0 != "msg4" {
-		t.Fatalf("offset=20 page[0] subject = %v, want msg4", s0)
+		t.Fatalf("offset=21 page[0] subject = %v, want msg4", s0)
 	}
 	// limit clamp: ?limit=0 and ?limit=<huge> must NOT return the whole account
-	// uncapped — they clamp to maxListLimit (1000), so with 25 messages both
-	// return all 25 (bounded, not unbounded), never more than the cap.
+	// uncapped — they clamp to maxListLimit (1000), so all `total` rows return
+	// (bounded), never more than the cap.
 	for _, path := range []string{"/webapi/v0/messages?limit=0", "/webapi/v0/messages?limit=999999999"} {
 		p := get(path)
 		mm, _ := p["messages"].([]any)
-		if len(mm) != n {
-			t.Fatalf("%s = %d messages, want %d (clamped, all returned)", path, len(mm), n)
+		if len(mm) != total {
+			t.Fatalf("%s = %d messages, want %d (clamped, all returned)", path, len(mm), total)
 		}
 		if lim := int(p["limit"].(float64)); lim != 1000 {
 			t.Fatalf("%s echoed limit=%d, want 1000 (clamped)", path, lim)
 		}
 	}
-	t.Logf("OK: accurate total(%d), newest-first, deep paging, column-sourced summaries, limit clamp", n)
+	t.Logf("OK: accurate total(%d), newest-first, deep paging, bare-address display, limit clamp", total)
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }

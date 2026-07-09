@@ -106,9 +106,13 @@ type Message struct {
 	// projection fold so list/query paths need not MIME-parse the body per row.
 	// SummaryFolded is false until the fold has run for this row; list endpoints
 	// fall back to an on-the-fly parse while false (see summarize).
+	// FromAddr/ToAddrs are DISPLAY forms (bare addresses); FromSearch/ToSearch add
+	// display names for substring filtering.
 	Subject       string
 	FromAddr      string
-	ToAddrs       string // space-joined recipient addresses
+	ToAddrs       string // space-joined recipient addresses (display)
+	FromSearch    string // sender name + address (filter)
+	ToSearch      string // recipient names + addresses (filter)
 	Preview       string
 	SummaryFolded bool
 }

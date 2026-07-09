@@ -98,9 +98,10 @@ func (w *ThreadWorker) RunOnceAccount(ctx context.Context, tenantID, accountID i
 		}
 		if _, err := w.Pool.Exec(ctx,
 			`UPDATE messages SET thread_id=$1,
-			   subject=$3, from_addr=$4, to_addrs=$5, preview=$6, summary_folded=true
+			   subject=$3, from_addr=$4, to_addrs=$5, from_search=$6, to_search=$7,
+			   preview=$8, summary_folded=true
 			 WHERE id=$2`,
-			threadID, m.id, sum.subject, sum.from, sum.to, sum.preview); err != nil {
+			threadID, m.id, sum.subject, sum.from, sum.to, sum.fromSearch, sum.toSearch, sum.preview); err != nil {
 			return 0, err
 		}
 		if m.seq > maxSeq {
@@ -156,10 +157,12 @@ func (w *ThreadWorker) assignThread(ctx context.Context, accountID, msgID int64,
 
 // msgSummary holds the denormalized list-summary fields extracted during the fold.
 type msgSummary struct {
-	subject string
-	from    string // first From address as user@host
-	to      string // space-joined To addresses
-	preview string // first ~140 chars of body text
+	subject    string
+	from       string // sender address (display)
+	to         string // space-joined recipient addresses (display)
+	fromSearch string // sender name + address (filter)
+	toSearch   string // recipient names + addresses (filter)
+	preview    string // first ~140 chars of body text
 }
 
 // parseMessage reads a stored message once and extracts BOTH its threading
@@ -202,8 +205,10 @@ func (w *ThreadWorker) parseMessage(ctx context.Context, tenantID int64, blobRef
 	if part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(full), int64(len(full))); err == nil || part.Envelope != nil {
 		if env := part.Envelope; env != nil {
 			sum.subject = env.Subject
-			sum.from = addrText(env.From)
-			sum.to = addrText(env.To)
+			sum.from = addrDisplay(env.From)
+			sum.to = addrDisplay(env.To)
+			sum.fromSearch = addrSearch(env.From)
+			sum.toSearch = addrSearch(env.To)
 		}
 		sum.preview = previewOf(&part)
 	}
@@ -215,15 +220,28 @@ func (w *ThreadWorker) parseMessage(ctx context.Context, tenantID int64, blobRef
 	sum.subject = toValidUTF8(sum.subject)
 	sum.from = toValidUTF8(sum.from)
 	sum.to = toValidUTF8(sum.to)
+	sum.fromSearch = toValidUTF8(sum.fromSearch)
+	sum.toSearch = toValidUTF8(sum.toSearch)
 	sum.preview = toValidUTF8(sum.preview)
 	return refs, sum, nil
 }
 
-// addrText renders a header address list into a searchable string that includes
-// each display name AND the email address (space-joined), matching the old
-// on-the-fly filter which searched "Name User@Host" — so display-name search on
-// from/to keeps working after the pushdown.
-func addrText(as []moxmessage.Address) string {
+// addrDisplay renders an address list to bare "user@host" values, space-joined —
+// the DISPLAY form stored in from_addr/to_addrs (clients get real addresses and a
+// correct recipient count; no display-name tokens shattering the split).
+func addrDisplay(as []moxmessage.Address) string {
+	var parts []string
+	for _, a := range as {
+		parts = append(parts, a.User+"@"+a.Host)
+	}
+	return strings.Join(parts, " ")
+}
+
+// addrSearch renders an address list to "Name user@host" per address, space-joined
+// — the FILTER form stored in from_search/to_search, so a substring search matches
+// either a display name or an address. Kept separate from the display form so the
+// name tokens never corrupt the displayed from/to (see summarize).
+func addrSearch(as []moxmessage.Address) string {
 	var parts []string
 	for _, a := range as {
 		s := a.User + "@" + a.Host
@@ -345,7 +363,7 @@ func (w *ThreadWorker) DrainAccount(ctx context.Context, tenantID, accountID int
 func (w *ThreadWorker) RebuildAccount(ctx context.Context, tenantID, accountID int64) error {
 	if _, err := w.Pool.Exec(ctx,
 		`UPDATE messages SET thread_id=NULL, summary_folded=false,
-		   subject='', from_addr='', to_addrs='', preview=''
+		   subject='', from_addr='', to_addrs='', from_search='', to_search='', preview=''
 		 WHERE account_id=$1`, accountID); err != nil {
 		return err
 	}

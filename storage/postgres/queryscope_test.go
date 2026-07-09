@@ -199,10 +199,12 @@ func TestMessageQuerySummaryFilters(t *testing.T) {
 
 	ins := func(uid int, from, subj string, size int64, kw []string, folded bool) int64 {
 		var id int64
+		// from_search mirrors the fold: FilterFrom targets from_search, not the
+		// display-only from_addr column.
 		must(t, s.Pool.QueryRow(ctx,
 			`INSERT INTO messages (account_id, mailbox_id, uid, createseq, modseq, blob_ref, size,
-			   from_addr, subject, keywords, summary_folded, received_at, save_date)
-			 VALUES ($1,$2,$3,$3,$3,'r',$4,$5,$6,$7,$8, now(), now()) RETURNING id`,
+			   from_addr, from_search, subject, keywords, summary_folded, received_at, save_date)
+			 VALUES ($1,$2,$3,$3,$3,'r',$4,$5,$5,$6,$7,$8, now(), now()) RETURNING id`,
 			accID, mbID, uid, size, from, subj, kw, folded).Scan(&id))
 		return id
 	}
