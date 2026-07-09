@@ -261,9 +261,10 @@ func TestFoldPreviewShortInvalidUTF8(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Short body (well under 140 bytes) with a lone 0xff invalid byte + a subject
-	// carrying an invalid byte too, so the tail-trim branch is never reached.
-	raw := "Message-ID: <s@example.com>\r\nSubject: bad\xffsubj\r\n\r\nshort\xffbody\r\n"
+	// Short body (well under 140 bytes) with a lone 0xff (invalid UTF-8) AND a NUL
+	// (0x00 — valid UTF-8 but rejected by Postgres text) in both subject and body,
+	// so both hazards are exercised and the tail-trim branch is never reached.
+	raw := "Message-ID: <s@example.com>\r\nSubject: bad\xffsub\x00j\r\n\r\nshort\xffbo\x00dy\r\n"
 	if _, err := target.Deliver(ctx, &store.Message{}, mem(raw)); err != nil {
 		t.Fatal(err)
 	}
@@ -285,4 +286,81 @@ func TestFoldPreviewShortInvalidUTF8(t *testing.T) {
 		t.Fatalf("stored summary not valid UTF-8: preview=%q subject=%q", preview, subject)
 	}
 	t.Logf("OK: short invalid-UTF-8 body folded without error; preview/subject stored as valid UTF-8")
+}
+
+// TestBackfillSummaries proves B2's fix: rows that were folded before the summary
+// columns existed (summary_folded=false, empty search columns, cursor already at
+// head) are repopulated by BackfillSummaries — so filtered search finds
+// historical mail on an in-place upgrade, without a full rethread/cursor reset.
+func TestBackfillSummaries(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, fts, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`).Scan(&tenantID)
+	s.Pool.QueryRow(ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, tenantID).Scan(&accID)
+	s.Pool.QueryRow(ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, tenantID).Scan(&domID)
+	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	dir := s.NewDirectory()
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, err := dir.ResolveInbound(ctx, addr.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Deliver(ctx, &store.Message{}, mem("Message-ID: <h@example.com>\r\nFrom: Alice Smith <alice@remote.example>\r\nSubject: legacy report\r\n\r\nold body\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	w := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100}
+	if err := w.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the pre-migration state: row was folded for threading but predates
+	// the summary columns — thread_id set, cursor at head, summary columns empty
+	// and summary_folded=false.
+	if _, err := s.Pool.Exec(ctx,
+		`UPDATE messages SET summary_folded=false, subject='', from_addr='', to_addrs='', from_search='', to_search='', preview='' WHERE account_id=$1`,
+		accID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The forward drain does NOT fix it (cursor already at head).
+	if err := w.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatal(err)
+	}
+	var folded bool
+	s.Pool.QueryRow(ctx, `SELECT summary_folded FROM messages WHERE account_id=$1`, accID).Scan(&folded)
+	if folded {
+		t.Fatal("precondition: forward drain should NOT have re-folded a cursor-passed row")
+	}
+
+	// Backfill repopulates it.
+	if err := w.BackfillSummaries(ctx, tenantID, accID); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	var subject, fromSearch string
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT subject, from_search, summary_folded FROM messages WHERE account_id=$1`, accID).Scan(&subject, &fromSearch, &folded); err != nil {
+		t.Fatal(err)
+	}
+	if !folded || subject != "legacy report" {
+		t.Fatalf("after backfill: folded=%v subject=%q, want true / 'legacy report'", folded, subject)
+	}
+	if !strings.Contains(strings.ToLower(fromSearch), "alice smith") {
+		t.Fatalf("from_search=%q, want to contain display name 'Alice Smith' (search-by-name works post-backfill)", fromSearch)
+	}
+	// Idempotent: a second backfill is a no-op (nothing left unfolded).
+	if err := w.BackfillSummaries(ctx, tenantID, accID); err != nil {
+		t.Fatalf("second backfill: %v", err)
+	}
+	t.Logf("OK: legacy folded-but-unbackfilled row repopulated (subject+from_search) by BackfillSummaries; idempotent")
 }

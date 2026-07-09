@@ -253,12 +253,18 @@ func addrSearch(as []moxmessage.Address) string {
 	return strings.Join(parts, " ")
 }
 
-// toValidUTF8 replaces invalid UTF-8 bytes so the value is safe for a text column.
+// toValidUTF8 makes a header/body-derived string safe for a Postgres text column:
+// it strips NUL (0x00) — which IS valid UTF-8 but Postgres text rejects with
+// SQLSTATE 22021 — and replaces any invalid UTF-8 sequences. Either, unhandled,
+// would error the fold UPDATE and wedge the projection forever.
 func toValidUTF8(s string) string {
-	if utf8.ValidString(s) {
-		return s
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
 	}
-	return strings.ToValidUTF8(s, "")
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+	return s
 }
 
 // previewOf returns the first ~140 chars of a message's text body (falling back
@@ -354,6 +360,64 @@ func (w *ThreadWorker) DrainAccount(ctx context.Context, tenantID, accountID int
 		}
 		if n == 0 {
 			return nil
+		}
+	}
+}
+
+// BackfillSummaries populates the summary columns for rows the forward fold
+// already passed but that predate those columns (summary_folded=false with
+// createseq <= cursor) — i.e. every row on an in-place upgrade, since the thread
+// cursor is already at head so DrainAccount never revisits them. It re-parses
+// each such row and writes the summary columns (leaving thread_id as-is, which is
+// already correct), marking summary_folded=true. Idempotent and bounded per call;
+// once every legacy row is backfilled it becomes a no-op. Without this, filtered
+// search would silently omit all pre-existing mail (its search columns stay ”).
+func (w *ThreadWorker) BackfillSummaries(ctx context.Context, tenantID, accountID int64) error {
+	batch := w.Batch
+	if batch <= 0 {
+		batch = 100
+	}
+	for {
+		rows, err := w.Pool.Query(ctx,
+			`SELECT id, blob_ref, msg_prefix FROM messages
+			 WHERE account_id=$1 AND NOT summary_folded
+			 ORDER BY id LIMIT $2`, accountID, batch)
+		if err != nil {
+			return err
+		}
+		type row struct {
+			id      int64
+			blobRef string
+			prefix  []byte
+		}
+		var todo []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.blobRef, &r.prefix); err != nil {
+				rows.Close()
+				return err
+			}
+			todo = append(todo, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(todo) == 0 {
+			return nil
+		}
+		for _, r := range todo {
+			_, sum, err := w.parseMessage(ctx, tenantID, r.blobRef, r.prefix)
+			if err != nil {
+				return err
+			}
+			if _, err := w.Pool.Exec(ctx,
+				`UPDATE messages SET subject=$2, from_addr=$3, to_addrs=$4,
+				   from_search=$5, to_search=$6, preview=$7, summary_folded=true
+				 WHERE id=$1 AND account_id=$8`,
+				r.id, sum.subject, sum.from, sum.to, sum.fromSearch, sum.toSearch, sum.preview, accountID); err != nil {
+				return err
+			}
 		}
 	}
 }

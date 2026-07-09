@@ -684,6 +684,12 @@ func drainProjections(ctx context.Context, log *slog.Logger, s *postgres.Store, 
 		if err := threads.DrainAccount(ctx, a.tenant, a.id); err != nil {
 			log.Warn("thread drain", "account", a.id, "err", err)
 		}
+		// Backfill summary columns for rows that predate them (in-place upgrade):
+		// the forward drain above only folds new rows, so legacy rows need this
+		// one-time-per-row pass or filtered search would omit all historical mail.
+		if err := threads.BackfillSummaries(ctx, a.tenant, a.id); err != nil {
+			log.Warn("summary backfill", "account", a.id, "err", err)
+		}
 	}
 }
 

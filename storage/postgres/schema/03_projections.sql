@@ -80,11 +80,13 @@ CREATE INDEX IF NOT EXISTS messages_email_idx ON messages (account_id, email_id)
 
 -- H13: denormalized list-summary columns so list/query paths don't MIME-parse
 -- every message body per request. Populated asynchronously by the threading
--- projection fold (which already opens+parses each message), backfilled by a
--- projection rebuild. summary_folded distinguishes "folded, genuinely empty"
--- from "not yet folded" so list endpoints fall back to an on-the-fly parse only
--- for the (rare, recent) unfolded rows. ADD COLUMN cascades to the hash
--- partitions.
+-- projection fold (which already opens+parses each message). On an in-place
+-- upgrade, pre-existing (already-folded) rows are repopulated by the projection
+-- worker's BackfillSummaries pass (drainProjections), which folds rows still
+-- marked summary_folded=false without a full rethread. summary_folded
+-- distinguishes "folded, genuinely empty" from "not yet folded" so list endpoints
+-- fall back to an on-the-fly parse only for the (rare, recent) unfolded rows.
+-- ADD COLUMN cascades to the hash partitions.
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS subject        text NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS from_addr      text NOT NULL DEFAULT ''; -- display: bare sender address
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS to_addrs       text NOT NULL DEFAULT ''; -- display: space-joined recipient addresses
