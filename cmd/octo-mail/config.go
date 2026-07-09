@@ -31,6 +31,11 @@ type config struct {
 	nodeID   string
 	hostname string
 	maxSize  int64
+	// maxConns caps concurrent connections per TCP listener (smtp-mx, submission,
+	// imap). Each connection may buffer a whole message (up to maxSize), so an
+	// unbounded goroutine-per-connection accept loop is an OOM/DoS vector; this
+	// bounds peak memory ≈ maxConns × maxSize per listener. 0 = unlimited.
+	maxConns int
 
 	// bounceDomain, when set, enables VERP: outbound deliveries use an envelope
 	// MAIL FROM of bounces+<tenant>.<msg>.<mac>@<bounceDomain>, and inbound mail to
@@ -108,6 +113,7 @@ func loadConfig() config {
 		verpKey:           []byte(os.Getenv("OCTO_MAIL_VERP_KEY")),
 		allowUnsignedVERP: os.Getenv("OCTO_MAIL_ALLOW_UNSIGNED_VERP") == "1",
 		maxSize:           envInt64("OCTO_MAIL_MAX_SIZE", 50*1024*1024),
+		maxConns:          int(envInt64("OCTO_MAIL_MAX_CONNS", 1024)),
 
 		blobDir: envDefault("OCTO_MAIL_BLOB_DIR", "./blobs"),
 

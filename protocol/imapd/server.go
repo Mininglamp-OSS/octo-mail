@@ -16,7 +16,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -51,6 +53,12 @@ type Server struct {
 	// spam; losing it (or leaving Junk) trains ham. This is the feedback loop that
 	// makes the bayesian filter learn from the user's corrections.
 	Junk JunkTrainer
+
+	// MaxSize bounds an accepted literal (APPEND/REPLACE/CATENATE/SETMETADATA), in
+	// bytes, and is advertised as APPENDLIMIT. A literal declaring a larger size is
+	// rejected before allocation, so a client can't force a multi-GB allocation per
+	// connection. 0 = unlimited (dev/tests). Mirrors smtpd.Server.MaxSize.
+	MaxSize int64
 }
 
 // JunkTrainer trains an account's junk filter on a message body.
@@ -103,6 +111,24 @@ type conn struct {
 
 	fatal error // set by handlers to force connection close
 
+	// cmdBudget is the remaining bytes a single command may RETAIN in memory,
+	// reset to srv.MaxSize before each command. readLiteral and CATENATE URL parts
+	// debit it, so a MULTIAPPEND or CATENATE that individually respects the
+	// per-literal cap still can't accumulate N×MaxSize on one connection —
+	// preserving the connection-cap sizing invariant (≈one message worth of buffer
+	// per connection). cmdLimited records whether a limit is in force (MaxSize>0);
+	// it MUST be tracked separately from cmdBudget because a command can legitimately
+	// decrement cmdBudget to exactly 0 — overloading 0 as an "unlimited" sentinel
+	// would misread an exhausted budget as unlimited and reopen the aggregate cap.
+	//
+	// Note this is a per-COMMAND cap, deliberately stricter than RFC 7889
+	// APPENDLIMIT (a per-MESSAGE limit): a MULTIAPPEND whose messages are each
+	// under APPENDLIMIT but together exceed MaxSize is rejected [TOOBIG]. That is a
+	// memory-safety tradeoff, not a bug — a client can split such a batch into
+	// separate APPEND commands.
+	cmdBudget  int64
+	cmdLimited bool
+
 	scope    directory.TenantScope
 	acc      store.Account
 	selected *store.Mailbox
@@ -129,7 +155,11 @@ func (c *conn) remoteIP() net.IP {
 // capString reports the CAPABILITY token list for the current connection state.
 // Before TLS on a TLS-required server, login is disabled and STARTTLS offered.
 func (c *conn) capString() string {
-	caps := []string{"IMAP4rev2", "IMAP4rev1", "UIDPLUS", "MOVE", "NAMESPACE", "ENABLE", "CONDSTORE", "QRESYNC", "QUOTA", "QUOTA=RES-STORAGE", "REPLACE", "METADATA", "BINARY", "UIDONLY", "NOTIFY", "ESEARCH", "SEARCHRES", "WITHIN", "STATUS=SIZE", "MULTIAPPEND", "ID", "SASL-IR", "LITERAL+", "UTF8=ACCEPT", "APPENDLIMIT=9223372036854775807", "LIST-EXTENDED", "LIST-STATUS", "LIST-METADATA", "SPECIAL-USE", "CREATE-SPECIAL-USE", "CHILDREN", "SORT", "THREAD=REFERENCES", "THREAD=ORDEREDSUBJECT", "SAVEDATE", "MULTISEARCH", "PREVIEW", "OBJECTID", "CATENATE", "URLAUTH", "INPROGRESS"}
+	appendLimit := int64(math.MaxInt64)
+	if c.srv.MaxSize > 0 {
+		appendLimit = c.srv.MaxSize
+	}
+	caps := []string{"IMAP4rev2", "IMAP4rev1", "UIDPLUS", "MOVE", "NAMESPACE", "ENABLE", "CONDSTORE", "QRESYNC", "QUOTA", "QUOTA=RES-STORAGE", "REPLACE", "METADATA", "BINARY", "UIDONLY", "NOTIFY", "ESEARCH", "SEARCHRES", "WITHIN", "STATUS=SIZE", "MULTIAPPEND", "ID", "SASL-IR", "LITERAL+", "UTF8=ACCEPT", "APPENDLIMIT=" + strconv.FormatInt(appendLimit, 10), "LIST-EXTENDED", "LIST-STATUS", "LIST-METADATA", "SPECIAL-USE", "CREATE-SPECIAL-USE", "CHILDREN", "SORT", "THREAD=REFERENCES", "THREAD=ORDEREDSUBJECT", "SAVEDATE", "MULTISEARCH", "PREVIEW", "OBJECTID", "CATENATE", "URLAUTH", "INPROGRESS"}
 	if !c.compress {
 		caps = append(caps, "COMPRESS=DEFLATE")
 	}
@@ -165,6 +195,12 @@ func (c *conn) serve() error {
 		tag, rest := cut(line, " ")
 		cmd, args := cut(rest, " ")
 		cmd = strings.ToUpper(cmd)
+		// Reset the per-command memory budget: the total bytes this command may
+		// retain across all its literals/parts (MULTIAPPEND, CATENATE). cmdLimited
+		// is captured separately so an exact-fit exhaustion (budget → 0) is not
+		// mistaken for "unlimited".
+		c.cmdBudget = c.srv.MaxSize
+		c.cmdLimited = c.srv.MaxSize > 0
 
 		var done bool
 		func() {

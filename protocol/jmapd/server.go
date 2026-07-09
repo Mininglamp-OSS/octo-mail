@@ -10,9 +10,9 @@
 package jmapd
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,6 +39,23 @@ type Server struct {
 	// by blobId.
 	Blob blob.Store
 }
+
+// JMAP request limits (RFC 8620 §2.1). These are both advertised in the session
+// capabilities AND enforced on the request path, so they never drift: an
+// oversized upload or an over-long method batch is rejected instead of buffered.
+const (
+	// maxSizeUpload bounds a single /jmap/upload body (bytes).
+	maxSizeUpload = 50_000_000
+	// maxCallsInRequest bounds the number of method calls in one /jmap/api request.
+	maxCallsInRequest = 64
+	// maxObjectsInGet / maxObjectsInSet bound per-method object counts (advertised).
+	maxObjectsInGet = 1000
+	maxObjectsInSet = 1000
+	// maxAPIRequestSize bounds a /jmap/api request body. The body is a small JSON
+	// envelope of method calls (not blob data), so a tight cap is safe and blocks
+	// the multi-GB-body amplification vector.
+	maxAPIRequestSize = 10 << 20 // 10 MiB
+)
 
 // Handler returns an http.Handler serving /jmap/session and /jmap/api.
 func (s *Server) Handler() http.Handler {
@@ -69,13 +86,19 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := scope.Tenant().ID
-	data, err := io.ReadAll(r.Body)
+	// Stream the (size-bounded) body straight into the blob store rather than
+	// buffering it all in memory first — Blob.Put content-addresses via a spooled
+	// temp file, so an upload costs no per-request 50 MB heap allocation.
+	r.Body = http.MaxBytesReader(w, r.Body, maxSizeUpload)
+	ref, size, err := s.Blob.Put(r.Context(), tenantID, r.Body)
 	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
-		return
-	}
-	ref, size, err := s.Blob.Put(r.Context(), tenantID, bytes.NewReader(data))
-	if err != nil {
+		// A MaxBytesReader overflow surfaces here (via Put's read) as a 413; any
+		// other error is a storage failure.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "upload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "store blob", http.StatusInternalServerError)
 		return
 	}
@@ -240,10 +263,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	session := map[string]any{
 		"capabilities": map[string]any{
 			"urn:ietf:params:jmap:core": map[string]any{
-				"maxSizeUpload":     50_000_000,
-				"maxCallsInRequest": 64,
-				"maxObjectsInGet":   1000,
-				"maxObjectsInSet":   1000,
+				"maxSizeUpload":     maxSizeUpload,
+				"maxCallsInRequest": maxCallsInRequest,
+				"maxObjectsInGet":   maxObjectsInGet,
+				"maxObjectsInSet":   maxObjectsInSet,
 			},
 			"urn:ietf:params:jmap:mail":             map[string]any{},
 			"urn:ietf:params:jmap:vacationresponse": map[string]any{},
@@ -292,10 +315,22 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	body, _ := io.ReadAll(r.Body)
+	r.Body = http.MaxBytesReader(w, r.Body, maxAPIRequestSize)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		// MaxBytesReader trips this once the body exceeds the cap.
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	var req Request
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	// Enforce the advertised batch cap before dispatching any call, so a huge
+	// methodCalls array can't amplify into thousands of queries.
+	if len(req.MethodCalls) > maxCallsInRequest {
+		http.Error(w, "too many method calls", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -319,6 +354,16 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 // dispatch runs one JMAP method call, returning the response name and args.
 func (s *Server) dispatch(ctx context.Context, acc store.Account, scope directory.TenantScope, login string, inv invocation) (string, any) {
+	// Enforce the advertised per-call object caps centrally, before any method
+	// runs, so no handler can drift from the maxObjectsInGet/Set the session
+	// advertises. A /get reads N ids; a /set mutates create+update+destroy
+	// objects. Exceeding the cap is RFC 8620 "requestTooLarge".
+	if n := invGetCount(inv); n > maxObjectsInGet {
+		return "error", map[string]any{"type": "requestTooLarge", "description": "too many objects requested"}
+	}
+	if n := invSetCount(inv); n > maxObjectsInSet {
+		return "error", map[string]any{"type": "requestTooLarge", "description": "too many objects in set"}
+	}
 	switch inv.name {
 	case "Mailbox/get":
 		return s.mailboxGet(ctx, acc, inv)
@@ -349,6 +394,37 @@ func (s *Server) dispatch(ctx context.Context, acc store.Account, scope director
 	default:
 		return "error", map[string]any{"type": "unknownMethod"}
 	}
+}
+
+// jsonLen counts the elements of a JSON array (for "ids") or the members of a
+// JSON object (for "create"/"update"/"destroy"), without materializing them —
+// so a huge id list is rejected before it is unmarshaled into a slice/map.
+// Returns 0 for absent/unparseable args.
+func jsonLen(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	// Arrays decode into []json.RawMessage; objects into map[string]json.RawMessage.
+	var arr []json.RawMessage
+	if json.Unmarshal(raw, &arr) == nil {
+		return len(arr)
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) == nil {
+		return len(obj)
+	}
+	return 0
+}
+
+// invGetCount returns the number of objects a /get-family call would fetch.
+func invGetCount(inv invocation) int {
+	return jsonLen(inv.args["ids"]) + jsonLen(inv.args["emailIds"])
+}
+
+// invSetCount returns the number of objects a /set-family call would mutate
+// (create + update + destroy).
+func invSetCount(inv invocation) int {
+	return jsonLen(inv.args["create"]) + jsonLen(inv.args["update"]) + jsonLen(inv.args["destroy"])
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

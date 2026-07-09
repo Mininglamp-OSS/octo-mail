@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -273,7 +274,7 @@ func run() error {
 				log.InfoContext(ctx, "bounce/complaint recorded", "tenant", c.TenantID, "kind", c.Kind)
 			}
 		}
-		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
+		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, cfg.maxConns, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
 	}
 	// SMTP submission (:587).
 	if cfg.submissionAddr != "" {
@@ -287,12 +288,12 @@ func run() error {
 			}
 			return imapd.ResolveURLAuth(ctx, acc, authURL)
 		}
-		go serveTCPListener(ctx, log, "smtp-submission", cfg.submissionAddr, prebound["smtp-submission"], errc, func(nc net.Conn) { _ = sub.Serve(ctx, nc) })
+		go serveTCPListener(ctx, log, "smtp-submission", cfg.submissionAddr, prebound["smtp-submission"], errc, cfg.maxConns, func(nc net.Conn) { _ = sub.Serve(ctx, nc) })
 	}
 	// IMAP (:143).
 	if cfg.imapAddr != "" {
-		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS}
-		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
+		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS, MaxSize: cfg.maxSize}
+		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, cfg.maxConns, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
 	}
 	// JMAP (HTTP) + webmail SPA (same origin, so the SPA's /jmap/* fetches work).
 	if cfg.jmapAddr != "" {
@@ -304,12 +305,7 @@ func run() error {
 		mux.Handle("/webmail", webui.Handler())
 		mux.Handle("/webmail/", webui.Handler())
 		srv := &http.Server{Addr: cfg.jmapAddr, Handler: mux}
-		go func() {
-			log.Info("listening", "service", "jmap+webmail", "addr", cfg.jmapAddr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- fmt.Errorf("jmap: %w", err)
-			}
-		}()
+		go serveHTTP(log, "jmap+webmail", srv, cfg.maxConns, errc)
 		go func() { <-ctx.Done(); _ = srv.Close() }()
 	}
 	// Admin/account API + healthz (HTTP).
@@ -320,12 +316,7 @@ func run() error {
 		as := &webadmin.Server{Pool: s.Pool, Dir: dir, Reputation: repo, AdminToken: cfg.adminToken,
 			QueueFailDSN: failDSN.Generate}
 		srv := &http.Server{Addr: cfg.adminAddr, Handler: as.Handler()}
-		go func() {
-			log.Info("listening", "service", "admin", "addr", cfg.adminAddr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- fmt.Errorf("admin: %w", err)
-			}
-		}()
+		go serveHTTP(log, "admin", srv, cfg.maxConns, errc)
 		go func() { <-ctx.Done(); _ = srv.Close() }()
 	}
 
@@ -545,7 +536,7 @@ func run() error {
 // serveTCPListener serves on a pre-bound listener when ln != nil (used by the
 // privsep path, which binds privileged ports before dropping root); otherwise it
 // binds addr itself.
-func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, ln net.Listener, errc chan<- error, handle func(net.Conn)) {
+func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, ln net.Listener, errc chan<- error, maxConns int, handle func(net.Conn)) {
 	if ln == nil {
 		var err error
 		ln, err = net.Listen("tcp", addr)
@@ -556,6 +547,13 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 	}
 	log.Info("listening", "service", name, "addr", ln.Addr().String())
 	go func() { <-ctx.Done(); _ = ln.Close() }()
+	// sem bounds concurrent connections per listener so a flood of connections
+	// (each of which may buffer a whole message) can't exhaust memory/goroutines.
+	// A nil sem (maxConns <= 0) disables the cap.
+	var sem chan struct{}
+	if maxConns > 0 {
+		sem = make(chan struct{}, maxConns)
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -565,8 +563,86 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 			log.Warn("accept", "service", name, "err", err)
 			continue
 		}
-		go handle(conn)
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			default:
+				// At capacity: refuse fast rather than queue unboundedly.
+				log.Warn("connection cap reached, refusing", "service", name, "max", maxConns)
+				_ = conn.Close()
+				continue
+			}
+		}
+		go func() {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+			handle(conn)
+		}()
 	}
+}
+
+// serveHTTP runs an http.Server behind the same per-listener connection cap as
+// the TCP front doors and with slowloris-defeating timeouts. The JMAP/webmail and
+// admin HTTP listeners would otherwise be the only entry doors without a
+// connection cap, and MaxBytesReader/body caps don't fire until a request fully
+// arrives — so a trickle of headers could hold goroutines/FDs indefinitely.
+func serveHTTP(log *slog.Logger, name string, srv *http.Server, maxConns int, errc chan<- error) {
+	// Timeouts bound how long a slow client can hold a connection before its
+	// request completes (headers, whole request, and idle keep-alive).
+	if srv.ReadHeaderTimeout == 0 {
+		srv.ReadHeaderTimeout = 10 * time.Second
+	}
+	if srv.ReadTimeout == 0 {
+		srv.ReadTimeout = 60 * time.Second
+	}
+	if srv.IdleTimeout == 0 {
+		srv.IdleTimeout = 120 * time.Second
+	}
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		errc <- fmt.Errorf("%s listen %s: %w", name, srv.Addr, err)
+		return
+	}
+	if maxConns > 0 {
+		ln = &limitListener{Listener: ln, sem: make(chan struct{}, maxConns)}
+	}
+	log.Info("listening", "service", name, "addr", ln.Addr().String())
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		errc <- fmt.Errorf("%s: %w", name, err)
+	}
+}
+
+// limitListener caps the number of concurrent accepted connections; a slot is
+// released when the connection is closed. Unlike the TCP front doors' refuse-fast
+// semaphore, an HTTP listener blocks in Accept when full (returning an error from
+// Accept would tear the server down), so excess connections wait for a slot.
+type limitListener struct {
+	net.Listener
+	sem chan struct{}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	l.sem <- struct{}{} // blocks until a slot is free
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: l.sem}, nil
+}
+
+// limitConn releases its listener slot exactly once, on Close.
+type limitConn struct {
+	net.Conn
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { <-c.release })
+	return err
 }
 
 // runLoop calls fn every interval until ctx is done.

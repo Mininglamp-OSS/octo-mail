@@ -57,6 +57,9 @@ func (c *conn) readCatenate(first string) ([]byte, string, error) {
 		case "URL":
 			after = strings.TrimSpace(after)
 			urlTok, remainder := cutAString(after)
+			// resolveCatenateURL charges the referenced message's size against the
+			// per-command budget BEFORE reading it (see conn.fetchURLSection), so a
+			// URL part is bounded without first materializing it.
 			part, err := c.resolveCatenateURL(urlTok)
 			if err != nil {
 				return nil, "", err
@@ -158,15 +161,27 @@ func parseIMAPURLPath(url string) (mbName string, uid uint32, section string, er
 
 // fetchURLSection looks up a message by mailbox + uid within this account and
 // returns the referenced section bytes (whole message when section is empty).
+// It charges the referenced message's size against the per-command budget BEFORE
+// reading the blob, so an oversized (or repeatedly-referenced) URL part is
+// rejected without ever materializing it — keeping peak per-command allocation at
+// ~1×MaxSize rather than 2×.
 func (c *conn) fetchURLSection(mbName string, uid uint32, section string) ([]byte, error) {
-	return fetchURLSection(c.ctx, c.acc, mbName, uid, section)
+	msg, err := lookupURLMessage(c.ctx, c.acc, mbName, uid)
+	if err != nil {
+		return nil, err
+	}
+	// Charge the full stored size up front (a conservative upper bound even when a
+	// sub-section is requested) before the unbounded read below.
+	if !c.chargeBudget(msg.Size) {
+		return nil, errNo("[TOOBIG] CATENATE exceeds APPENDLIMIT")
+	}
+	return sectionBytes(c.acc, *msg, section), nil
 }
 
-// fetchURLSection looks up a message by mailbox + uid within an account and
-// returns the referenced section bytes (whole message when section is empty).
-// Standalone (ctx, Account) form so both IMAP (CATENATE/URLFETCH) and SMTP
-// (BURL) can resolve IMAP URLs without a connection.
-func fetchURLSection(ctx context.Context, acc store.Account, mbName string, uid uint32, section string) ([]byte, error) {
+// lookupURLMessage resolves an IMAP URL's (mailbox, uid) to a message row within
+// an account WITHOUT reading its body — so callers can consult msg.Size (from the
+// projection) before deciding to materialize it.
+func lookupURLMessage(ctx context.Context, acc store.Account, mbName string, uid uint32) (*store.Message, error) {
 	var msg *store.Message
 	err := acc.Tx(ctx, func(tx store.Tx) error {
 		mb, err := acc.MailboxFind(tx, mbName)
@@ -191,14 +206,31 @@ func fetchURLSection(ctx context.Context, acc store.Account, mbName string, uid 
 	if err != nil {
 		return nil, err
 	}
+	return msg, nil
+}
 
-	full := readMessageBytes(acc, *msg)
+// sectionBytes reads a message's bytes (whole message, or the referenced section).
+func sectionBytes(acc store.Account, msg store.Message, section string) []byte {
+	full := readMessageBytes(acc, msg)
 	if section == "" {
-		return full, nil
+		return full
 	}
 	// Reuse the FETCH body-section extractor for the referenced section.
 	sec := bodySection{spec: strings.ToUpper(urlDecode(section)), raw: "BODY[" + section + "]"}
-	return extractSection(full, sec), nil
+	return extractSection(full, sec)
+}
+
+// fetchURLSection looks up a message by mailbox + uid within an account and
+// returns the referenced section bytes (whole message when section is empty).
+// Standalone (ctx, Account) form so both IMAP (URLFETCH) and SMTP (BURL) can
+// resolve IMAP URLs without a connection. The connection-scoped CATENATE path
+// uses conn.fetchURLSection instead, which budgets the read.
+func fetchURLSection(ctx context.Context, acc store.Account, mbName string, uid uint32, section string) ([]byte, error) {
+	msg, err := lookupURLMessage(ctx, acc, mbName, uid)
+	if err != nil {
+		return nil, err
+	}
+	return sectionBytes(acc, *msg, section), nil
 }
 
 // readMessageBytes reads a message's full bytes (MsgPrefix + blob) via the store.
