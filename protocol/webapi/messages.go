@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -45,8 +44,18 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 	offset := atoiDefault(q.Get("offset"), 0)
 
 	var out []messageSummary
+	var total int
 	err := a.acc.Tx(ctx, func(tx store.Tx) error {
-		mq := tx.QueryMessage()
+		// Build the filtered, email-deduped query once; Count gives the true total,
+		// then the same filter is sorted + paged in SQL. No whole-account load, no
+		// per-row body parse (summarize reads the projection columns).
+		filter := func() store.MessageQuery {
+			mq := tx.QueryMessage().DistinctEmail()
+			if search != "" {
+				mq = mq.FilterFTS(search)
+			}
+			return mq
+		}
 		if mailbox != "" {
 			mb, e := a.acc.MailboxFind(tx, mailbox)
 			if e != nil {
@@ -55,25 +64,21 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 			if mb == nil {
 				return errStatus(http.StatusNotFound, "not_found", "no such mailbox")
 			}
-			mq = mq.FilterMailbox(mb.ID)
+			// Re-apply the mailbox filter on each builder instance below.
+			base := filter
+			filter = func() store.MessageQuery { return base().FilterMailbox(mb.ID) }
 		}
-		if search != "" {
-			mq = mq.FilterFTS(search)
-		}
-		msgs, e := mq.SortUID().List()
+		n, e := filter().Count()
 		if e != nil {
 			return e
 		}
-		// Newest first; dedup by email group.
-		sort.SliceStable(msgs, func(i, j int) bool { return msgs[i].Received.After(msgs[j].Received) })
+		total = n
+		msgs, e := filter().SortReceivedDesc().Limit(limit).Offset(offset).List()
+		if e != nil {
+			return e
+		}
 		mbNames := mailboxNames(tx, a.acc)
-		seen := map[int64]bool{}
 		for _, m := range msgs {
-			gid := m.EffectiveEmailID()
-			if seen[gid] {
-				continue
-			}
-			seen[gid] = true
 			out = append(out, summarize(a.acc, m, mbNames))
 		}
 		return nil
@@ -81,8 +86,6 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 	if err != nil {
 		return 0, nil, err
 	}
-	total := len(out)
-	out = page(out, offset, limit)
 	if out == nil {
 		out = []messageSummary{}
 	}
@@ -363,20 +366,30 @@ func (s *Server) deleteMessage(ctx context.Context, a authCtx, r *http.Request) 
 // --- message helpers ---
 
 func summarize(acc store.Account, m store.Message, mbNames map[int64]string) messageSummary {
-	br := acc.MessageReader(m)
-	data, _ := io.ReadAll(br)
-	br.Close()
-	env := parseEnvelope(data)
+	// Prefer the denormalized summary columns (H13); fall back to an on-the-fly
+	// body parse only for rows the projection hasn't folded yet (recently
+	// delivered), so the common case does no blob read/MIME parse.
+	subject, from, to, preview := m.Subject, m.FromAddr, splitAddrs(m.ToAddrs), m.Preview
+	if !m.SummaryFolded {
+		br := acc.MessageReader(m)
+		data, _ := io.ReadAll(br)
+		br.Close()
+		env := parseEnvelope(data)
+		subject, from, to, preview = env.subject, env.from, env.to, previewText(data)
+	}
 	sum := messageSummary{
 		ID:       emailID(m),
 		Mailbox:  mbNames[m.MailboxID],
-		Subject:  env.subject,
-		From:     env.from,
-		To:       env.to,
-		Preview:  previewText(data),
+		Subject:  subject,
+		From:     from,
+		To:       to,
+		Preview:  preview,
 		Size:     m.Size,
 		Keywords: m.Flags.IMAPFlags(m.Keywords),
 		Unread:   !m.Flags.Seen,
+	}
+	if sum.To == nil {
+		sum.To = []string{}
 	}
 	if sum.Keywords == nil {
 		sum.Keywords = []string{}
@@ -388,6 +401,14 @@ func summarize(acc store.Account, m store.Message, mbNames map[int64]string) mes
 		sum.ReceivedAt = m.Received.UTC().Format("2006-01-02T15:04:05Z")
 	}
 	return sum
+}
+
+// splitAddrs splits the space-joined to_addrs column back into a list.
+func splitAddrs(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Fields(s)
 }
 
 func mailboxNames(tx store.Tx, acc store.Account) map[int64]string {
@@ -597,15 +618,4 @@ func atoiDefault(s string, def int) int {
 		return def
 	}
 	return n
-}
-
-func page[T any](xs []T, offset, limit int) []T {
-	if offset > len(xs) {
-		offset = len(xs)
-	}
-	xs = xs[offset:]
-	if limit > 0 && limit < len(xs) {
-		xs = xs[:limit]
-	}
-	return xs
 }

@@ -3,7 +3,9 @@ package projection_test
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/projection"
@@ -129,6 +131,28 @@ func TestThreadingProjectionAndRebuild(t *testing.T) {
 	}
 	firstThread := conv[0]
 
+	// H13 PR2: the fold also populates the denormalized summary columns from the
+	// same parse. Verify subject/preview/summary_folded for the root message.
+	checkSummary := func(when string) {
+		var subject, preview string
+		var folded bool
+		if err := s.Pool.QueryRow(ctx,
+			`SELECT subject, preview, summary_folded FROM messages WHERE account_id=$1 ORDER BY id LIMIT 1`,
+			accID).Scan(&subject, &preview, &folded); err != nil {
+			t.Fatal(err)
+		}
+		if !folded {
+			t.Fatalf("%s: root summary_folded=false, want true", when)
+		}
+		if subject != "hello" {
+			t.Fatalf("%s: root subject=%q, want 'hello'", when, subject)
+		}
+		if !strings.Contains(preview, "root body") {
+			t.Fatalf("%s: root preview=%q, want to contain 'root body'", when, preview)
+		}
+	}
+	checkSummary("after fold")
+
 	// Rebuild from zero reproduces the identical grouping.
 	if err := w.RebuildAccount(ctx, tenantID, accID); err != nil {
 		t.Fatalf("rebuild: %v", err)
@@ -143,5 +167,67 @@ func TestThreadingProjectionAndRebuild(t *testing.T) {
 	if other2 == conv2[0] {
 		t.Fatalf("after rebuild, unrelated joined conversation")
 	}
-	t.Logf("OK: reply chain collapsed to thread %d; unrelated separate; rebuild-from-zero identical", firstThread)
+	checkSummary("after rebuild")
+	t.Logf("OK: reply chain collapsed to thread %d; unrelated separate; rebuild-from-zero identical; summary columns populated + repopulated", firstThread)
+}
+
+// TestFoldPreviewUTF8Safe proves the H13 PR2 fix for the projection-wedge bug: a
+// body whose 140-byte cut falls mid-rune must not produce invalid UTF-8, which a
+// Postgres text column would reject and stall the fold forever. The preview is
+// truncated on a rune boundary and stored without error.
+func TestFoldPreviewUTF8Safe(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, fts, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`).Scan(&tenantID)
+	s.Pool.QueryRow(ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, tenantID).Scan(&accID)
+	s.Pool.QueryRow(ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, tenantID).Scan(&domID)
+	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	dir := s.NewDirectory()
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, err := dir.ResolveInbound(ctx, addr.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Body of many 3-byte runes (は = E3 81 AF): the 140th byte lands mid-rune.
+	body := strings.Repeat("は", 200)
+	raw := "Message-ID: <u@example.com>\r\nSubject: 件名テスト\r\n\r\n" + body + "\r\n"
+	if _, err := target.Deliver(ctx, &store.Message{}, mem(raw)); err != nil {
+		t.Fatal(err)
+	}
+	w := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 10}
+	if err := w.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatalf("fold must not error on multibyte body (UTF-8 truncation): %v", err)
+	}
+	var preview, subject string
+	var folded bool
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT preview, subject, summary_folded FROM messages WHERE account_id=$1 ORDER BY id LIMIT 1`,
+		accID).Scan(&preview, &subject, &folded); err != nil {
+		t.Fatal(err)
+	}
+	if !folded {
+		t.Fatal("row not folded — fold stalled")
+	}
+	if !utf8.ValidString(preview) || !utf8.ValidString(subject) {
+		t.Fatalf("stored summary is not valid UTF-8: preview=%q subject=%q", preview, subject)
+	}
+	if len(preview) > 140 {
+		t.Fatalf("preview = %d bytes, want <= 140", len(preview))
+	}
+	if subject != "件名テスト" {
+		t.Fatalf("subject = %q, want 件名テスト", subject)
+	}
+	t.Logf("OK: multibyte body folded without error; preview valid UTF-8 (%d bytes), subject intact", len(preview))
 }

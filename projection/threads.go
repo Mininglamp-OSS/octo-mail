@@ -12,11 +12,13 @@
 package projection
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net/mail"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -86,7 +88,7 @@ func (w *ThreadWorker) RunOnceAccount(ctx context.Context, tenantID, accountID i
 
 	maxSeq := cursor
 	for _, m := range msgs {
-		refs, err := w.references(ctx, tenantID, m.blobRef, m.prefix)
+		refs, sum, err := w.parseMessage(ctx, tenantID, m.blobRef, m.prefix)
 		if err != nil {
 			return 0, err
 		}
@@ -95,7 +97,10 @@ func (w *ThreadWorker) RunOnceAccount(ctx context.Context, tenantID, accountID i
 			return 0, err
 		}
 		if _, err := w.Pool.Exec(ctx,
-			`UPDATE messages SET thread_id=$1 WHERE id=$2`, threadID, m.id); err != nil {
+			`UPDATE messages SET thread_id=$1,
+			   subject=$3, from_addr=$4, to_addrs=$5, preview=$6, summary_folded=true
+			 WHERE id=$2`,
+			threadID, m.id, sum.subject, sum.from, sum.to, sum.preview); err != nil {
 			return 0, err
 		}
 		if m.seq > maxSeq {
@@ -149,38 +154,146 @@ func (w *ThreadWorker) assignThread(ctx context.Context, accountID, msgID int64,
 	return threadID, nil
 }
 
-// references extracts the canonical Message-ID plus all In-Reply-To/References
-// ids from a stored message.
-func (w *ThreadWorker) references(ctx context.Context, tenantID int64, blobRef string, prefix []byte) ([]string, error) {
+// msgSummary holds the denormalized list-summary fields extracted during the fold.
+type msgSummary struct {
+	subject string
+	from    string // first From address as user@host
+	to      string // space-joined To addresses
+	preview string // first ~140 chars of body text
+}
+
+// parseMessage reads a stored message once and extracts BOTH its threading
+// references (canonical Message-ID + In-Reply-To/References) AND its list-summary
+// fields (subject/from/to/preview), so the fold populates thread_id and the
+// summary columns from a single blob read + parse.
+func (w *ThreadWorker) parseMessage(ctx context.Context, tenantID int64, blobRef string, prefix []byte) ([]string, msgSummary, error) {
 	r, err := w.Blob.Open(ctx, tenantID, blob.Ref(blobRef))
 	if err != nil {
-		return nil, err
+		return nil, msgSummary{}, err
 	}
 	defer r.Close()
 	body, err := io.ReadAll(r)
 	if err != nil {
-		return nil, err
+		return nil, msgSummary{}, err
 	}
 	full := append(append([]byte{}, prefix...), body...)
-	msg, err := mail.ReadMessage(strings.NewReader(string(full)))
-	if err != nil {
-		// Unparseable header: no references, threads to itself.
-		return nil, nil
+
+	var refs []string
+	var sum msgSummary
+
+	// Headers + references via the stdlib parser (matches the prior behavior).
+	if msg, err := mail.ReadMessage(strings.NewReader(string(full))); err == nil {
+		seen := map[string]bool{}
+		add := func(raw string) {
+			for _, tok := range splitIDs(raw) {
+				if c, _, err := moxmessage.MessageIDCanonical(tok); err == nil && c != "" && !seen[c] {
+					seen[c] = true
+					refs = append(refs, c)
+				}
+			}
+		}
+		add(msg.Header.Get("Message-Id"))
+		add(msg.Header.Get("In-Reply-To"))
+		add(msg.Header.Get("References"))
 	}
-	seen := map[string]bool{}
-	var out []string
-	add := func(raw string) {
-		for _, tok := range splitIDs(raw) {
-			if c, _, err := moxmessage.MessageIDCanonical(tok); err == nil && c != "" && !seen[c] {
-				seen[c] = true
-				out = append(out, c)
+	// else: unparseable header → threads to itself, empty summary.
+
+	// Structured envelope + body preview via mox's parser (one parse of full).
+	if part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(full), int64(len(full))); err == nil || part.Envelope != nil {
+		if env := part.Envelope; env != nil {
+			sum.subject = env.Subject
+			if len(env.From) > 0 {
+				sum.from = env.From[0].User + "@" + env.From[0].Host
+			}
+			var tos []string
+			for _, a := range env.To {
+				tos = append(tos, a.User+"@"+a.Host)
+			}
+			sum.to = strings.Join(tos, " ")
+		}
+		sum.preview = previewOf(&part)
+	}
+	// Header-derived fields can contain invalid UTF-8 (malformed/encoded headers);
+	// a Postgres text column rejects it, which would fail the whole fold. Scrub to
+	// valid UTF-8 defensively (preview is already clean via previewOf).
+	sum.subject = toValidUTF8(sum.subject)
+	sum.from = toValidUTF8(sum.from)
+	sum.to = toValidUTF8(sum.to)
+	return refs, sum, nil
+}
+
+// toValidUTF8 replaces invalid UTF-8 bytes so the value is safe for a text column.
+func toValidUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "")
+}
+
+// previewOf returns the first ~140 chars of a message's text body (falling back
+// to stripped HTML), whitespace-collapsed — the list-view preview snippet.
+func previewOf(part *moxmessage.Part) string {
+	var text, html string
+	var walk func(p *moxmessage.Part)
+	walk = func(p *moxmessage.Part) {
+		if len(p.Parts) > 0 {
+			for i := range p.Parts {
+				walk(&p.Parts[i])
+			}
+			return
+		}
+		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
+			return
+		}
+		rd := p.Reader()
+		if rd == nil {
+			return
+		}
+		b, _ := io.ReadAll(rd)
+		if strings.EqualFold(p.MediaSubType, "HTML") {
+			if html == "" {
+				html = string(b)
+			}
+		} else if text == "" {
+			text = string(b)
+		}
+	}
+	walk(part)
+	s := text
+	if s == "" {
+		s = stripHTMLTags(html)
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	// Truncate on a rune boundary (not a byte offset): a mid-rune byte slice would
+	// yield invalid UTF-8, which a Postgres text column rejects.
+	if len(s) > 140 {
+		s = s[:140]
+		for len(s) > 0 && !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
+
+// stripHTMLTags removes tags for a text preview of an HTML-only body.
+func stripHTMLTags(s string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
 			}
 		}
 	}
-	add(msg.Header.Get("Message-Id"))
-	add(msg.Header.Get("In-Reply-To"))
-	add(msg.Header.Get("References"))
-	return out, nil
+	return b.String()
 }
 
 // splitIDs splits a header value into individual <id> tokens.
@@ -217,7 +330,10 @@ func (w *ThreadWorker) DrainAccount(ctx context.Context, tenantID, accountID int
 // RebuildAccount clears thread_id + thread_refs and resets the cursor, re-folding
 // the whole log from seq 0.
 func (w *ThreadWorker) RebuildAccount(ctx context.Context, tenantID, accountID int64) error {
-	if _, err := w.Pool.Exec(ctx, `UPDATE messages SET thread_id=NULL WHERE account_id=$1`, accountID); err != nil {
+	if _, err := w.Pool.Exec(ctx,
+		`UPDATE messages SET thread_id=NULL, summary_folded=false,
+		   subject='', from_addr='', to_addrs='', preview=''
+		 WHERE account_id=$1`, accountID); err != nil {
 		return err
 	}
 	if _, err := w.Pool.Exec(ctx, `DELETE FROM thread_refs WHERE account_id=$1`, accountID); err != nil {

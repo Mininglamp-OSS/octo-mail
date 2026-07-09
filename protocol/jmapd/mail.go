@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -136,92 +135,83 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 	position := int(jsonNum(inv.args["position"]))
 	limit := int(jsonNum(inv.args["limit"]))
 
-	// Precompute fts hits for a text/body term if present. Keyed by message ID
-	// (globally unique) — NOT UID, which is only unique per mailbox and would
-	// collide across mailboxes when no inMailbox filter is set.
-	var ftsHits map[int64]bool
-	if filt.text != "" {
-		ftsHits = map[int64]bool{}
-		_ = acc.Tx(ctx, func(tx store.Tx) error {
-			q := tx.QueryMessage()
-			if filt.mailboxID != 0 {
-				q = q.FilterMailbox(filt.mailboxID)
-			}
-			ms, e := q.FilterFTS(filt.text).List()
-			if e != nil {
-				return e
-			}
-			for _, mm := range ms {
-				ftsHits[mm.ID] = true
-			}
-			return nil
-		})
-	}
-
-	type row struct {
-		id  string
-		rcv int64
-		sz  int64
-	}
-	var rows []row
-	err := acc.Tx(ctx, func(tx store.Tx) error {
-		q := tx.QueryMessage()
+	// Build the filter query in SQL: header substrings hit the denormalized
+	// summary columns, size/date/keyword hit their columns, text/body hits the fts
+	// projection — so no message body is parsed and the whole account is not
+	// loaded. Email-group dedup, sort, and paging are pushed down too.
+	build := func(tx store.Tx) store.MessageQuery {
+		q := tx.QueryMessage().DistinctEmail()
 		if filt.mailboxID != 0 {
 			q = q.FilterMailbox(filt.mailboxID)
 		}
-		msgs, e := q.SortUID().List()
+		if filt.text != "" {
+			q = q.FilterFTS(filt.text)
+		}
+		if filt.subject != "" {
+			q = q.FilterSubject(filt.subject)
+		}
+		if filt.from != "" {
+			q = q.FilterFrom(filt.from)
+		}
+		if filt.to != "" {
+			q = q.FilterTo(filt.to)
+		}
+		if filt.after != "" || filt.before != "" {
+			q = q.FilterReceivedRange(filt.after, filt.before)
+		}
+		if filt.minSize > 0 || filt.maxSize > 0 {
+			q = q.FilterSizeRange(filt.minSize, filt.maxSize)
+		}
+		if filt.hasKeyword != "" {
+			q = q.FilterKeyword(filt.hasKeyword, true)
+		}
+		if filt.notKeyword != "" {
+			q = q.FilterKeyword(filt.notKeyword, false)
+		}
+		return q
+	}
+	sortIt := func(q store.MessageQuery) store.MessageQuery {
+		if sortProp == "size" {
+			if sortAsc {
+				return q.SortSizeAsc()
+			}
+			return q.SortSizeDesc()
+		}
+		if sortAsc {
+			return q.SortReceivedAsc()
+		}
+		return q.SortReceivedDesc()
+	}
+
+	var ids []string
+	var total int
+	err := acc.Tx(ctx, func(tx store.Tx) error {
+		n, e := build(tx).Count()
 		if e != nil {
 			return e
 		}
-		// Dedup by email group: one row may match per mailbox, but an Email is a
-		// single object. Keep the first matching row per effective email id.
-		seen := map[int64]bool{}
+		total = n
+		if position < 0 {
+			position = 0
+		}
+		q := sortIt(build(tx)).Offset(position)
+		if limit > 0 {
+			q = q.Limit(limit)
+		}
+		msgs, e := q.List()
+		if e != nil {
+			return e
+		}
 		for _, m := range msgs {
-			if !s.emailMatchesFilter(acc, m, filt, ftsHits) {
-				continue
-			}
-			gid := m.EffectiveEmailID()
-			if seen[gid] {
-				continue
-			}
-			seen[gid] = true
-			rows = append(rows, row{id: emailID(m), rcv: m.Received.UnixNano(), sz: m.Size})
+			ids = append(ids, emailID(m))
 		}
 		return nil
 	})
 	if err != nil {
 		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
 	}
-
-	// Sort.
-	sort.SliceStable(rows, func(i, j int) bool {
-		var less bool
-		switch sortProp {
-		case "size":
-			less = rows[i].sz < rows[j].sz
-		default: // receivedAt
-			less = rows[i].rcv < rows[j].rcv
-		}
-		if !sortAsc {
-			return !less
-		}
-		return less
-	})
-
-	total := len(rows)
-	if position < 0 {
-		position = 0
-	}
-	if position > len(rows) {
-		position = len(rows)
-	}
-	rows = rows[position:]
-	if limit > 0 && limit < len(rows) {
-		rows = rows[:limit]
-	}
-	ids := make([]string, 0, len(rows))
-	for _, r := range rows {
-		ids = append(ids, r.id)
+	if ids == nil {
+		ids = []string{}
 	}
 
 	st, _ := accountState(ctx, acc)
@@ -298,84 +288,6 @@ func parseEmailSort(raw json.RawMessage) (prop string, asc bool) {
 		_ = json.Unmarshal(v, &asc)
 	}
 	return
-}
-
-// emailMatchesFilter evaluates the non-mailbox filter predicates for a message.
-func (s *Server) emailMatchesFilter(acc store.Account, m store.Message, f emailFilter, ftsHits map[int64]bool) bool {
-	if f.minSize > 0 && m.Size < f.minSize {
-		return false
-	}
-	if f.maxSize > 0 && m.Size > f.maxSize {
-		return false
-	}
-	if f.after != "" && !m.Received.IsZero() && m.Received.UTC().Format("2006-01-02T15:04:05Z") < f.after {
-		return false
-	}
-	if f.before != "" && !m.Received.IsZero() && m.Received.UTC().Format("2006-01-02T15:04:05Z") >= f.before {
-		return false
-	}
-	if f.hasKeyword != "" && !hasKeyword(m, f.hasKeyword) {
-		return false
-	}
-	if f.notKeyword != "" && hasKeyword(m, f.notKeyword) {
-		return false
-	}
-	if f.text != "" && (ftsHits == nil || !ftsHits[m.ID]) {
-		return false
-	}
-	// Header substring filters need the parsed message.
-	if f.from != "" || f.to != "" || f.subject != "" {
-		br := acc.MessageReader(m)
-		data, _ := io.ReadAll(br)
-		br.Close()
-		part, _ := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
-		env := part.Envelope
-		if env == nil {
-			return false
-		}
-		if f.subject != "" && !strings.Contains(strings.ToLower(env.Subject), strings.ToLower(f.subject)) {
-			return false
-		}
-		if f.from != "" && !addrsContain(env.From, f.from) {
-			return false
-		}
-		if f.to != "" && !addrsContain(env.To, f.to) {
-			return false
-		}
-	}
-	return true
-}
-
-func addrsContain(as []moxmessage.Address, sub string) bool {
-	sub = strings.ToLower(sub)
-	for _, a := range as {
-		if strings.Contains(strings.ToLower(a.Name+" "+a.User+"@"+a.Host), sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasKeyword reports whether a message has the given JMAP keyword ($seen etc).
-func hasKeyword(m store.Message, kw string) bool {
-	switch strings.ToLower(kw) {
-	case "$seen":
-		return m.Seen
-	case "$flagged":
-		return m.Flagged
-	case "$answered":
-		return m.Answered
-	case "$draft":
-		return m.Draft
-	case "$junk":
-		return m.Junk
-	}
-	for _, k := range m.Keywords {
-		if strings.EqualFold(k, kw) {
-			return true
-		}
-	}
-	return false
 }
 
 func jsonNum(raw json.RawMessage) int64 {

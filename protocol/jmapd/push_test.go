@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
+	"github.com/Mininglamp-OSS/octo-mail/projection"
 	"github.com/Mininglamp-OSS/octo-mail/protocol/jmapd"
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 	"github.com/Mininglamp-OSS/octo-mail/storage/postgres"
@@ -26,7 +27,7 @@ func TestEmailQueryFilterSort(t *testing.T) {
 		t.Skipf("postgres not available (%v)", err)
 	}
 	defer s.Close()
-	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	var tenantID, accID, domID int64
@@ -52,6 +53,14 @@ func TestEmailQueryFilterSort(t *testing.T) {
 	deliver("alice@remote.example", "invoice", 10)
 	deliver("bob@remote.example", "lunch", 5000)
 	deliver("alice@remote.example", "report", 1000)
+
+	// Fold the projection so the denormalized summary columns (subject/from/…)
+	// that Email/query's header filters read are populated — same async contract
+	// as threadId/fts (recently delivered mail lags until folded).
+	tw := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 10}
+	if err := tw.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatal(err)
+	}
 
 	js := &jmapd.Server{Dir: dir, BaseURL: "http://jmap.test"}
 	hs := httptest.NewServer(js.Handler())

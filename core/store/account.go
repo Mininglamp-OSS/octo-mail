@@ -171,10 +171,31 @@ type MessageQuery interface {
 	FilterFTS(query string) MessageQuery
 	// FilterThread restricts to messages in the given thread (indexed).
 	FilterThread(id int64) MessageQuery
+	// FilterSubject/FilterFrom/FilterTo are case-insensitive substring matches on
+	// the denormalized summary columns (H13), so header searches run in SQL rather
+	// than parsing every body.
+	FilterSubject(substr string) MessageQuery
+	FilterFrom(substr string) MessageQuery
+	FilterTo(substr string) MessageQuery
+	// FilterReceivedRange bounds received time; each RFC3339 bound is optional ("").
+	FilterReceivedRange(after, before string) MessageQuery
+	// FilterSizeRange bounds message size; each bound is optional (0 = unbounded).
+	FilterSizeRange(min, max int64) MessageQuery
+	// FilterKeyword matches messages that have (want=true) or lack (want=false) an
+	// IMAP/JMAP keyword.
+	FilterKeyword(kw string, want bool) MessageQuery
 	SortUID() MessageQuery
 	// SortReceivedDesc orders newest-first by received time (ties broken by id),
 	// so list endpoints can page in SQL instead of loading + sorting in Go.
 	SortReceivedDesc() MessageQuery
+	// SortReceivedAsc orders oldest-first by received time (ties broken by id).
+	SortReceivedAsc() MessageQuery
+	// SortSizeDesc / SortSizeAsc order by message size (ties broken by id).
+	SortSizeDesc() MessageQuery
+	SortSizeAsc() MessageQuery
+	// DistinctEmail collapses sibling rows of one JMAP Email (shared email_id) to a
+	// single row, so LIMIT/OFFSET paging and Count over Emails are correct.
+	DistinctEmail() MessageQuery
 	Limit(n int) MessageQuery
 	// Offset skips the first n rows (for LIMIT/OFFSET paging pushed into SQL).
 	Offset(n int) MessageQuery
