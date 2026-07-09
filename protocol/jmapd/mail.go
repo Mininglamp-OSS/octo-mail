@@ -840,35 +840,31 @@ func (s *Server) threadGet(ctx context.Context, acc store.Account, inv invocatio
 	var list []map[string]any
 	var notFound []string
 	err := acc.Tx(ctx, func(tx store.Tx) error {
-		// Load all messages once; group by threadId.
-		msgs, e := tx.QueryMessage().SortUID().List()
-		if e != nil {
-			return e
-		}
-		byThread := map[int64][]string{}
-		seen := map[int64]map[int64]bool{} // threadID -> set of effective email ids
-		for _, m := range msgs {
-			tid := m.ThreadID
-			gid := m.EffectiveEmailID()
-			if seen[tid] == nil {
-				seen[tid] = map[int64]bool{}
-			}
-			if seen[tid][gid] {
-				continue // sibling in another mailbox: same Email, list once
-			}
-			seen[tid][gid] = true
-			byThread[tid] = append(byThread[tid], emailID(m))
-		}
 		for _, id := range ids {
 			tid, ok := parseThreadID(id)
 			if !ok {
 				notFound = append(notFound, id)
 				continue
 			}
-			emails, present := byThread[tid]
-			if !present {
+			// Push the thread filter into SQL (indexed by messages_thread_idx)
+			// instead of loading the whole account and grouping in Go.
+			msgs, e := tx.QueryMessage().FilterThread(tid).SortUID().List()
+			if e != nil {
+				return e
+			}
+			if len(msgs) == 0 {
 				notFound = append(notFound, id)
 				continue
+			}
+			var emails []string
+			seen := map[int64]bool{} // effective email ids (dedup siblings across mailboxes)
+			for _, m := range msgs {
+				gid := m.EffectiveEmailID()
+				if seen[gid] {
+					continue // sibling in another mailbox: same Email, list once
+				}
+				seen[gid] = true
+				emails = append(emails, emailID(m))
 			}
 			list = append(list, map[string]any{"id": id, "emailIds": emails})
 		}

@@ -169,8 +169,15 @@ type MessageQuery interface {
 	FilterModSeqGreater(m ModSeq) MessageQuery
 	FilterFlags(mask, want Flags) MessageQuery
 	FilterFTS(query string) MessageQuery
+	// FilterThread restricts to messages in the given thread (indexed).
+	FilterThread(id int64) MessageQuery
 	SortUID() MessageQuery
+	// SortReceivedDesc orders newest-first by received time (ties broken by id),
+	// so list endpoints can page in SQL instead of loading + sorting in Go.
+	SortReceivedDesc() MessageQuery
 	Limit(n int) MessageQuery
+	// Offset skips the first n rows (for LIMIT/OFFSET paging pushed into SQL).
+	Offset(n int) MessageQuery
 
 	ForEach(fn func(Message) error) error
 	List() ([]Message, error)
