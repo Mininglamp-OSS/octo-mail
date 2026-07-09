@@ -179,6 +179,17 @@ func (q *msgQuery) FilterFolded() store.MessageQuery {
 	q.wheres = append(q.wheres, "summary_folded")
 	return q
 }
+func (q *msgQuery) FilterEmailGroupIn(groupIDs []int64) store.MessageQuery {
+	if len(groupIDs) == 0 {
+		// Empty set matches nothing; a bare "IN ()" is a syntax error, so use a
+		// constant-false predicate.
+		q.wheres = append(q.wheres, "false")
+		return q
+	}
+	q.args = append(q.args, groupIDs)
+	q.wheres = append(q.wheres, emailGroupExpr+" = ANY($"+itoaPos(len(q.args))+")")
+	return q
+}
 
 // ilikeContains adds a case-insensitive substring match on col, escaping the
 // LIKE metacharacters %, _ and \ in the user input so they match literally.

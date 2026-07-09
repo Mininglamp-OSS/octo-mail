@@ -254,13 +254,28 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 			}
 		}
 
-		// Accurate total: folded matches counted in SQL (not capped) + the distinct
-		// live matches (which by definition aren't folded, so they don't overlap).
+		// Accurate total, deduped at the EMAIL-GROUP granularity. foldedTotal counts
+		// distinct folded groups; len(live) counts distinct unfolded groups. These are
+		// row-disjoint (FilterFolded vs FilterUnfolded) but a copied message mid-fold
+		// can have a folded sibling AND an unfolded sibling sharing one email_id — so
+		// the same group appears in both. Subtract that overlap: the count of live
+		// groups that also have a folded matching sibling.
 		foldedTotal, e := build(tx).Count()
 		if e != nil {
 			return e
 		}
 		total = foldedTotal + len(live)
+		if len(live) > 0 {
+			liveGids := make([]int64, 0, len(live))
+			for _, r := range live {
+				liveGids = append(liveGids, r.gid)
+			}
+			overlap, e := build(tx).FilterEmailGroupIn(liveGids).Count()
+			if e != nil {
+				return e
+			}
+			total -= overlap
+		}
 
 		if len(live) == 0 {
 			// Fast path: no unfolded matches — page entirely in SQL, so total/paging

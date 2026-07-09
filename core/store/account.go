@@ -180,6 +180,12 @@ type MessageQuery interface {
 	// also evaluates the unfolded set live, so the SQL (folded) and live (unfolded)
 	// result sets are provably disjoint and totals don't double-count.
 	FilterFolded() MessageQuery
+	// FilterEmailGroupIn restricts to rows whose email group — COALESCE(email_id, id)
+	// — is in the given set. Used to compute the overlap between the folded (SQL) and
+	// live (unfolded) result sets at the EMAIL-GROUP granularity: a copied message
+	// mid-fold has one folded and one unfolded sibling sharing email_id, so the two
+	// row-disjoint sets can still share a group; the total must dedup on the group.
+	FilterEmailGroupIn(groupIDs []int64) MessageQuery
 	// FilterSubject/FilterFrom/FilterTo are case-insensitive substring matches on
 	// the denormalized summary columns (H13), so header searches run in SQL rather
 	// than parsing every body.

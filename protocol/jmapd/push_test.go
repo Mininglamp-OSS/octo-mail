@@ -363,3 +363,73 @@ func TestEmailQueryKeywordTotalNoDoubleCount(t *testing.T) {
 	}
 	t.Logf("OK: keyword filter total counts folded+unfolded rows once (no double count) for hasKeyword and notKeyword")
 }
+
+// TestEmailQueryCopiedEmailTotalNoDoubleCount proves the email-group-dimension
+// fix: a copied (multi-mailbox) message has two rows sharing one email_id. When
+// one sibling is folded and the other is not (the fold-lag window), the folded
+// row lands in foldedTotal and the unfolded row lands in the live set — the same
+// Email counted twice by a row-level partition. total must dedup on the email
+// group, so a single copied Email reports total=1 (matching its single id).
+func TestEmailQueryCopiedEmailTotalNoDoubleCount(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	sc(t, s, ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`, &tenantID)
+	sc(t, s, ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, &accID, tenantID)
+	sc(t, s, ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, &domID, tenantID)
+	ex(t, s, ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	ex(t, s, ctx, `INSERT INTO principals (tenant_id, login) VALUES ($1,'u1@example.com')`, tenantID)
+	dir := s.NewDirectory()
+	if err := dir.SetPassword(ctx, "u1@example.com", "x"); err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, _ := dir.ResolveInbound(ctx, addr.Path())
+	if _, err := target.Deliver(ctx, &store.Message{}, mem("Message-ID: <m@example.com>\r\nFrom: alice@remote.example\r\nTo: u1@example.com\r\nSubject: shared\r\n\r\nbody\r\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	js := &jmapd.Server{Dir: dir, BaseURL: "http://jmap.test"}
+	hs := httptest.NewServer(js.Handler())
+	defer hs.Close()
+
+	// Copy the email into a second mailbox → two rows sharing one email_id.
+	cr := call(t, hs.URL, `["Mailbox/set", {"accountId":"`+itoa(accID)+`","create":{"a":{"name":"Archive"}}}, "c1"]`)
+	archiveID := cr["created"].(map[string]any)["a"].(map[string]any)["id"].(string)
+	call(t, hs.URL, `["Email/set", {"accountId":"`+itoa(accID)+`","update":{"E1":{"mailboxIds/`+archiveID+`":true}}}, "c2"]`)
+	var nRows int
+	sc(t, s, ctx, `SELECT count(*) FROM messages WHERE account_id=$1 AND NOT expunged`, &nRows, accID)
+	if nRows != 2 {
+		t.Fatalf("precondition: want 2 rows (copied email), got %d", nRows)
+	}
+
+	// Put a custom keyword on BOTH rows, and fold EXACTLY ONE sibling — the
+	// straddling state: one folded row + one unfolded row, same email_id.
+	ex(t, s, ctx, `UPDATE messages SET keywords=ARRAY['important'] WHERE account_id=$1`, accID)
+	ex(t, s, ctx, `UPDATE messages SET summary_folded=true, subject='shared', from_search='alice@remote.example'
+	     WHERE account_id=$1 AND id=(SELECT min(id) FROM messages WHERE account_id=$1)`, accID)
+	ex(t, s, ctx, `UPDATE messages SET summary_folded=false WHERE account_id=$1 AND id=(SELECT max(id) FROM messages WHERE account_id=$1)`, accID)
+
+	// hasKeyword: one Email, folded+unfolded siblings — total must be 1, not 2.
+	q := call(t, hs.URL, `["Email/query", {"accountId":"`+itoa(accID)+`","filter":{"hasKeyword":"important"}}, "c3"]`)
+	ids := toStrings(q["ids"])
+	if len(ids) != 1 {
+		t.Fatalf("copied-email hasKeyword ids = %v, want exactly [E1] (one Email)", ids)
+	}
+	if tot := int(q["total"].(float64)); tot != 1 {
+		t.Fatalf("copied-email hasKeyword total = %d, want 1 (email-group double-count: folded+unfolded siblings)", tot)
+	}
+	// total must equal len(ids) — the internal-consistency invariant RFC 8621 paging relies on.
+	if tot := int(q["total"].(float64)); tot != len(ids) {
+		t.Fatalf("total (%d) != len(ids) (%d) — inconsistent", tot, len(ids))
+	}
+	t.Logf("OK: a copied email straddling the fold boundary is counted once in total (email-group dedup)")
+}
