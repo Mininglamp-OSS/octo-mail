@@ -21,11 +21,12 @@ import (
 func openBlobStore(cfg config, log *slog.Logger) (blob.Store, error) {
 	if cfg.s3Endpoint != "" {
 		bs, err := blob.NewS3(blob.S3Config{
-			Endpoint:  cfg.s3Endpoint,
-			Region:    cfg.s3Region,
-			Bucket:    cfg.s3Bucket,
-			AccessKey: cfg.s3Access,
-			SecretKey: cfg.s3Secret,
+			Endpoint:     cfg.s3Endpoint,
+			Region:       cfg.s3Region,
+			Bucket:       cfg.s3Bucket,
+			AccessKey:    cfg.s3Access,
+			SecretKey:    cfg.s3Secret,
+			SessionToken: cfg.s3SessionToken,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("s3 blob store: %w", err)
@@ -38,6 +39,7 @@ func openBlobStore(cfg config, log *slog.Logger) (blob.Store, error) {
 		return nil, fmt.Errorf("fs blob store: %w", err)
 	}
 	log.Info("blob store", "backend", "fs", "dir", cfg.blobDir)
+	log.Warn("fs blob backend is SINGLE-NODE only: message bodies live on this node's local disk and are not visible to other nodes; use OCTO_MAIL_S3_ENDPOINT for a multi-node deployment")
 	return bs, nil
 }
 
@@ -92,6 +94,11 @@ type config struct {
 	// bounds peak memory ≈ maxConns × maxSize per listener. 0 = unlimited.
 	maxConns int
 
+	// drainTimeout bounds the graceful-shutdown drain: on SIGTERM the node stops
+	// accepting and waits up to this long for in-flight requests + worker iterations
+	// to finish before exiting.
+	drainTimeout time.Duration
+
 	// bounceDomain, when set, enables VERP: outbound deliveries use an envelope
 	// MAIL FROM of bounces+<tenant>.<msg>.<mac>@<bounceDomain>, and inbound mail to
 	// that domain is routed to complaint/bounce handling (ARF + DSN) → reputation.
@@ -129,6 +136,8 @@ type config struct {
 	s3Bucket   string
 	s3Access   string
 	s3Secret   string
+	// s3SessionToken is an optional STS/IAM-role temporary-credential token.
+	s3SessionToken string
 
 	smtpAddr       string
 	submissionAddr string
@@ -149,7 +158,7 @@ type config struct {
 	maxHops     int // inbound Received-header loop limit (0 = smtpd default)
 	greylist    bool
 
-	junkDir       string
+	junkDir       string // deprecated/unused: junk-filter state now lives in Postgres (shared)
 	junkThreshold float64
 
 	// Inbound decision-engine tuning (all optional; zero uses Decider defaults).
@@ -194,14 +203,16 @@ func loadConfig() config {
 		reportDomain:      envLower("OCTO_MAIL_REPORT_DOMAIN"),
 		maxSize:           envInt64("OCTO_MAIL_MAX_SIZE", 50*1024*1024),
 		maxConns:          int(envInt64("OCTO_MAIL_MAX_CONNS", 1024)),
+		drainTimeout:      envDuration("OCTO_MAIL_DRAIN_TIMEOUT", 30*time.Second),
 
 		blobDir: envDefault("OCTO_MAIL_BLOB_DIR", "./blobs"),
 
-		s3Endpoint: os.Getenv("OCTO_MAIL_S3_ENDPOINT"),
-		s3Region:   envDefault("OCTO_MAIL_S3_REGION", "us-east-1"),
-		s3Bucket:   envDefault("OCTO_MAIL_S3_BUCKET", "octo-mail"),
-		s3Access:   os.Getenv("OCTO_MAIL_S3_ACCESS"),
-		s3Secret:   os.Getenv("OCTO_MAIL_S3_SECRET"),
+		s3Endpoint:     os.Getenv("OCTO_MAIL_S3_ENDPOINT"),
+		s3Region:       envDefault("OCTO_MAIL_S3_REGION", "us-east-1"),
+		s3Bucket:       envDefault("OCTO_MAIL_S3_BUCKET", "octo-mail"),
+		s3Access:       os.Getenv("OCTO_MAIL_S3_ACCESS"),
+		s3Secret:       os.Getenv("OCTO_MAIL_S3_SECRET"),
+		s3SessionToken: os.Getenv("OCTO_MAIL_S3_SESSION_TOKEN"),
 
 		smtpAddr:       envDefault("OCTO_MAIL_SMTP_ADDR", ":25"),
 		submissionAddr: envDefault("OCTO_MAIL_SUBMISSION_ADDR", ":587"),

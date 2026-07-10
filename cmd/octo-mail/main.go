@@ -153,6 +153,10 @@ func run() error {
 
 	// --- Front doors ---
 	errc := make(chan error, 8)
+	// drain coordinates graceful shutdown: HTTP servers to Shutdown() and a
+	// WaitGroup of in-flight connection handlers + worker-loop iterations awaited on
+	// SIGTERM (bounded by cfg.drainTimeout).
+	drain := &drainSet{}
 
 	// Privilege separation: when OCTO_MAIL_RUN_AS is set, bind all privileged TCP
 	// ports while still root, then irreversibly drop to the unprivileged user
@@ -236,8 +240,9 @@ func run() error {
 		log.Info("subjectpass disabled (no OCTO_MAIL_SUBJECTPASS_KEY); content-rejected senders get no challenge-retry path")
 	}
 
-	// Per-account junk filter (bayesian), routing spam to the Junk mailbox.
-	junkMgr := junkfilter.NewManager(cfg.junkDir, junkfilter.DefaultParams, cfg.junkThreshold)
+	// Per-account junk filter (bayesian), routing spam to the Junk mailbox. State
+	// lives in Postgres (shared across nodes), not per-node files.
+	junkMgr := junkfilter.NewManager(s.Pool, junkfilter.DefaultParams, cfg.junkThreshold)
 	defer junkMgr.Close()
 
 	// SMTP receive (MX, :25).
@@ -292,7 +297,7 @@ func run() error {
 				log.InfoContext(ctx, "report ingested", "kind", kind, "localpart", localpart)
 			}
 		}
-		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, cfg.maxConns, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
+		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, cfg.maxConns, drain, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
 	}
 	// SMTP submission (:587).
 	if cfg.submissionAddr != "" {
@@ -306,7 +311,7 @@ func run() error {
 			}
 			return imapd.ResolveURLAuth(ctx, acc, authURL)
 		}
-		go serveTCPListener(ctx, log, "smtp-submission", cfg.submissionAddr, prebound["smtp-submission"], errc, cfg.maxConns, func(nc net.Conn) { _ = sub.Serve(ctx, nc) })
+		go serveTCPListener(ctx, log, "smtp-submission", cfg.submissionAddr, prebound["smtp-submission"], errc, cfg.maxConns, drain, func(nc net.Conn) { _ = sub.Serve(ctx, nc) })
 	}
 	// Shared per-IP login throttle for the network auth surfaces (IMAP + JMAP +
 	// REST). Bounds brute-force / credential-stuffing and login/API-key
@@ -319,7 +324,7 @@ func run() error {
 	// IMAP (:143).
 	if cfg.imapAddr != "" {
 		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS, MaxSize: cfg.maxSize, LoginLimiter: loginLimiter}
-		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, cfg.maxConns, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
+		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, cfg.maxConns, drain, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
 	}
 	// JMAP (HTTP) + webmail SPA (same origin, so the SPA's /jmap/* fetches work).
 	if cfg.jmapAddr != "" {
@@ -331,8 +336,7 @@ func run() error {
 		mux.Handle("/webmail", webui.Handler())
 		mux.Handle("/webmail/", webui.Handler())
 		srv := &http.Server{Addr: cfg.jmapAddr, Handler: mux}
-		go serveHTTP(log, "jmap+webmail", srv, cfg.maxConns, errc)
-		go func() { <-ctx.Done(); _ = srv.Close() }()
+		go serveHTTP(log, "jmap+webmail", srv, cfg.maxConns, drain, errc)
 	}
 	// Admin/account API + healthz (HTTP).
 	if cfg.adminAddr != "" {
@@ -342,8 +346,7 @@ func run() error {
 		as := &webadmin.Server{Pool: s.Pool, Dir: dir, Reputation: repo, AdminToken: cfg.adminToken, Log: log,
 			QueueFailDSN: failDSN.Generate}
 		srv := &http.Server{Addr: cfg.adminAddr, Handler: as.Handler()}
-		go serveHTTP(log, "admin", srv, cfg.maxConns, errc)
-		go func() { <-ctx.Done(); _ = srv.Close() }()
+		go serveHTTP(log, "admin", srv, cfg.maxConns, drain, errc)
 	}
 
 	// --- Background workers ---
@@ -471,7 +474,7 @@ func run() error {
 			return nil
 		},
 	}
-	go runLoop(ctx, log, "queue-worker", cfg.queueInterval, func() {
+	drain.goLoop(ctx, log, "queue-worker", cfg.queueInterval, func() {
 		if n, err := worker.RunOnce(ctx); err != nil {
 			log.Warn("queue worker", "err", err)
 		} else if n > 0 {
@@ -481,7 +484,7 @@ func run() error {
 
 	// Retired-message retention sweep: drop retired queue rows (and their results)
 	// past keep_until. Safe on every node (a plain DELETE by time); hourly is fine.
-	go runLoop(ctx, log, "queue-cleanup", time.Hour, func() {
+	drain.goLoop(ctx, log, "queue-cleanup", time.Hour, func() {
 		if n, err := queue.CleanupRetired(ctx, s.Pool); err != nil {
 			log.Warn("queue retired cleanup", "err", err)
 		} else if n > 0 {
@@ -494,7 +497,7 @@ func run() error {
 	// Without this, storage grows monotonically — every expunge leaks its body.
 	// Safe on every node: the row delete uses FOR UPDATE SKIP LOCKED and the
 	// per-blob referrer re-check is authoritative at delete time.
-	go runLoop(ctx, log, "blob-gc", time.Hour, func() {
+	drain.goLoop(ctx, log, "blob-gc", time.Hour, func() {
 		rows, blobs, err := s.CollectGarbage(ctx, 1000)
 		if err != nil {
 			log.Warn("blob gc", "err", err)
@@ -505,7 +508,7 @@ func run() error {
 
 	// Queue depth gauge sampler: publish due/held/total to Prometheus each tick.
 	// Safe on every node (a read-only aggregate); the scraper sees the latest value.
-	go runLoop(ctx, log, "queue-depth", 15*time.Second, func() {
+	drain.goLoop(ctx, log, "queue-depth", 15*time.Second, func() {
 		d, err := queue.Depth(ctx, s.Pool)
 		if err != nil {
 			log.Warn("queue depth sample", "err", err)
@@ -528,7 +531,8 @@ func run() error {
 	projCoord := ha.NewCoordinator(ha.New(s.Pool, projLeaderKey, cfg.nodeID), cfg.projInterval)
 	projCoord.OnElected = func(context.Context) { log.Info("elected projection-drain leader", "node", cfg.nodeID) }
 	projCoord.OnLost = func() { log.Info("lost projection-drain leadership", "node", cfg.nodeID) }
-	projCoord.Tick = func(ctx context.Context) { drainProjections(ctx, log, s, fts, threads) }
+	projDrainer := &projectionDrainer{s: s, fts: fts, threads: threads, log: log, pageSize: 500}
+	projCoord.Tick = projDrainer.tick
 	go projCoord.Run(ctx)
 
 	// Daily IP-warmup maintenance, when an egress pool is configured. This MUST be
@@ -650,7 +654,7 @@ func run() error {
 
 	// Webhook delivery worker.
 	whWorker := &deliverability.WebhookWorker{Pool: s.Pool, NodeID: cfg.nodeID, Batch: 50, Secret: cfg.webhookSecret, Log: log}
-	go runLoop(ctx, log, "webhook-worker", cfg.queueInterval, func() {
+	drain.goLoop(ctx, log, "webhook-worker", cfg.queueInterval, func() {
 		if n, err := whWorker.RunOnce(ctx); err != nil {
 			log.Warn("webhook worker", "err", err)
 		} else if n > 0 {
@@ -660,20 +664,30 @@ func run() error {
 
 	log.Info("octo-mail node up", "node", cfg.nodeID)
 
-	// Wait for shutdown or a fatal listener error.
+	// Wait for shutdown or a fatal listener error, then drain gracefully.
+	var runErr error
 	select {
 	case <-ctx.Done():
-		log.Info("shutting down")
-		return nil
+		log.Info("shutting down; draining in-flight work", "timeout", cfg.drainTimeout)
 	case err := <-errc:
-		return err
+		runErr = err
+		log.Warn("fatal listener error; shutting down", "err", err)
 	}
+	// Stop accepting and let in-flight requests + worker iterations finish, bounded
+	// by the drain timeout. ctx is already cancelled on the ctx.Done() path; on the
+	// errc path, cancel it so listeners/workers begin winding down before we wait.
+	stop()
+	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.drainTimeout)
+	defer cancel()
+	drain.shutdown(drainCtx, log)
+	log.Info("drain complete")
+	return runErr
 }
 
 // serveTCPListener serves on a pre-bound listener when ln != nil (used by the
 // privsep path, which binds privileged ports before dropping root); otherwise it
 // binds addr itself.
-func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, ln net.Listener, errc chan<- error, maxConns int, handle func(net.Conn)) {
+func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, ln net.Listener, errc chan<- error, maxConns int, drain *drainSet, handle func(net.Conn)) {
 	if ln == nil {
 		var err error
 		ln, err = net.Listen("tcp", addr)
@@ -710,12 +724,14 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 				continue
 			}
 		}
-		go func() {
+		// Track the handler so a graceful shutdown awaits in-flight connections
+		// (up to the drain deadline) instead of cutting them off mid-request.
+		drain.track(func() {
 			if sem != nil {
 				defer func() { <-sem }()
 			}
 			handle(conn)
-		}()
+		})
 	}
 }
 
@@ -724,7 +740,7 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 // admin HTTP listeners would otherwise be the only entry doors without a
 // connection cap, and MaxBytesReader/body caps don't fire until a request fully
 // arrives — so a trickle of headers could hold goroutines/FDs indefinitely.
-func serveHTTP(log *slog.Logger, name string, srv *http.Server, maxConns int, errc chan<- error) {
+func serveHTTP(log *slog.Logger, name string, srv *http.Server, maxConns int, drain *drainSet, errc chan<- error) {
 	// Timeouts bound how long a slow client can hold a connection before its
 	// request completes (headers, whole request, and idle keep-alive).
 	if srv.ReadHeaderTimeout == 0 {
@@ -736,6 +752,8 @@ func serveHTTP(log *slog.Logger, name string, srv *http.Server, maxConns int, er
 	if srv.IdleTimeout == 0 {
 		srv.IdleTimeout = 120 * time.Second
 	}
+	// Register for graceful Shutdown at drain time (replaces an abrupt Close).
+	drain.addServer(srv)
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		errc <- fmt.Errorf("%s listen %s: %w", name, srv.Addr, err)
@@ -782,6 +800,63 @@ func (c *limitConn) Close() error {
 	return err
 }
 
+// drainSet coordinates a graceful shutdown drain: it tracks the HTTP servers to
+// Shutdown and a WaitGroup for in-flight connection handlers and worker-loop
+// iterations, so on SIGTERM the process stops accepting new work but lets
+// in-progress requests/iterations finish (up to a deadline) instead of being cut
+// off mid-flight. Methods are goroutine-safe.
+type drainSet struct {
+	mu      sync.Mutex
+	servers []*http.Server
+	wg      sync.WaitGroup
+}
+
+func (d *drainSet) addServer(srv *http.Server) {
+	d.mu.Lock()
+	d.servers = append(d.servers, srv)
+	d.mu.Unlock()
+}
+
+// track wraps a unit of drainable work: increment before it starts, decrement
+// when it returns. Used for connection handlers and worker loops.
+func (d *drainSet) track(fn func()) {
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		fn()
+	}()
+}
+
+// shutdown stops accepting and waits (bounded by drainCtx) for tracked work to
+// finish. It Shutdown()s every registered HTTP server (graceful: stop accepting,
+// let active requests complete) and awaits the connection/worker WaitGroup.
+func (d *drainSet) shutdown(drainCtx context.Context, log *slog.Logger) {
+	d.mu.Lock()
+	servers := append([]*http.Server(nil), d.servers...)
+	d.mu.Unlock()
+	for _, srv := range servers {
+		if err := srv.Shutdown(drainCtx); err != nil {
+			log.Warn("http graceful shutdown", "addr", srv.Addr, "err", err)
+		}
+	}
+	// Await tracked conns + worker iterations, bounded by drainCtx.
+	done := make(chan struct{})
+	go func() { d.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-drainCtx.Done():
+		log.Warn("drain deadline exceeded; some in-flight work was not awaited")
+	}
+}
+
+// goLoop starts a tracked runLoop: because runLoop returns only after ctx is
+// cancelled AND its current fn() has finished, awaiting the tracked goroutine at
+// shutdown awaits the in-flight iteration (e.g. a queue RunOnce), so a worker
+// isn't torn down mid-batch.
+func (d *drainSet) goLoop(ctx context.Context, log *slog.Logger, name string, interval time.Duration, fn func()) {
+	d.track(func() { runLoop(ctx, log, name, interval, fn) })
+}
+
 // runLoop calls fn every interval until ctx is done.
 func runLoop(ctx context.Context, log *slog.Logger, name string, interval time.Duration, fn func()) {
 	t := time.NewTicker(interval)
@@ -796,12 +871,27 @@ func runLoop(ctx context.Context, log *slog.Logger, name string, interval time.D
 	}
 }
 
-// drainProjections advances FTS + threading for every account that has fallen
-// behind (a projection cursor below the account head, or no cursor yet).
-func drainProjections(ctx context.Context, log *slog.Logger, s *postgres.Store, fts *projection.FTSWorker, threads *projection.ThreadWorker) {
-	rows, err := s.Pool.Query(ctx, `SELECT id, tenant_id FROM accounts WHERE NOT disabled`)
+// projectionDrainer advances the FTS + threading projections across accounts,
+// paginated and cancellable. It keeps a round-robin cursor across ticks so each
+// tick does a bounded amount of work (at most pageSize accounts) and no account is
+// starved: the cursor wraps to 0 after the last account. Serial within a tick, but
+// bounded — a huge account table no longer means one unbounded, uncancellable scan.
+type projectionDrainer struct {
+	s       *postgres.Store
+	fts     *projection.FTSWorker
+	threads *projection.ThreadWorker
+	log     *slog.Logger
+
+	pageSize int
+	cursor   int64 // last account id processed; next tick resumes after it
+}
+
+func (d *projectionDrainer) tick(ctx context.Context) {
+	rows, err := d.s.Pool.Query(ctx,
+		`SELECT id, tenant_id FROM accounts WHERE NOT disabled AND id > $1 ORDER BY id LIMIT $2`,
+		d.cursor, d.pageSize)
 	if err != nil {
-		log.Warn("projection: list accounts", "err", err)
+		d.log.Warn("projection: list accounts", "err", err)
 		return
 	}
 	type acct struct{ id, tenant int64 }
@@ -810,25 +900,34 @@ func drainProjections(ctx context.Context, log *slog.Logger, s *postgres.Store, 
 		var a acct
 		if err := rows.Scan(&a.id, &a.tenant); err != nil {
 			rows.Close()
-			log.Warn("projection: scan account", "err", err)
+			d.log.Warn("projection: scan account", "err", err)
 			return
 		}
 		accts = append(accts, a)
 	}
 	rows.Close()
+	if len(accts) == 0 {
+		d.cursor = 0 // wrapped past the last account; restart the round-robin next tick
+		return
+	}
 	for _, a := range accts {
-		if err := fts.DrainAccount(ctx, a.tenant, a.id); err != nil {
-			log.Warn("fts drain", "account", a.id, "err", err)
+		// Return promptly on shutdown so the coordinator loop can exit and resign.
+		if ctx.Err() != nil {
+			return
 		}
-		if err := threads.DrainAccount(ctx, a.tenant, a.id); err != nil {
-			log.Warn("thread drain", "account", a.id, "err", err)
+		if err := d.fts.DrainAccount(ctx, a.tenant, a.id); err != nil {
+			d.log.Warn("fts drain", "account", a.id, "err", err)
+		}
+		if err := d.threads.DrainAccount(ctx, a.tenant, a.id); err != nil {
+			d.log.Warn("thread drain", "account", a.id, "err", err)
 		}
 		// Backfill summary columns for rows that predate them (in-place upgrade):
 		// the forward drain above only folds new rows, so legacy rows need this
 		// one-time-per-row pass or filtered search would omit all historical mail.
-		if err := threads.BackfillSummaries(ctx, a.tenant, a.id); err != nil {
-			log.Warn("summary backfill", "account", a.id, "err", err)
+		if err := d.threads.BackfillSummaries(ctx, a.tenant, a.id); err != nil {
+			d.log.Warn("summary backfill", "account", a.id, "err", err)
 		}
+		d.cursor = a.id // advance so the next tick resumes after this account
 	}
 }
 

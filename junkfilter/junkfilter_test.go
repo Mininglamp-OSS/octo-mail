@@ -6,7 +6,36 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-mail/junkfilter"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const testDSN = "postgres://octo_mail:octo_mail@localhost:55432/octo_mail"
+
+func openJunkPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
+	t.Helper()
+	pool, err := pgxpool.New(ctx, testDSN)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Skipf("postgres not available (%v)", err)
+	}
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS junk_words (account_id bigint NOT NULL, word text NOT NULL, ham bigint NOT NULL DEFAULT 0, spam bigint NOT NULL DEFAULT 0, PRIMARY KEY (account_id, word))`,
+		`CREATE TABLE IF NOT EXISTS junk_totals (account_id bigint NOT NULL PRIMARY KEY, hams bigint NOT NULL DEFAULT 0, spams bigint NOT NULL DEFAULT 0)`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			pool.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `TRUNCATE junk_words, junk_totals`); err != nil {
+		pool.Close()
+		t.Fatal(err)
+	}
+	return pool
+}
 
 func spamMsg(i int) []byte {
 	return []byte(fmt.Sprintf("From: promo@deals.example\r\nSubject: WINNER buy cheap viagra pills now\r\n\r\n"+
@@ -21,10 +50,13 @@ func hamMsg(i int) []byte {
 // TestJunkClassifyAndTrainPerAccount proves WF-B: after training an account's
 // bayesian filter on ham + spam corpora, a held-out spam message is classified
 // as junk and a held-out ham message is not, and that training is per-account —
-// an untrained account does not inherit another account's learning.
+// an untrained account does not inherit another account's learning. State is in
+// Postgres (shared across nodes), not per-node files.
 func TestJunkClassifyAndTrainPerAccount(t *testing.T) {
 	ctx := context.Background()
-	mgr := junkfilter.NewManager(t.TempDir(), junkfilter.DefaultParams, 0.95)
+	pool := openJunkPool(t, ctx)
+	defer pool.Close()
+	mgr := junkfilter.NewManager(pool, junkfilter.DefaultParams, 0.95)
 	defer mgr.Close()
 
 	const accA, accB = int64(1), int64(2)
@@ -75,4 +107,41 @@ func TestJunkClassifyAndTrainPerAccount(t *testing.T) {
 	}
 
 	t.Logf("OK: spam prob=%.3f→junk, ham prob=%.3f→not junk (per-account); untrained account B not significant", probSpam, probHam)
+}
+
+// TestJunkSharedAcrossNodes proves the #24-7 fix: junk state is shared via
+// Postgres, so training performed by one node ("Manager") is visible to another
+// node's Manager on the same database. Before the fix (per-node files) node B
+// would classify with zero learned words.
+func TestJunkSharedAcrossNodes(t *testing.T) {
+	ctx := context.Background()
+	pool := openJunkPool(t, ctx)
+	defer pool.Close()
+
+	nodeA := junkfilter.NewManager(pool, junkfilter.DefaultParams, 0.95)
+	nodeB := junkfilter.NewManager(pool, junkfilter.DefaultParams, 0.95)
+
+	const acc = int64(1)
+	// Train entirely on node A.
+	for i := 0; i < 60; i++ {
+		if err := nodeA.Train(ctx, acc, false, spamMsg(i)); err != nil {
+			t.Fatalf("nodeA train spam %d: %v", i, err)
+		}
+		if err := nodeA.Train(ctx, acc, true, hamMsg(i)); err != nil {
+			t.Fatalf("nodeA train ham %d: %v", i, err)
+		}
+	}
+
+	// Classify on node B — it must see node A's training (shared PG state).
+	prob, sig, isJunk, err := nodeB.Classify(ctx, acc, spamMsg(1000))
+	if err != nil {
+		t.Fatalf("nodeB classify: %v", err)
+	}
+	if !sig {
+		t.Fatalf("nodeB classification not significant — training not shared across nodes (prob=%.3f)", prob)
+	}
+	if !isJunk {
+		t.Fatalf("nodeB did not classify held-out spam as junk (prob=%.3f) — shared state broken", prob)
+	}
+	t.Logf("OK: node B classified spam as junk (prob=%.3f) from node A's training — junk state shared via Postgres", prob)
 }

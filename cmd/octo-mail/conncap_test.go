@@ -46,7 +46,7 @@ func TestServeTCPListenerConnCap(t *testing.T) {
 
 	errc := make(chan error, 1)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	go serveTCPListener(ctx, log, "test", "", ln, errc, 2, handle)
+	go serveTCPListener(ctx, log, "test", "", ln, errc, 2, &drainSet{}, handle)
 
 	addr := ln.Addr().String()
 	// Open two connections that will occupy both slots and block in handle.
@@ -138,7 +138,7 @@ func TestServeHTTPConnCapAndTimeouts(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 	srv.Addr = addr
-	go serveHTTP(log, "test-http", srv, 2, errc)
+	go serveHTTP(log, "test-http", srv, 2, &drainSet{}, errc)
 	defer srv.Close()
 
 	// Timeouts must be set by serveHTTP.
