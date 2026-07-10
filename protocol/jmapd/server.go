@@ -218,7 +218,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// bounded chunks — never buffer the whole (potentially large) message in memory
 	// (an unauthenticated-size DoS multiplier). Mirrors webapi's raw-message stream.
 	var msg store.Message
-	err = acc.Tx(r.Context(), func(tx store.Tx) error {
+	err = acc.ReadTx(r.Context(), func(tx store.Tx) error {
 		group, ok := s.emailGroup(tx, acc, blobID)
 		if !ok {
 			return errNotFoundJMAP
@@ -230,7 +230,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	br := acc.MessageReader(msg)
+	br := acc.MessageReader(r.Context(), msg)
 	defer br.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)

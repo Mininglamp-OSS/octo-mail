@@ -175,7 +175,7 @@ func (c *conn) fetchURLSection(mbName string, uid uint32, section string) ([]byt
 	if !c.chargeBudget(msg.Size) {
 		return nil, errNo("[TOOBIG] CATENATE exceeds APPENDLIMIT")
 	}
-	return sectionBytes(c.acc, *msg, section), nil
+	return sectionBytes(c.ctx, c.acc, *msg, section), nil
 }
 
 // lookupURLMessage resolves an IMAP URL's (mailbox, uid) to a message row within
@@ -183,7 +183,7 @@ func (c *conn) fetchURLSection(mbName string, uid uint32, section string) ([]byt
 // projection) before deciding to materialize it.
 func lookupURLMessage(ctx context.Context, acc store.Account, mbName string, uid uint32) (*store.Message, error) {
 	var msg *store.Message
-	err := acc.Tx(ctx, func(tx store.Tx) error {
+	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		mb, err := acc.MailboxFind(tx, mbName)
 		if err != nil {
 			return err
@@ -210,8 +210,8 @@ func lookupURLMessage(ctx context.Context, acc store.Account, mbName string, uid
 }
 
 // sectionBytes reads a message's bytes (whole message, or the referenced section).
-func sectionBytes(acc store.Account, msg store.Message, section string) []byte {
-	full := readMessageBytes(acc, msg)
+func sectionBytes(ctx context.Context, acc store.Account, msg store.Message, section string) []byte {
+	full := readMessageBytes(ctx, acc, msg)
 	if section == "" {
 		return full
 	}
@@ -230,12 +230,12 @@ func fetchURLSection(ctx context.Context, acc store.Account, mbName string, uid 
 	if err != nil {
 		return nil, err
 	}
-	return sectionBytes(acc, *msg, section), nil
+	return sectionBytes(ctx, acc, *msg, section), nil
 }
 
 // readMessageBytes reads a message's full bytes (MsgPrefix + blob) via the store.
-func readMessageBytes(acc store.Account, m store.Message) []byte {
-	r := acc.MessageReader(m)
+func readMessageBytes(ctx context.Context, acc store.Account, m store.Message) []byte {
+	r := acc.MessageReader(ctx, m)
 	data, _ := io.ReadAll(r)
 	r.Close()
 	return data

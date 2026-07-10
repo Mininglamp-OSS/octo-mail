@@ -171,10 +171,112 @@ func TestThreadingProjectionAndRebuild(t *testing.T) {
 	t.Logf("OK: reply chain collapsed to thread %d; unrelated separate; rebuild-from-zero identical; summary columns populated + repopulated", firstThread)
 }
 
-// TestFoldPreviewUTF8Safe proves the H13 PR2 fix for the projection-wedge bug: a
-// body whose 140-byte cut falls mid-rune must not produce invalid UTF-8, which a
-// Postgres text column would reject and stall the fold forever. The preview is
-// truncated on a rune boundary and stored without error.
+// TestThreadingUnionFindMergesBridgedThreads proves the #21-2 fix: two messages
+// that start as separate threads are MERGED when a later message references both.
+// The old code (pick smallest existing thread_id, no merge) left the second thread
+// split; true union-find re-points every member of the losing thread to the
+// survivor (the minimum id).
+func TestThreadingUnionFindMergesBridgedThreads(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, fts, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	if err := s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`).Scan(&tenantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool.QueryRow(ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, tenantID).Scan(&accID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool.QueryRow(ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, tenantID).Scan(&domID); err != nil {
+		t.Fatal(err)
+	}
+	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+
+	dir := s.NewDirectory()
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, err := dir.ResolveInbound(ctx, addr.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two independent messages A and B (no shared refs → two separate threads),
+	// then a bridging message C that references BOTH. C must merge A's and B's
+	// threads into one.
+	a := "Message-ID: <a@example.com>\r\nSubject: A\r\n\r\nfirst\r\n"
+	b := "Message-ID: <b@example.com>\r\nSubject: B\r\n\r\nsecond\r\n"
+	bridge := "Message-ID: <c@example.com>\r\nReferences: <a@example.com> <b@example.com>\r\nSubject: bridge\r\n\r\nbridges A and B\r\n"
+
+	w := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 10}
+	// Deliver + fold A and B first so they become two distinct threads.
+	for _, raw := range []string{a, b} {
+		if _, err := target.Deliver(ctx, &store.Message{}, mem(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatalf("drain A,B: %v", err)
+	}
+	threadsByID := func() map[int64]int64 {
+		rows, err := s.Pool.Query(ctx, `SELECT id, thread_id FROM messages WHERE account_id=$1 ORDER BY id`, accID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		m := map[int64]int64{}
+		for rows.Next() {
+			var id int64
+			var th *int64
+			if err := rows.Scan(&id, &th); err != nil {
+				t.Fatal(err)
+			}
+			if th == nil {
+				t.Fatalf("message %d has NULL thread_id", id)
+			}
+			m[id] = *th
+		}
+		return m
+	}
+	before := threadsByID()
+	if len(before) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(before))
+	}
+	// A and B must be in DIFFERENT threads before the bridge arrives.
+	var idA, idB int64 = 1, 2
+	if before[idA] == before[idB] {
+		t.Fatalf("A and B unexpectedly share a thread before bridging: %v", before)
+	}
+
+	// Now deliver + fold the bridging message.
+	if _, err := target.Deliver(ctx, &store.Message{}, mem(bridge)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatalf("drain bridge: %v", err)
+	}
+	after := threadsByID()
+	if len(after) != 3 {
+		t.Fatalf("expected 3 messages after bridge, got %d", len(after))
+	}
+	// All three must now be one thread, and its id must be the minimum (id of A).
+	if after[idA] != after[idB] || after[idB] != after[3] {
+		t.Fatalf("bridge did not merge the two threads: %v", after)
+	}
+	if after[idA] != idA {
+		t.Fatalf("merged thread_id = %d, want the minimum id %d (survivor invariant)", after[idA], idA)
+	}
+	t.Logf("OK: bridging message merged threads %d and %d into %d (union-find, survivor=min id)", before[idA], before[idB], after[idA])
+}
+
 func TestFoldPreviewUTF8Safe(t *testing.T) {
 	ctx := context.Background()
 	bs, err := blob.NewFS(t.TempDir())

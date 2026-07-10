@@ -19,7 +19,7 @@ type mailboxInfo struct {
 // GET /webapi/v0/mailboxes
 func (s *Server) listMailboxes(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
 	var out []mailboxInfo
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		mbs, e := tx.QueryMailbox().List()
 		if e != nil {
 			return e

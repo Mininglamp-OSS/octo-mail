@@ -87,34 +87,50 @@ func (w *FTSWorker) RunOnceAccount(ctx context.Context, tenantID, accountID int6
 		return 0, nil
 	}
 
-	maxSeq := cursor
-	for _, m := range msgs {
+	// Phase 1 — read each message's text OUTSIDE any transaction (blob reads are
+	// network I/O; holding a tx open across the whole batch would be a long-lived
+	// transaction).
+	texts := make([]string, len(msgs))
+	for i, m := range msgs {
 		text, err := w.readText(ctx, tenantID, m.blobRef, m.prefix)
 		if err != nil {
 			return 0, err
 		}
-		// Upsert the tsvector. to_tsvector runs in Postgres so we never ship a
-		// parsed vector over the wire.
-		if _, err := w.Pool.Exec(ctx,
-			`INSERT INTO fts (account_id, message_id, tsv)
-			 VALUES ($1,$2, to_tsvector('simple', $3))
-			 ON CONFLICT (account_id, message_id)
-			 DO UPDATE SET tsv = EXCLUDED.tsv`,
-			accountID, m.id, text); err != nil {
-			return 0, err
-		}
-		if m.seq > maxSeq {
-			maxSeq = m.seq
-		}
+		texts[i] = text
 	}
 
-	// Advance the cursor to the highest indexed seq.
-	if _, err := w.Pool.Exec(ctx,
-		`INSERT INTO projection_cursor (account_id, name, seq)
-		 VALUES ($1,$2,$3)
-		 ON CONFLICT (account_id, name)
-		 DO UPDATE SET seq=EXCLUDED.seq`,
-		accountID, ftsCursor, maxSeq); err != nil {
+	// Phase 2 — upsert every tsvector and advance the cursor in ONE transaction, so
+	// the cursor moves iff all upserts in the batch are durable. A crash mid-batch
+	// rolls back and the batch re-runs from the unchanged cursor.
+	maxSeq := cursor
+	err = pgx.BeginFunc(ctx, w.Pool, func(tx pgx.Tx) error {
+		for i, m := range msgs {
+			// Upsert the tsvector. to_tsvector runs in Postgres so we never ship a
+			// parsed vector over the wire.
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO fts (account_id, message_id, tsv)
+				 VALUES ($1,$2, to_tsvector('simple', $3))
+				 ON CONFLICT (account_id, message_id)
+				 DO UPDATE SET tsv = EXCLUDED.tsv`,
+				accountID, m.id, texts[i]); err != nil {
+				return err
+			}
+			if m.seq > maxSeq {
+				maxSeq = m.seq
+			}
+		}
+		// Advance the cursor to the highest indexed seq.
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO projection_cursor (account_id, name, seq)
+			 VALUES ($1,$2,$3)
+			 ON CONFLICT (account_id, name)
+			 DO UPDATE SET seq=EXCLUDED.seq`,
+			accountID, ftsCursor, maxSeq); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return 0, err
 	}
 	return len(msgs), nil

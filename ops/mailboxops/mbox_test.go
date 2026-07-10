@@ -124,7 +124,7 @@ func TestMboxRoundTrip(t *testing.T) {
 		mb, _ := dstAcc.MailboxFind(tx, "Inbox")
 		msgs, _ := tx.QueryMessage().FilterMailbox(mb.ID).SortUID().List()
 		for _, msg := range msgs {
-			r := dstAcc.MessageReader(msg)
+			r := dstAcc.MessageReader(ctx, msg)
 			data := make([]byte, msg.Size)
 			off := 0
 			for off < len(data) {

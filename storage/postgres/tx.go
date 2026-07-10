@@ -45,13 +45,14 @@ func (pt *pgTx) Update(v any) error {
 	case *store.Message:
 		seq := pt.nextModSeq()
 		x.ModSeq = seq
-		// Read the prior seen state (account-scoped) so we can adjust the mailbox
-		// unseen/unread counters by the delta. This SELECT also doubles as the
-		// existence+ownership check (fail closed on a foreign/missing id).
-		var oldSeen bool
+		// Read the prior seen+deleted state (account-scoped) so we can adjust the
+		// mailbox unseen/unread and deleted counters by the delta. This SELECT also
+		// doubles as the existence+ownership check (fail closed on a foreign/missing
+		// id).
+		var oldSeen, oldDeleted bool
 		if err := pt.tx.QueryRow(pt.ctx,
-			`SELECT f_seen FROM messages WHERE id=$1 AND account_id=$2`,
-			x.ID, pt.acc.id).Scan(&oldSeen); err != nil {
+			`SELECT f_seen, f_deleted FROM messages WHERE id=$1 AND account_id=$2`,
+			x.ID, pt.acc.id).Scan(&oldSeen, &oldDeleted); err != nil {
 			if err == pgx.ErrNoRows {
 				return errNotFound
 			}
@@ -69,15 +70,16 @@ func (pt *pgTx) Update(v any) error {
 		if ct.RowsAffected() == 0 {
 			return errNotFound
 		}
-		// Keep the mailbox unseen/unread projection in step with the flag change —
-		// otherwise IMAP STATUS(UNSEEN) and JMAP unreadEmails drift on the commonest
-		// operation (mark-read). unseen and unread share one counter. c_deleted is
-		// intentionally NOT maintained here: it has no reader (IMAP STATUS(DELETED)
-		// recomputes by scanning) and MessageRemove doesn't decrement it, so bumping
-		// it on Update would drift it upward asymmetrically.
+		// Keep the mailbox unseen/unread AND deleted projections in step with the
+		// flag change — otherwise IMAP STATUS(UNSEEN/DELETED) and JMAP unreadEmails
+		// drift on the commonest operations (mark-read, mark-\Deleted). unseen and
+		// unread share one counter; c_deleted tracks the \Deleted flag so
+		// STATUS(DELETED) reads it instead of rescanning, and MessageRemove
+		// decrements it symmetrically on expunge.
 		dUnseen := boolInt(!x.Seen) - boolInt(!oldSeen)
-		if dUnseen != 0 {
-			if err := pt.bumpCounts(x.MailboxID, 0, 0, dUnseen, 0); err != nil {
+		dDeleted := boolInt(x.Deleted) - boolInt(oldDeleted)
+		if dUnseen != 0 || dDeleted != 0 {
+			if err := pt.bumpCounts(x.MailboxID, 0, 0, dUnseen, dDeleted); err != nil {
 				return err
 			}
 		}

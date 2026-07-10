@@ -47,7 +47,7 @@ func (c *conn) cmdFetch(tag, args string, byUID bool) {
 	// Load the mailbox's messages in UID order (seq number = position+1). When
 	// CHANGEDSINCE is set, the kernel filters by changelog offset directly.
 	var msgs []store.Message
-	err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
+	err := c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 		q := tx.QueryMessage().FilterMailbox(c.selected.ID)
 		if changedSince >= 0 {
 			q = q.FilterModSeqGreater(store.ModSeq(changedSince))
@@ -166,7 +166,7 @@ func (c *conn) cmdSearch(tag, args string, byUID bool) {
 	c.ftsHits = map[string]map[store.UID]bool{}
 	for _, q := range collectTextTerms(node) {
 		hits := map[store.UID]bool{}
-		_ = c.acc.Tx(c.ctx, func(tx store.Tx) error {
+		_ = c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 			ms, e := tx.QueryMessage().FilterMailbox(c.selected.ID).FilterFTS(q).List()
 			if e != nil {
 				return e
@@ -181,7 +181,7 @@ func (c *conn) cmdSearch(tag, args string, byUID bool) {
 	defer func() { c.ftsHits = nil }()
 
 	var allMsgs []store.Message
-	err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
+	err := c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 		var e error
 		allMsgs, e = tx.QueryMessage().FilterMailbox(c.selected.ID).SortUID().List()
 		return e

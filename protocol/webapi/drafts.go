@@ -11,7 +11,7 @@ import (
 // GET /webapi/v0/drafts
 func (s *Server) listDrafts(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
 	var out []messageSummary
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		mb, e := a.acc.MailboxFind(tx, "Drafts")
 		if e != nil {
 			return e
@@ -25,7 +25,7 @@ func (s *Server) listDrafts(ctx context.Context, a authCtx, r *http.Request) (in
 		}
 		mbNames := mailboxNames(tx, a.acc)
 		for _, m := range msgs {
-			out = append(out, summarize(a.acc, m, mbNames))
+			out = append(out, summarize(ctx, a.acc, m, mbNames))
 		}
 		return nil
 	})
@@ -53,7 +53,7 @@ func (s *Server) createDraft(ctx context.Context, a authCtx, r *http.Request) (i
 	}
 	m := &store.Message{}
 	m.Flags.Draft = true
-	if _, err := a.acc.DeliverMailbox("Drafts", m, memBlob(raw)); err != nil {
+	if _, err := a.acc.DeliverMailbox(ctx, "Drafts", m, memBlob(raw)); err != nil {
 		return 0, nil, internalErr("draft_failed", err)
 	}
 	return http.StatusCreated, map[string]any{"id": emailID(*m)}, nil
@@ -70,12 +70,12 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 		rcpts  []string
 		mailFr = a.login
 	)
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
 		if e != nil {
 			return e
 		}
-		br := a.acc.MessageReader(msgs[0])
+		br := a.acc.MessageReader(ctx, msgs[0])
 		raw, _ = io.ReadAll(br)
 		br.Close()
 		env := parseEnvelope(raw)

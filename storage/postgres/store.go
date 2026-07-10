@@ -114,9 +114,39 @@ func Open(ctx context.Context, dsn string, bs blob.Store) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("loading schema: %w", err)
 	}
-	if _, err := pool.Exec(ctx, ddl); err != nil {
+	// Serialize bootstrap across nodes with a session advisory lock so concurrent
+	// startups can't race the same CREATE INDEX/TABLE (which is not internally
+	// serialized and can deadlock or error under contention). The key is a fixed
+	// namespace distinct from the per-account (account id) and leader-election keys.
+	// Held on one dedicated connection for the DDL Exec, then released; the schema
+	// DDL itself is idempotent (IF NOT EXISTS), so the lock only prevents the
+	// concurrent-DDL race, not re-application.
+	const schemaBootstrapKey = int64(0x6f6d5f7363686d) // "om_schm"
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("applying schema: %w", err)
+		return nil, fmt.Errorf("acquiring bootstrap conn: %w", err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaBootstrapKey); err != nil {
+		conn.Release()
+		pool.Close()
+		return nil, fmt.Errorf("bootstrap advisory lock: %w", err)
+	}
+	_, ddlErr := conn.Exec(ctx, ddl)
+	// Release the lock on the same connection before returning it to the pool. Use
+	// a ctx detached from cancellation: if the DDL failed because ctx was
+	// cancelled/timed out, the unlock must still reach Postgres rather than fail
+	// alongside it. (pool.Close() on the error paths would also drop the session
+	// and auto-release the lock, but releasing explicitly is not left to teardown.)
+	_, unlockErr := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, schemaBootstrapKey)
+	conn.Release()
+	if ddlErr != nil {
+		pool.Close()
+		return nil, fmt.Errorf("applying schema: %w", ddlErr)
+	}
+	if unlockErr != nil {
+		pool.Close()
+		return nil, fmt.Errorf("bootstrap advisory unlock: %w", unlockErr)
 	}
 	return &Store{Pool: pool, Blob: bs}, nil
 }

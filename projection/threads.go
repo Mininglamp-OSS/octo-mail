@@ -98,7 +98,17 @@ func (w *ThreadWorker) RunOnceAccount(ctx context.Context, tenantID, accountID i
 		return 0, nil
 	}
 
-	maxSeq := cursor
+	// Phase 1 — parse each message's blob OUTSIDE any transaction (blob reads are
+	// network I/O; holding a tx open across the whole batch would be a long-lived
+	// transaction). A transient blob error aborts the batch (retry); a permanent
+	// one marks the message for quarantine in phase 2.
+	type parsed struct {
+		m          msg
+		refs       []string
+		sum        msgSummary
+		quarantine bool
+	}
+	items := make([]parsed, 0, len(msgs))
 	for _, m := range msgs {
 		refs, sum, err := w.parseMessage(ctx, tenantID, m.blobRef, m.prefix)
 		if err != nil {
@@ -106,79 +116,140 @@ func (w *ThreadWorker) RunOnceAccount(ctx context.Context, tenantID, accountID i
 				return 0, err // transient: retry this batch rather than skip
 			}
 			// Permanent blob failure (missing/invalid ref): quarantine so one poison
-			// row can't wedge the fold for every higher-id message. Thread to self,
-			// empty summary, mark folded, advance the cursor past it.
+			// row can't wedge the fold for every higher-id message.
 			if w.Log != nil {
 				w.Log.Warn("thread fold: quarantining message with unreadable blob",
 					"account", accountID, "msg", m.id, "blob_ref", m.blobRef, "err", err)
 			}
-			if _, err := w.Pool.Exec(ctx,
-				`UPDATE messages SET thread_id=$1, summary_folded=true,
-				   subject='', from_addr='', to_addrs='', from_search='', to_search='', preview=''
-				 WHERE id=$2 AND account_id=$3`,
-				m.id, m.id, accountID); err != nil {
-				return 0, err
-			}
-			if m.seq > maxSeq {
-				maxSeq = m.seq
-			}
+			items = append(items, parsed{m: m, quarantine: true})
 			continue
 		}
-		threadID, err := w.assignThread(ctx, accountID, m.id, refs)
-		if err != nil {
-			return 0, err
-		}
-		if _, err := w.Pool.Exec(ctx,
-			`UPDATE messages SET thread_id=$1,
-			   subject=$3, from_addr=$4, to_addrs=$5, from_search=$6, to_search=$7,
-			   preview=$8, summary_folded=true
-			 WHERE id=$2`,
-			threadID, m.id, sum.subject, sum.from, sum.to, sum.fromSearch, sum.toSearch, sum.preview); err != nil {
-			return 0, err
-		}
-		if m.seq > maxSeq {
-			maxSeq = m.seq
-		}
+		items = append(items, parsed{m: m, refs: refs, sum: sum})
 	}
 
-	if _, err := w.Pool.Exec(ctx,
-		`INSERT INTO projection_cursor (account_id, name, seq) VALUES ($1,$2,$3)
-		 ON CONFLICT (account_id, name) DO UPDATE SET seq=EXCLUDED.seq`,
-		accountID, threadCursor, maxSeq); err != nil {
+	// Phase 2 — apply all folds and advance the cursor in ONE transaction, so the
+	// cursor moves iff every fold in the batch (thread_id + thread_refs + any union
+	// merge) is durable. A crash mid-batch rolls the whole batch back and it re-runs
+	// from the unchanged cursor.
+	maxSeq := cursor
+	err = pgx.BeginFunc(ctx, w.Pool, func(tx pgx.Tx) error {
+		for _, it := range items {
+			if it.quarantine {
+				// Thread to self, empty summary, mark folded.
+				if _, err := tx.Exec(ctx,
+					`UPDATE messages SET thread_id=$1, summary_folded=true,
+					   subject='', from_addr='', to_addrs='', from_search='', to_search='', preview=''
+					 WHERE id=$2 AND account_id=$3`,
+					it.m.id, it.m.id, accountID); err != nil {
+					return err
+				}
+				if it.m.seq > maxSeq {
+					maxSeq = it.m.seq
+				}
+				continue
+			}
+			threadID, err := w.assignThread(ctx, tx, accountID, it.m.id, it.refs)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE messages SET thread_id=$1,
+				   subject=$3, from_addr=$4, to_addrs=$5, from_search=$6, to_search=$7,
+				   preview=$8, summary_folded=true
+				 WHERE id=$2 AND account_id=$9`,
+				threadID, it.m.id, it.sum.subject, it.sum.from, it.sum.to, it.sum.fromSearch, it.sum.toSearch, it.sum.preview, accountID); err != nil {
+				return err
+			}
+			if it.m.seq > maxSeq {
+				maxSeq = it.m.seq
+			}
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO projection_cursor (account_id, name, seq) VALUES ($1,$2,$3)
+			 ON CONFLICT (account_id, name) DO UPDATE SET seq=EXCLUDED.seq`,
+			accountID, threadCursor, maxSeq); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return 0, err
 	}
 	return len(msgs), nil
 }
 
 // assignThread returns the thread_id for a message given its canonical
-// references. It records (message_id -> ref) links in thread_refs and finds any
-// already-threaded message sharing a reference; if found, the existing thread_id
-// is reused, otherwise a new thread rooted at this message's own id is created.
-func (w *ThreadWorker) assignThread(ctx context.Context, accountID, msgID int64, refs []string) (int64, error) {
+// references, running inside the caller's transaction tx. It finds the set of
+// already-threaded messages sharing any of these references and performs a real
+// union-find merge: the surviving thread is the smallest existing thread_id, and
+// if the references bridge two or more distinct threads, every member of the
+// losing threads is re-pointed to the survivor. With no prior match the message
+// roots a new thread at its own id. Finally it records (message_id -> ref) links
+// for future messages to match against.
+func (w *ThreadWorker) assignThread(ctx context.Context, tx pgx.Tx, accountID, msgID int64, refs []string) (int64, error) {
 	// Default: a message threads to itself.
 	threadID := msgID
 
 	if len(refs) > 0 {
-		// Any prior message that shares one of these references dictates the thread.
-		var existing *int64
-		err := w.Pool.QueryRow(ctx,
-			`SELECT m.thread_id
+		// Collect the DISTINCT set of threads any prior message with a shared
+		// reference belongs to. Unlike a LIMIT 1 pick, this sees ALL bridged
+		// threads so we can merge them (true union-find), not just join the smallest.
+		rows, err := tx.Query(ctx,
+			`SELECT DISTINCT m.thread_id
 			 FROM thread_refs r
-			 JOIN messages m ON m.id = r.message_id
-			 WHERE r.account_id=$1 AND r.ref = ANY($2) AND m.thread_id IS NOT NULL
-			 ORDER BY m.thread_id
-			 LIMIT 1`, accountID, refs).Scan(&existing)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			 JOIN messages m ON m.account_id = r.account_id AND m.id = r.message_id
+			 WHERE r.account_id=$1 AND r.ref = ANY($2) AND m.thread_id IS NOT NULL`,
+			accountID, refs)
+		if err != nil {
 			return 0, err
 		}
-		if existing != nil {
-			threadID = *existing
+		var existing []int64
+		for rows.Next() {
+			var tid int64
+			if err := rows.Scan(&tid); err != nil {
+				rows.Close()
+				return 0, err
+			}
+			existing = append(existing, tid)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return 0, err
+		}
+
+		if len(existing) > 0 {
+			// Survivor = smallest existing thread_id (preserves the "thread_id is the
+			// smallest id in the connected component" invariant deterministically).
+			survivor := existing[0]
+			for _, tid := range existing[1:] {
+				if tid < survivor {
+					survivor = tid
+				}
+			}
+			threadID = survivor
+			// Merge the bridged components: re-point every member of the losing
+			// threads to the survivor. Scoped by account_id so it prunes to one hash
+			// partition and uses messages_thread_idx.
+			losers := make([]int64, 0, len(existing))
+			for _, tid := range existing {
+				if tid != survivor {
+					losers = append(losers, tid)
+				}
+			}
+			if len(losers) > 0 {
+				if _, err := tx.Exec(ctx,
+					`UPDATE messages SET thread_id=$1
+					 WHERE account_id=$2 AND thread_id = ANY($3)`,
+					survivor, accountID, losers); err != nil {
+					return 0, err
+				}
+			}
 		}
 	}
 
 	// Record this message's references for future messages to match against.
 	for _, ref := range refs {
-		if _, err := w.Pool.Exec(ctx,
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO thread_refs (account_id, message_id, ref) VALUES ($1,$2,$3)
 			 ON CONFLICT DO NOTHING`, accountID, msgID, ref); err != nil {
 			return 0, err

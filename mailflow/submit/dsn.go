@@ -153,7 +153,7 @@ func (g *DSNGenerator) generate(ctx context.Context, m queue.Msg, action dsn.Act
 	acc := g.Opener.OpenAccountByID(m.AccountID, m.TenantID, "")
 	defer acc.Close()
 	sm := &store.Message{}
-	_, err = acc.DeliverMailbox("Inbox", sm, blobReader(raw))
+	_, err = acc.DeliverMailbox(ctx, "Inbox", sm, blobReader(raw))
 	return err
 }
 

@@ -17,7 +17,11 @@ import (
 // reclaimable once nothing else points at it.
 //
 // The sweep, per run:
-//  1. Hard-delete expunged message rows, capturing their (tenant_id, blob_ref).
+//  1. Hard-delete expunged message rows, capturing their (tenant_id, blob_ref),
+//     and in the same statement delete the message's projection rows (fts,
+//     thread_refs) — those tables have no FK to messages (they are deliberately
+//     decoupled from the delivery write path), so GC is what keeps them from
+//     accumulating orphans and degrading the GIN index.
 //  2. For each distinct freed (tenant, ref), delete the blob IFF no live message
 //     row and no queue row still reference it in that tenant. This respects both
 //     content-addressed dedup and JMAP sibling sharing (AddSibling reuses one
@@ -58,6 +62,14 @@ func (s *Store) CollectGarbage(ctx context.Context, limit int) (rowsDeleted int6
 			     USING doomed d
 			     WHERE m.account_id=d.account_id AND m.id=d.id
 			     RETURNING m.account_id, m.blob_ref
+			 ), del_fts AS (
+			     DELETE FROM fts f
+			     USING doomed d
+			     WHERE f.account_id=d.account_id AND f.message_id=d.id
+			 ), del_refs AS (
+			     DELETE FROM thread_refs r
+			     USING doomed d
+			     WHERE r.account_id=d.account_id AND r.message_id=d.id
 			 )
 			 SELECT a.tenant_id, del.blob_ref FROM del JOIN accounts a ON a.id=del.account_id`, limit)
 		if e != nil {

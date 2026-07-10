@@ -542,7 +542,7 @@ func (c *conn) cmdCopyMove(tag, args string, byUID, move bool) {
 		}
 		for _, m := range chosen {
 			// Copy: read the body and append to the destination mailbox.
-			body := c.acc.MessageReader(m)
+			body := c.acc.MessageReader(c.ctx, m)
 			nm := &store.Message{Flags: m.Flags, Keywords: m.Keywords}
 			if _, err := c.acc.MessageAdd(tx, dmb, nm, body, store.AddOpts{}); err != nil {
 				return err
