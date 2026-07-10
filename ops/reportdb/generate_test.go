@@ -60,8 +60,7 @@ func TestReportGeneration(t *testing.T) {
 	}
 
 	// Generate the XML report and prove it parses back (valid RFC 7489).
-	xmlBody, rua, ok, err := s.GenerateDMARCReport(ctx, "sender.example", "mx.example.com", "postmaster@example.com",
-		"rid-1", time.Now().Add(-24*time.Hour), time.Now())
+	xmlBody, rua, ok, err := s.GenerateDMARCReport(ctx, "sender.example", "mx.example.com", "postmaster@example.com", "rid-1")
 	if err != nil || !ok {
 		t.Fatalf("generate dmarc: ok=%v err=%v", ok, err)
 	}
@@ -83,9 +82,9 @@ func TestReportGeneration(t *testing.T) {
 		t.Fatalf("report total count = %d, want 7 (5 pass + 2 fail)", total)
 	}
 
-	// Send via stub, assert enqueued to rua + rows marked reported.
+	// Send via the fenced sender + stub, assert enqueued to rua + rows marked reported.
 	sender := &stubSender{}
-	sent, err := s.SendDMARCReport(ctx, sender, 1, 1, "sender.example", "mx.example.com", "postmaster@example.com")
+	sent, err := s.SendDMARCReportFenced(ctx, realFence(pool), allowAllRUA, sender, 1, 1, "sender.example", "mx.example.com", "postmaster@example.com")
 	if err != nil || !sent {
 		t.Fatalf("send dmarc: sent=%v err=%v", sent, err)
 	}

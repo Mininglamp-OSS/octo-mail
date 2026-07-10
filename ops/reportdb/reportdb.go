@@ -9,6 +9,7 @@ package reportdb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,10 +34,26 @@ type DMARCSummary struct {
 	FailCount int64
 }
 
-// IngestDMARC parses a DMARC aggregate report (the XML body, possibly gzip/zip
-// wrapped is handled by ParseMessageReport when given the full email) and stores
-// a summary. Here we take the already-extracted XML report reader.
+// OwnedDomain reports whether this node serves/sends-as the given domain. It
+// gates report INGESTION: inbound reports arrive unauthenticated on the MX, so
+// without an ownership check any peer could inject fabricated rows for an
+// arbitrary domain, or pre-seed a victim's (org_name, report_id) to suppress the
+// genuine report via ON CONFLICT DO NOTHING. Only reports about domains we
+// actually own are stored. A nil OwnedDomain disables the check (tests / trusted
+// callers).
+type OwnedDomain func(ctx context.Context, domain string) bool
+
+// errNotOwned is returned by ingest when the report's policy-published domain is
+// not served by this node — a rejected (likely forged) report, not a parse error.
+var errNotOwned = errors.New("reportdb: report for a domain this node does not serve")
+
+// IngestDMARC parses a DMARC aggregate report (already-extracted XML) and stores a
+// summary. Convenience wrapper with no ownership gate (trusted callers/tests).
 func (s *Store) IngestDMARC(ctx context.Context, xml []byte) (DMARCSummary, error) {
+	return s.ingestDMARC(ctx, xml, nil)
+}
+
+func (s *Store) ingestDMARC(ctx context.Context, xml []byte, owned OwnedDomain) (DMARCSummary, error) {
 	fb, err := dmarcrpt.ParseReport(bytes.NewReader(xml))
 	if err != nil {
 		return DMARCSummary{}, err
@@ -47,6 +64,11 @@ func (s *Store) IngestDMARC(ctx context.Context, xml []byte) (DMARCSummary, erro
 	sum.ReportID = fb.ReportMetadata.ReportID
 	sum.Begin = time.Unix(fb.ReportMetadata.DateRange.Begin, 0).UTC()
 	sum.End = time.Unix(fb.ReportMetadata.DateRange.End, 0).UTC()
+	// Reject reports for domains we don't serve BEFORE any write, so a forged
+	// report can neither inject rows nor pre-seed (org_name, report_id).
+	if owned != nil && !owned(ctx, sum.Domain) {
+		return DMARCSummary{}, errNotOwned
+	}
 	for _, rec := range fb.Records {
 		n := int64(rec.Row.Count)
 		// A row "passes" DMARC if the evaluated disposition is none AND at least
@@ -77,8 +99,13 @@ type TLSSummary struct {
 	FailureCount int64
 }
 
-// IngestTLSRPT parses a TLS-RPT JSON report and stores a summary.
+// IngestTLSRPT parses a TLS-RPT JSON report and stores a summary. Convenience
+// wrapper with no ownership gate (trusted callers/tests).
 func (s *Store) IngestTLSRPT(ctx context.Context, jsonReport []byte) (TLSSummary, error) {
+	return s.ingestTLSRPT(ctx, jsonReport, nil)
+}
+
+func (s *Store) ingestTLSRPT(ctx context.Context, jsonReport []byte, owned OwnedDomain) (TLSSummary, error) {
 	rj, err := tlsrpt.Parse(bytes.NewReader(jsonReport))
 	if err != nil {
 		return TLSSummary{}, err
@@ -93,6 +120,9 @@ func (s *Store) IngestTLSRPT(ctx context.Context, jsonReport []byte) (TLSSummary
 		if sum.Domain == "" && p.Policy.Domain != "" {
 			sum.Domain = p.Policy.Domain
 		}
+	}
+	if owned != nil && !owned(ctx, sum.Domain) {
+		return TLSSummary{}, errNotOwned
 	}
 	_, err = s.Pool.Exec(ctx,
 		`INSERT INTO tlsrpt_reports (domain, org_name, report_id, success_count, failure_count)

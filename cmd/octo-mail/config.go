@@ -56,6 +56,30 @@ func checkVERPConfig(cfg config) error {
 		"Set OCTO_MAIL_VERP_KEY, or set OCTO_MAIL_ALLOW_UNSIGNED_VERP=1 to allow the unsigned path (dev only)")
 }
 
+// checkReporterConfig validates the report role: outbound aggregate reports carry
+// this node's identity (org domain/email derived from hostname) to third parties,
+// so the default placeholder hostname would emit reports as "octo-mail.local" —
+// refuse it at startup rather than send misattributed mail.
+func checkReporterConfig(cfg config) error {
+	if !cfg.reporter {
+		return nil
+	}
+	if cfg.hostname == "" || cfg.hostname == "octo-mail.local" {
+		return fmt.Errorf("OCTO_MAIL_REPORTER=1 requires a real OCTO_MAIL_HOSTNAME: " +
+			"outbound DMARC reports are addressed as dmarc-reports@<hostname> and sent to third parties; " +
+			"the default 'octo-mail.local' would misattribute them")
+	}
+	// Inbound report ingestion routes RCPT by domain, and the RCPT dispatch checks
+	// the bounce domain BEFORE the report domain. If they collide, all report mail
+	// is swallowed by the bounce handler and silently never ingested — refuse it.
+	if cfg.reportDomain != "" && cfg.bounceDomain != "" && cfg.reportDomain == cfg.bounceDomain {
+		return fmt.Errorf("OCTO_MAIL_REPORT_DOMAIN must differ from OCTO_MAIL_BOUNCE_DOMAIN "+
+			"(both %q): report mail to a shared domain would be routed to the bounce handler and never ingested",
+			cfg.reportDomain)
+	}
+	return nil
+}
+
 // config is the node's runtime configuration, loaded from the environment.
 type config struct {
 	dsn      string
@@ -84,6 +108,19 @@ type config struct {
 	// is a fatal misconfiguration rather than a silent fail-open onto the forgeable
 	// unsigned attribution path (a security control, not a warning).
 	allowUnsignedVERP bool
+
+	// reporter, when true, enables the RFC 7489/8460 report ROLE: a leader-gated
+	// scheduler that generates+sends outbound DMARC aggregate reports, and an MX
+	// hook that ingests inbound reports addressed to reportDomain. Off by default —
+	// it sends mail to third parties, so it is opt-in. Requires a real (non-default)
+	// hostname for the report org identity.
+	reporter bool
+	// reportInterval is the outbound report scheduler cadence (leader-gated).
+	reportInterval time.Duration
+	// reportDomain is the domain of this node's inbound report address; mail to it
+	// is parsed and ingested instead of delivered (mirrors bounceDomain). Empty
+	// disables inbound ingestion even when reporter is true.
+	reportDomain string
 
 	blobDir string // fs blob store dir (used when s3Endpoint is empty)
 
@@ -146,6 +183,9 @@ func loadConfig() config {
 		bounceDomain:      envLower("OCTO_MAIL_BOUNCE_DOMAIN"),
 		verpKey:           []byte(os.Getenv("OCTO_MAIL_VERP_KEY")),
 		allowUnsignedVERP: os.Getenv("OCTO_MAIL_ALLOW_UNSIGNED_VERP") == "1",
+		reporter:          os.Getenv("OCTO_MAIL_REPORTER") == "1",
+		reportInterval:    envDuration("OCTO_MAIL_REPORT_INTERVAL", 6*time.Hour),
+		reportDomain:      envLower("OCTO_MAIL_REPORT_DOMAIN"),
 		maxSize:           envInt64("OCTO_MAIL_MAX_SIZE", 50*1024*1024),
 		maxConns:          int(envInt64("OCTO_MAIL_MAX_CONNS", 1024)),
 
