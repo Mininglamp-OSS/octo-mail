@@ -714,6 +714,17 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 			log.Warn("accept", "service", name, "err", err)
 			continue
 		}
+		// A connection already in the kernel accept queue can be returned AFTER
+		// ctx was cancelled but before the async ln.Close() fires. Admitting it
+		// would both let a new connection into a drain that is supposed to have
+		// stopped accepting, and — worse — call drain.track()'s wg.Add(1)
+		// concurrently with the shutdown path's wg.Wait(), which panics
+		// ("WaitGroup misuse: Add called concurrently with Wait"). Re-check here
+		// and refuse promptly.
+		if ctx.Err() != nil {
+			_ = conn.Close()
+			return
+		}
 		if sem != nil {
 			select {
 			case sem <- struct{}{}:

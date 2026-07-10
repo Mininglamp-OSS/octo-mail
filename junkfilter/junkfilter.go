@@ -251,13 +251,23 @@ func (m *Manager) Train(ctx context.Context, accountID int64, ham bool, raw []by
 			accountID, hamDelta, spamDelta); err != nil {
 			return err
 		}
+		if len(words) == 0 {
+			return nil
+		}
+		// Bulk-upsert every word's counter in ONE round trip via unnest, instead of
+		// an Exec per token (a token-heavy message would otherwise be hundreds of
+		// SQL round trips per train). The per-word delta is uniform for this message
+		// (hamDelta/spamDelta), so it is applied to each unnested word.
+		wl := make([]string, 0, len(words))
 		for w := range words {
-			if _, err := tx.Exec(ctx,
-				`INSERT INTO junk_words (account_id, word, ham, spam) VALUES ($1,$2,$3,$4)
-				 ON CONFLICT (account_id, word) DO UPDATE SET ham = junk_words.ham + $3, spam = junk_words.spam + $4`,
-				accountID, w, hamDelta, spamDelta); err != nil {
-				return err
-			}
+			wl = append(wl, w)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO junk_words (account_id, word, ham, spam)
+			 SELECT $1, w, $3, $4 FROM unnest($2::text[]) AS w
+			 ON CONFLICT (account_id, word) DO UPDATE SET ham = junk_words.ham + $3, spam = junk_words.spam + $4`,
+			accountID, wl, hamDelta, spamDelta); err != nil {
+			return err
 		}
 		return nil
 	})

@@ -98,6 +98,12 @@ func TestS3BlobRoundTrip(t *testing.T) {
 		t.Fatalf("ranged read = %q, want %q", string(buf[:m]), "quick brown")
 	}
 
+	// A zero-length ReadAt must be a no-op (0, nil) — never build an invalid
+	// "bytes=off-(off-1)" Range that the server would reject.
+	if zn, zerr := r2.ReadAt(nil, int64(idx)); zn != 0 || zerr != nil {
+		t.Fatalf("zero-length ReadAt = (%d, %v), want (0, nil)", zn, zerr)
+	}
+
 	// Delete removes it; a subsequent read fails with not-found. (Open is lazy — it
 	// defers existence to the first read to avoid a pre-Open HEAD — so not-found may
 	// surface at Open OR at the first Read; check the read path.)

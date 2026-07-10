@@ -37,9 +37,11 @@ type s3Store struct {
 	// for static long-lived credentials.
 	sessionToken string
 	// maxAttempts bounds per-request retries on transient failures (5xx / SlowDown /
-	// network errors). attemptTimeout bounds each individual attempt (so a stuck
-	// attempt is abandoned and retried, while a long-but-progressing streaming body
-	// is not capped by a whole-request deadline).
+	// network errors). attemptTimeout bounds each individual attempt for BOUNDED
+	// control requests (HEAD/DELETE/bucket, ranged ReadAt) — a stuck attempt is
+	// abandoned and retried. Streaming transfers (a full-object GET body, a PUT
+	// upload) are NOT subject to this deadline: a slow-but-progressing large body
+	// must not be capped (see retryDo's streaming parameter).
 	maxAttempts    int
 	attemptTimeout time.Duration
 	// nowFn is overridable in tests; defaults to time.Now.
@@ -96,12 +98,20 @@ func NewS3(cfg S3Config) (Store, error) {
 
 // retryDo signs and sends req, retrying on transient failures (network error,
 // 5xx, or S3 503 SlowDown) with capped exponential backoff + jitter, up to
-// maxAttempts. Each attempt gets its own timeout (attemptTimeout) derived from the
-// caller's ctx. payloadHash is the SigV4 X-Amz-Content-Sha256 for the (unchanging)
+// maxAttempts. payloadHash is the SigV4 X-Amz-Content-Sha256 for the (unchanging)
 // body; the request must be replayable (idempotent method, or GetBody set for a
 // body) since a retry re-sends it. The returned response's body is the caller's to
 // close.
-func (s *s3Store) retryDo(req *http.Request, payloadHash string) (*http.Response, error) {
+//
+// streaming distinguishes the two request classes. For a bounded control request
+// (HEAD/DELETE/bucket, or a size-bounded ranged ReadAt) each attempt gets its own
+// attemptTimeout deadline, so a stuck attempt is abandoned and retried. For a
+// STREAMING transfer (a large GET body held for sequential read, or a PUT upload)
+// no fixed whole-body deadline is imposed — a legitimately slow but steadily
+// progressing multi-GB transfer must not be killed by a 5-minute wall. The
+// transport's dial/TLS/response-header/idle timeouts still bound the risky setup
+// and stall phases in both cases; only the body-transfer phase differs.
+func (s *s3Store) retryDo(req *http.Request, payloadHash string, streaming bool) (*http.Response, error) {
 	parentCtx := req.Context()
 	var lastErr error
 	for attempt := 0; attempt < s.maxAttempts; attempt++ {
@@ -119,8 +129,13 @@ func (s *s3Store) retryDo(req *http.Request, payloadHash string) (*http.Response
 			}
 		}
 		// Fresh per-attempt request: reset the body from GetBody (net/http consumes
-		// it on send) and re-sign under a per-attempt deadline.
-		attemptCtx, cancel := context.WithTimeout(parentCtx, s.attemptTimeout)
+		// it on send) and re-sign. A control request runs under a per-attempt
+		// deadline; a streaming transfer runs under the caller's ctx only (no
+		// fixed body-transfer cap — see the streaming note above).
+		attemptCtx, cancel := parentCtx, context.CancelFunc(func() {})
+		if !streaming {
+			attemptCtx, cancel = context.WithTimeout(parentCtx, s.attemptTimeout)
+		}
 		r := req.Clone(attemptCtx)
 		if req.GetBody != nil {
 			body, err := req.GetBody()
@@ -198,7 +213,7 @@ func (s *s3Store) ensureBucket(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := s.retryDo(req, emptyHash)
+	resp, err := s.retryDo(req, emptyHash, false)
 	if err != nil {
 		return err
 	}
@@ -211,7 +226,7 @@ func (s *s3Store) ensureBucket(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cresp, err := s.retryDo(creq, emptyHash)
+	cresp, err := s.retryDo(creq, emptyHash, false)
 	if err != nil {
 		return err
 	}
@@ -271,7 +286,7 @@ func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 		return f, nil
 	}
 	payloadHash := hex.EncodeToString(sum)
-	resp, err := s.retryDo(req, payloadHash)
+	resp, err := s.retryDo(req, payloadHash, true)
 	if err != nil {
 		return "", 0, err
 	}
@@ -291,7 +306,7 @@ func (s *s3Store) head(ctx context.Context, key string) (bool, int64, error) {
 	if err != nil {
 		return false, 0, err
 	}
-	resp, err := s.retryDo(req, emptyHash)
+	resp, err := s.retryDo(req, emptyHash, false)
 	if err != nil {
 		return false, 0, err
 	}
@@ -323,7 +338,7 @@ func (s *s3Store) Delete(ctx context.Context, tenantID int64, ref Ref) error {
 	if err != nil {
 		return err
 	}
-	resp, err := s.retryDo(req, emptyHash)
+	resp, err := s.retryDo(req, emptyHash, false)
 	if err != nil {
 		return err
 	}
@@ -381,7 +396,9 @@ func (r *s3Reader) openStream(off int64) error {
 	if off > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", off))
 	}
-	resp, err := r.s.retryDo(req, emptyHash)
+	// Streaming: this body is held and consumed sequentially (potentially a
+	// multi-GB object), so it must not be capped by the per-attempt deadline.
+	resp, err := r.s.retryDo(req, emptyHash, true)
 	if err != nil {
 		return err
 	}
@@ -444,6 +461,10 @@ func (r *s3Reader) Read(p []byte) (int, error) {
 }
 
 func (r *s3Reader) ReadAt(p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		// A zero-length read must not build an invalid "bytes=off-(off-1)" Range.
+		return 0, nil
+	}
 	if err := r.ensureSize(); err != nil {
 		return 0, err
 	}
@@ -459,7 +480,9 @@ func (r *s3Reader) ReadAt(p []byte, off int64) (int, error) {
 		return 0, err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
-	resp, err := r.s.retryDo(req, emptyHash)
+	// Bounded: a ReadAt fetches at most len(p) bytes (an IMAP partial fetch), so
+	// the per-attempt deadline is appropriate.
+	resp, err := r.s.retryDo(req, emptyHash, false)
 	if err != nil {
 		return 0, err
 	}
