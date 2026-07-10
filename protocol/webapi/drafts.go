@@ -54,7 +54,7 @@ func (s *Server) createDraft(ctx context.Context, a authCtx, r *http.Request) (i
 	m := &store.Message{}
 	m.Flags.Draft = true
 	if _, err := a.acc.DeliverMailbox("Drafts", m, memBlob(raw)); err != nil {
-		return 0, nil, errStatus(http.StatusInternalServerError, "draft_failed", err.Error())
+		return 0, nil, internalErr("draft_failed", err)
 	}
 	return http.StatusCreated, map[string]any{"id": emailID(*m)}, nil
 }
@@ -90,7 +90,7 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 	}
 	ids, err := s.Submission.Submit(ctx, a.scope.Tenant().ID, a.acc.ID(), mailFr, rcpts, raw)
 	if err != nil {
-		return 0, nil, errStatus(http.StatusInternalServerError, "submit_failed", err.Error())
+		return 0, nil, internalErr("submit_failed", err)
 	}
 	return http.StatusAccepted, map[string]any{"submissionIds": ids}, nil
 }

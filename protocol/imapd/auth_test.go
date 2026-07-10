@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 	"github.com/Mininglamp-OSS/octo-mail/storage/postgres"
 	"github.com/mjl-/mox/imapclient"
+	"github.com/mjl-/mox/ratelimit"
 )
 
 // TestAuthCredentialVerification proves the credential-verification boundary is
@@ -90,4 +91,78 @@ func errFromPanic(r any) error {
 		return e
 	}
 	return fmt.Errorf("%v", r)
+}
+
+// TestLoginLimiterCountsOnlyFailures proves the #23 rate-limiter regression fix:
+// with a tight per-IP budget, repeated SUCCESSFUL logins are never throttled
+// (the limiter counts only failures), while a burst of failed logins is refused
+// once the window budget is exhausted.
+func TestLoginLimiterCountsOnlyFailures(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	mustScan(t, s, ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`, &tenantID)
+	mustScan(t, s, ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, &accID, tenantID)
+	mustScan(t, s, ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, &domID, tenantID)
+	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	s.Pool.Exec(ctx, `INSERT INTO principals (tenant_id, login) VALUES ($1,'u1@example.com')`, tenantID)
+	dir := s.NewDirectory()
+	if err := dir.SetPassword(ctx, "u1@example.com", "correct-horse"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tight budget: 3 failed attempts per minute for the whole /0 class, so the
+	// limit is easy to hit — yet successes must not consume it.
+	lim := &ratelimit.Limiter{WindowLimits: []ratelimit.WindowLimit{{Window: time.Minute, Limits: [...]int64{3, 3, 3}}}}
+	srv := &imapd.Server{Dir: dir, LoginLimiter: lim}
+
+	login := func(user, pass string) (rerr error) {
+		defer func() {
+			if r := recover(); r != nil {
+				rerr = errFromPanic(r)
+			}
+		}()
+		cc, sc := net.Pipe()
+		go func() { _ = srv.Serve(ctx, sc) }()
+		_ = cc.SetDeadline(time.Now().Add(60 * time.Second))
+		ic, err := imapclient.New(cc, &imapclient.Opts{Error: func(err error) { panic(err) }})
+		if err != nil {
+			return err
+		}
+		defer ic.Close()
+		_, err = ic.Login(user, pass)
+		return err
+	}
+
+	// Far more successful logins than the budget: none is throttled.
+	for i := 0; i < 10; i++ {
+		if err := login("u1@example.com", "correct-horse"); err != nil {
+			t.Fatalf("successful login #%d was throttled/rejected: %v", i+1, err)
+		}
+	}
+
+	// Now exhaust the failure budget: after 3 wrong-password failures, further
+	// attempts are refused by the limiter (still an error, but for throttling).
+	for i := 0; i < 3; i++ {
+		if err := login("u1@example.com", "wrong"); err == nil {
+			t.Fatalf("wrong password #%d was accepted", i+1)
+		}
+	}
+	if err := login("u1@example.com", "wrong"); err == nil {
+		t.Fatalf("attempt past the failure budget was accepted")
+	}
+	// A correct login is now also refused (the IP is throttled) — confirms the
+	// budget was actually consumed by the failures, not by the successes above.
+	if err := login("u1@example.com", "correct-horse"); err == nil {
+		t.Fatalf("expected throttled IP to be refused even with correct password")
+	}
+	t.Logf("OK: successful logins never throttled; failures consume the per-IP budget")
 }

@@ -50,3 +50,32 @@ func TestComposeCRLFAndInjection(t *testing.T) {
 		t.Fatalf("message does not end with CRLF")
 	}
 }
+
+// TestComposeAttachmentHeaderInjection guards finding #23-5: a crafted attachment
+// Content-Type (or filename) must not inject extra headers into the MIME part.
+func TestComposeAttachmentHeaderInjection(t *testing.T) {
+	raw, _, err := compose(composeInput{
+		From: "a@x.test",
+		To:   []string{"b@y.test"},
+		Text: "body",
+		Attachments: []attachment{{
+			Filename:    "ok.txt",
+			ContentType: "text/plain\r\nX-Injected: evil", // injection attempt
+			Content:     "aGVsbG8=",                       // base64 "hello"
+		}},
+	}, "x.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The smuggled header must not appear as its own line anywhere in the message.
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "x-injected:") {
+			t.Fatalf("attachment Content-Type header injection succeeded: %q", line)
+		}
+	}
+	// The Content-Type is still present, just with the CRLF stripped out.
+	if !bytes.Contains(raw, []byte("Content-Type: text/plainX-Injected: evil")) {
+		t.Fatalf("attachment content-type not sanitized as expected:\n%q", raw)
+	}
+	t.Logf("OK: attachment Content-Type CRLF stripped — no header injection")
+}

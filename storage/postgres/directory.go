@@ -65,6 +65,12 @@ func (d *Directory) AuthenticatePrincipal(ctx context.Context, login string, cre
 		`SELECT id, tenant_id, login, cred FROM principals WHERE login=$1`, login).
 		Scan(&p.ID, &p.TenantID, &p.Login, &credJSON)
 	if err == pgx.ErrNoRows {
+		// Spend the same argon2 cost on a missing login as on an existing one, so
+		// response timing can't be used to enumerate valid logins. Only for the
+		// password credential (the nil/resolve-only path is internal, not network).
+		if c, ok := cred.(directory.PasswordCredential); ok {
+			auth.VerifyDummy(string(c))
+		}
 		return nil, directory.Principal{}, fail
 	}
 	if err != nil {
@@ -231,6 +237,9 @@ func (d *Directory) AuthenticateAPIKey(ctx context.Context, token string) (direc
 		 WHERE key_prefix=$1 AND revoked_at IS NULL`, prefix).
 		Scan(&keyID, &tenantID, &accountID, &login, &credJSON)
 	if err == pgx.ErrNoRows {
+		// Match the cost of a real verify so an unknown key prefix can't be
+		// distinguished by timing.
+		auth.VerifyAPIKeyDummy(secret)
 		return nil, directory.Principal{}, 0, fail
 	}
 	if err != nil {
@@ -361,6 +370,22 @@ func (t *tenantScope) AccountForAddress(ctx context.Context, addr smtp.Path) (st
 		return nil, err
 	}
 	return t.s.openAccount(accID, t.info.ID, name), nil
+}
+
+// AccountForID resolves an account by id within this tenant. The WHERE clause
+// pins tenant_id, so an id from another tenant returns no row — isolation is
+// structural, not a caller convention.
+func (t *tenantScope) AccountForID(ctx context.Context, id int64) (store.Account, error) {
+	var name string
+	err := t.s.Pool.QueryRow(ctx,
+		`SELECT name FROM accounts WHERE id=$1 AND tenant_id=$2`, id, t.info.ID).Scan(&name)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("no such account")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return t.s.openAccount(id, t.info.ID, name), nil
 }
 
 func (t *tenantScope) Accounts(ctx context.Context) ([]store.Account, error) {

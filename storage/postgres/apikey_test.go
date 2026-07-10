@@ -98,3 +98,50 @@ func TestAPIKeyIssueAndAuthenticate(t *testing.T) {
 	_ = bobLogin
 	t.Logf("OK: API key issues, authenticates as its own account, rejects tampered/garbage/revoked, and cannot reach another tenant")
 }
+
+// TestAccountForIDTenantScoped proves the id-based opener added for #23 (API-key
+// auth opens the BOUND accountID rather than re-resolving by address): a scope
+// resolves its own account by id, and an id belonging to another tenant matches
+// nothing — isolation is structural, in the WHERE clause, not caller convention.
+func TestAccountForIDTenantScoped(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	t.Cleanup(s.Close)
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE accounts, domains, principals, tenants RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name, domain string) (int64, int64) {
+		var tid, aid int64
+		must(t, s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ($1) RETURNING id`, name).Scan(&tid))
+		must(t, s.Pool.QueryRow(ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,$2) RETURNING id`, tid, name).Scan(&aid))
+		return tid, aid
+	}
+	aliceTenant, aliceAcc := mk("alice", "acme.test")
+	_, bobAcc := mk("bob", "other.test")
+
+	dir := s.NewDirectory()
+	scope, err := dir.tenantScope(ctx, aliceTenant)
+	if err != nil {
+		t.Fatalf("tenantScope: %v", err)
+	}
+	// Own account resolves by id.
+	acc, err := scope.AccountForID(ctx, aliceAcc)
+	if err != nil {
+		t.Fatalf("AccountForID(own): %v", err)
+	}
+	if acc.ID() != aliceAcc {
+		t.Fatalf("AccountForID returned %d, want %d", acc.ID(), aliceAcc)
+	}
+	// Another tenant's account id must NOT resolve within alice's scope.
+	if _, err := scope.AccountForID(ctx, bobAcc); err == nil {
+		t.Fatalf("alice's scope resolved bob's account id — cross-tenant leak")
+	}
+	t.Logf("OK: AccountForID resolves own account and rejects a foreign-tenant id (structural isolation)")
+}

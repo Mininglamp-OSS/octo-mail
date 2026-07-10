@@ -141,7 +141,21 @@ func TestMetricsEndpoint(t *testing.T) {
 	hs := httptest.NewServer(admin.Handler())
 	defer hs.Close()
 
-	resp, err := http.Get(hs.URL + "/metrics")
+	// /metrics now requires the admin token: an unauthenticated scrape is 401 (it
+	// leaks queue depth, delivery timings, auth-attempt counts otherwise).
+	unauth, err := http.Get(hs.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauth.Body.Close()
+	if unauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /metrics status = %d, want 401", unauth.StatusCode)
+	}
+
+	// With the admin token it scrapes normally.
+	req, _ := http.NewRequest("GET", hs.URL+"/metrics", nil)
+	req.Header.Set("Authorization", "Bearer x")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		t.Fatalf("/metrics: err=%v status=%v", err, resp)
 	}
@@ -150,5 +164,56 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !bytes.Contains(body, []byte("octo_mail_outbound_sent_total")) {
 		t.Fatalf("/metrics did not expose octo_mail_outbound_sent_total")
 	}
-	t.Logf("OK: Prometheus /metrics exposes octo-mail counters")
+	t.Logf("OK: /metrics requires admin auth (401 without), exposes octo-mail counters with it")
+}
+
+// TestDuplicateResourceConflict proves the #23 error-mapping fix: a unique-
+// constraint violation (creating a duplicate tenant) is surfaced as an actionable
+// 409 Conflict, not swallowed into an opaque 500 — and the response body does not
+// echo the constraint name (no internal schema detail leaks).
+func TestDuplicateResourceConflict(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, dsn, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := &webadmin.Server{Pool: s.Pool, Dir: s.NewDirectory(), AdminToken: "secret-admin"}
+	hs := httptest.NewServer(admin.Handler())
+	defer hs.Close()
+
+	post := func(name string) *http.Response {
+		b, _ := json.Marshal(map[string]any{"name": name})
+		req, _ := http.NewRequest("POST", hs.URL+"/admin/tenants", bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer secret-admin")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /admin/tenants: %v", err)
+		}
+		return resp
+	}
+
+	// First create succeeds.
+	first := post("dupco")
+	first.Body.Close()
+	if first.StatusCode != 200 {
+		t.Fatalf("first create status %d, want 200", first.StatusCode)
+	}
+	// Second create of the same tenant name violates UNIQUE(name) → 409, not 500.
+	second := post("dupco")
+	body, _ := io.ReadAll(second.Body)
+	second.Body.Close()
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate create status %d, want 409; body=%s", second.StatusCode, body)
+	}
+	// The constraint name (e.g. "tenants_name_key") must not leak in the body.
+	if bytes.Contains(bytes.ToLower(body), []byte("constraint")) || bytes.Contains(body, []byte("_key")) {
+		t.Fatalf("409 body leaked schema detail: %s", body)
+	}
+	t.Logf("OK: duplicate resource → 409 Conflict, no constraint-name leak")
 }

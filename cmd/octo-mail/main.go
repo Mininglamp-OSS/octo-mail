@@ -44,6 +44,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/webui"
 	"github.com/mjl-/mox/dmarc"
 	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/ratelimit"
 	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/smtpclient"
 )
@@ -307,15 +308,23 @@ func run() error {
 		}
 		go serveTCPListener(ctx, log, "smtp-submission", cfg.submissionAddr, prebound["smtp-submission"], errc, cfg.maxConns, func(nc net.Conn) { _ = sub.Serve(ctx, nc) })
 	}
+	// Shared per-IP login throttle for the network auth surfaces (IMAP + JMAP +
+	// REST). Bounds brute-force / credential-stuffing and login/API-key
+	// enumeration: at most a few failed attempts per client IP per minute.
+	loginLimiter := &ratelimit.Limiter{WindowLimits: []ratelimit.WindowLimit{{
+		Window: time.Minute,
+		Limits: [3]int64{10, 100, 1000}, // per /32, /64-ish, /48-ish IP class
+	}}}
+
 	// IMAP (:143).
 	if cfg.imapAddr != "" {
-		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS, MaxSize: cfg.maxSize}
+		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS, MaxSize: cfg.maxSize, LoginLimiter: loginLimiter}
 		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, cfg.maxConns, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
 	}
 	// JMAP (HTTP) + webmail SPA (same origin, so the SPA's /jmap/* fetches work).
 	if cfg.jmapAddr != "" {
-		js := &jmapd.Server{Dir: dir, BaseURL: cfg.jmapBaseURL, Submission: submitter, Blob: bs}
-		wa := &webapi.Server{Dir: dir, Submission: submitter, Suppressions: &deliverability.Suppressions{Pool: s.Pool}}
+		js := &jmapd.Server{Dir: dir, BaseURL: cfg.jmapBaseURL, Submission: submitter, Blob: bs, Log: log, LoginLimiter: loginLimiter}
+		wa := &webapi.Server{Dir: dir, Submission: submitter, Suppressions: &deliverability.Suppressions{Pool: s.Pool}, Log: log, LoginLimiter: loginLimiter}
 		mux := http.NewServeMux()
 		mux.Handle("/jmap/", js.Handler())
 		mux.Handle("/webapi/", wa.Handler())
@@ -330,7 +339,7 @@ func run() error {
 		// Operators failing a queued message from the admin API bounce it back to
 		// the sender via the same DSN generator the worker uses at max attempts.
 		failDSN := &submit.DSNGenerator{Opener: s, Hostname: dns.Domain{ASCII: cfg.hostname}, Blob: bs}
-		as := &webadmin.Server{Pool: s.Pool, Dir: dir, Reputation: repo, AdminToken: cfg.adminToken,
+		as := &webadmin.Server{Pool: s.Pool, Dir: dir, Reputation: repo, AdminToken: cfg.adminToken, Log: log,
 			QueueFailDSN: failDSN.Generate}
 		srv := &http.Server{Addr: cfg.adminAddr, Handler: as.Handler()}
 		go serveHTTP(log, "admin", srv, cfg.maxConns, errc)
