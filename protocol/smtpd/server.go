@@ -82,8 +82,10 @@ type Server struct {
 
 	// DMARCRecorder, when set, accumulates each authenticated message's DMARC
 	// evaluation for later aggregate-report generation (P0-3). Injected as a func
-	// to avoid coupling smtpd to reportdb.
-	DMARCRecorder func(ctx context.Context, fromDomain, sourceIP, spf, dkim, disposition string)
+	// to avoid coupling smtpd to reportdb. rua is the sender domain's published
+	// aggregate-report destination (from the parsed DMARC record), or "" when the
+	// sender publishes none — without it no outbound report can be addressed.
+	DMARCRecorder func(ctx context.Context, fromDomain, rua, sourceIP, spf, dkim, disposition string)
 
 	// VacationResponder, when set, is invoked after a message is delivered to a
 	// recipient account's Inbox. It sends a JMAP vacation auto-reply if the
@@ -109,6 +111,18 @@ type Server struct {
 	// event + suppresses the recipient. Errors are logged, never bounced (a bounce
 	// of a bounce would loop). Injected to avoid coupling smtpd to deliverability.
 	BounceHandler func(ctx context.Context, verpLocalpart string, raw []byte)
+
+	// ReportDomain, when set, is the domain of this node's inbound RFC 7489/8460
+	// report address. Inbound mail whose recipient domain equals it is routed to
+	// ReportHandler instead of normal delivery (it belongs to no account),
+	// mirroring BounceDomain. Lowercase.
+	ReportDomain string
+
+	// ReportHandler, when set, processes a message delivered to ReportDomain: a
+	// DMARC aggregate (RUA) or TLS-RPT report. localpart is the recipient localpart.
+	// It extracts + parses the attachment and stores the report summary. Errors are
+	// logged, never bounced. Injected to avoid coupling smtpd to reportdb.
+	ReportHandler func(ctx context.Context, localpart string, raw []byte)
 }
 
 // JunkClassifier classifies a raw message for an account as spam or not.
@@ -182,6 +196,10 @@ type conn struct {
 	// bounceRcpts holds VERP recipient localparts for mail addressed to the
 	// bounce domain (ARF/DSN), routed to the bounce handler instead of a mailbox.
 	bounceRcpts []string
+	// reportRcpts holds recipient localparts for mail addressed to the report
+	// domain (DMARC RUA / TLS-RPT), routed to the report handler instead of a
+	// mailbox.
+	reportRcpts []string
 }
 
 func (c *conn) writef(format string, a ...any) error {
@@ -336,6 +354,7 @@ func (c *conn) reset() {
 	c.rcptAddrs = nil
 	c.subRcpts = nil
 	c.bounceRcpts = nil
+	c.reportRcpts = nil
 	c.subNotify = nil
 	c.subORcpt = nil
 	c.dsnRet = ""
@@ -709,7 +728,7 @@ func (c *conn) cmdRcpt(rest string) {
 		return
 	}
 	// LIMITS RCPTMAX (RFC 9422): reject once the per-message recipient cap is hit.
-	if len(c.rcpts)+len(c.subRcpts)+len(c.bounceRcpts) >= c.srv.maxRcpt() {
+	if len(c.rcpts)+len(c.subRcpts)+len(c.bounceRcpts)+len(c.reportRcpts) >= c.srv.maxRcpt() {
 		c.writef("452 4.5.3 too many recipients (RCPTMAX=%d)", c.srv.maxRcpt())
 		return
 	}
@@ -736,7 +755,7 @@ func (c *conn) cmdRcpt(rest string) {
 	isBounce := c.srv.BounceDomain != "" && c.srv.BounceHandler != nil &&
 		strings.EqualFold(addr.Domain.ASCII, c.srv.BounceDomain)
 	if isBounce {
-		if len(c.rcpts) > 0 {
+		if len(c.rcpts) > 0 || len(c.reportRcpts) > 0 {
 			c.writef("%d 5.5.1 cannot mix bounce-domain and normal recipients", smtp.C503BadCmdSeq)
 			return
 		}
@@ -744,8 +763,22 @@ func (c *conn) cmdRcpt(rest string) {
 		c.writef("%d 2.1.5 OK", smtp.C250Completed)
 		return
 	}
-	if len(c.bounceRcpts) > 0 {
-		c.writef("%d 5.5.1 cannot mix normal and bounce-domain recipients", smtp.C503BadCmdSeq)
+	// Mail to the report domain (DMARC RUA / TLS-RPT) likewise belongs to no
+	// account: accept and route to the report handler after DATA. Kept exclusive
+	// from bounce and normal recipients for the same short-circuit reason.
+	isReport := c.srv.ReportDomain != "" && c.srv.ReportHandler != nil &&
+		strings.EqualFold(addr.Domain.ASCII, c.srv.ReportDomain)
+	if isReport {
+		if len(c.rcpts) > 0 || len(c.bounceRcpts) > 0 {
+			c.writef("%d 5.5.1 cannot mix report-domain and other recipients", smtp.C503BadCmdSeq)
+			return
+		}
+		c.reportRcpts = append(c.reportRcpts, string(addr.Localpart))
+		c.writef("%d 2.1.5 OK", smtp.C250Completed)
+		return
+	}
+	if len(c.bounceRcpts) > 0 || len(c.reportRcpts) > 0 {
+		c.writef("%d 5.5.1 cannot mix normal and bounce/report-domain recipients", smtp.C503BadCmdSeq)
 		return
 	}
 	target, err := c.srv.Dir.ResolveInbound(c.ctx, addr.Path())
@@ -760,7 +793,7 @@ func (c *conn) cmdRcpt(rest string) {
 
 func (c *conn) cmdData() error {
 	submission := c.srv.Submission != nil
-	haveRcpt := len(c.rcpts) > 0 || len(c.bounceRcpts) > 0
+	haveRcpt := len(c.rcpts) > 0 || len(c.bounceRcpts) > 0 || len(c.reportRcpts) > 0
 	if submission {
 		haveRcpt = len(c.subRcpts) > 0
 	}
@@ -810,7 +843,7 @@ func (c *conn) cmdBDAT(rest string) error {
 		return c.writef("%d 5.5.4 bad BDAT size", smtp.C501BadParamSyntax)
 	}
 	last := len(fields) >= 2 && strings.EqualFold(fields[1], "LAST")
-	if !c.haveFrom || (len(c.rcpts) == 0 && len(c.subRcpts) == 0 && len(c.bounceRcpts) == 0) {
+	if !c.haveFrom || (len(c.rcpts) == 0 && len(c.subRcpts) == 0 && len(c.bounceRcpts) == 0 && len(c.reportRcpts) == 0) {
 		return c.writef("%d 5.5.1 need MAIL and RCPT first", smtp.C503BadCmdSeq)
 	}
 	// Reject an oversized chunk BEFORE allocating it — a client-controlled size
@@ -892,6 +925,22 @@ func (c *conn) processData(data []byte) error {
 		return c.writef("%d 2.0.0 accepted", smtp.C250Completed)
 	}
 
+	// Mail to the report domain (DMARC RUA / TLS-RPT): hand each distinct recipient
+	// to the report handler and accept. Dedup so one physical message addressed to
+	// the same localpart twice ingests once. Never bounce a report.
+	if len(c.reportRcpts) > 0 && c.srv.ReportHandler != nil {
+		seen := make(map[string]bool, len(c.reportRcpts))
+		for _, lp := range c.reportRcpts {
+			if seen[lp] {
+				continue
+			}
+			seen[lp] = true
+			c.srv.ReportHandler(c.ctx, lp, data)
+		}
+		c.reset()
+		return c.writef("%d 2.0.0 accepted", smtp.C250Completed)
+	}
+
 	if submission {
 		// Enqueue to the shared outbound queue; the queue worker delivers. Carry
 		// the RFC 3461 DSN params (RET/ENVID per-message, NOTIFY/ORCPT per-rcpt).
@@ -940,7 +989,7 @@ func (c *conn) processData(data []byte) error {
 					if res.DMARC.Reject {
 						disp = "reject"
 					}
-					c.srv.DMARCRecorder(c.ctx, fd, ipString(c.remoteIP()), string(res.SPF), dkimStatus(res), disp)
+					c.srv.DMARCRecorder(c.ctx, fd, dmarcRUA(res), ipString(c.remoteIP()), string(res.SPF), dkimStatus(res), disp)
 				}
 			}
 			// DNSBL-listed clients are rejected outright.
@@ -1114,6 +1163,24 @@ func dkimStatus(res inbound.Result) string {
 		return string(res.DKIM[0].Status)
 	}
 	return "none"
+}
+
+// dmarcRUA returns the sender domain's first published aggregate-report address
+// (the "rua=" tag), with the "mailto:" scheme stripped, or "" when the sender
+// publishes no DMARC record or no rua. Uses the already-parsed record on the
+// evaluation result — no extra DNS lookup. Only the first address is used; the
+// report is sent to one destination.
+func dmarcRUA(res inbound.Result) string {
+	if res.DMARC.Record == nil {
+		return ""
+	}
+	for _, u := range res.DMARC.Record.AggregateReportAddresses {
+		addr := strings.TrimPrefix(u.Address, "mailto:")
+		if addr != "" {
+			return addr
+		}
+	}
+	return ""
 }
 
 // parsePathOrZero parses an SMTP address into a smtp.Path, or a zero Path for an

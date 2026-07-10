@@ -42,6 +42,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/security/privsep"
 	"github.com/Mininglamp-OSS/octo-mail/storage/postgres"
 	"github.com/Mininglamp-OSS/octo-mail/webui"
+	"github.com/mjl-/mox/dmarc"
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/smtpclient"
 )
@@ -103,6 +104,9 @@ func run() error {
 	// silently emit unsigned, forgeable return-paths — the exact fail-open the
 	// control exists to prevent.
 	if err := checkVERPConfig(cfg); err != nil {
+		return err
+	}
+	if err := checkReporterConfig(cfg); err != nil {
 		return err
 	}
 	if cfg.bounceDomain != "" && len(cfg.verpKey) == 0 {
@@ -238,8 +242,8 @@ func run() error {
 	if cfg.smtpAddr != "" {
 		vacation := &autoreply.Responder{Lookup: s.LookupAccountByID, Submitter: submitter}
 		mx := &smtpd.Server{Dir: dir, Hostname: cfg.hostname, MaxSize: cfg.maxSize, TLSConfig: nil, Auth: authenticator, RejectDMARCFail: cfg.rejectDMARC, Junk: junkMgr, Decider: decider,
-			DMARCRecorder: func(ctx context.Context, fromDomain, sourceIP, spf, dkim, disposition string) {
-				_ = reports.RecordDMARCAgg(ctx, fromDomain, "", sourceIP, spf, dkim, disposition)
+			DMARCRecorder: func(ctx context.Context, fromDomain, rua, sourceIP, spf, dkim, disposition string) {
+				_ = reports.RecordDMARCAgg(ctx, fromDomain, rua, sourceIP, spf, dkim, disposition)
 			},
 			VacationResponder: func(ctx context.Context, accountID int64, sender, recipient string, raw []byte) {
 				if err := vacation.Respond(ctx, accountID, sender, recipient, raw); err != nil {
@@ -270,6 +274,20 @@ func run() error {
 				// let one complaint silence a tenant's mail to a whole provider.
 				// Suppression stays driven by the delivery-time hard-bounce path.
 				log.InfoContext(ctx, "bounce/complaint recorded", "tenant", c.TenantID, "kind", c.Kind)
+			}
+		}
+		// Report ingestion: route mail addressed to the report domain (DMARC RUA /
+		// TLS-RPT) to the report store instead of a mailbox. Enabled with the reporter
+		// role + a configured report domain.
+		if cfg.reporter && cfg.reportDomain != "" {
+			mx.ReportDomain = cfg.reportDomain
+			mx.ReportHandler = func(ctx context.Context, localpart string, raw []byte) {
+				kind, err := reports.IngestMessage(ctx, raw)
+				if err != nil {
+					log.WarnContext(ctx, "report ingest", "localpart", localpart, "err", err)
+					return
+				}
+				log.InfoContext(ctx, "report ingested", "kind", kind, "localpart", localpart)
 			}
 		}
 		go serveTCPListener(ctx, log, "smtp-mx", cfg.smtpAddr, prebound["smtp-mx"], errc, cfg.maxConns, func(nc net.Conn) { _ = mx.Serve(ctx, nc) })
@@ -507,6 +525,76 @@ func run() error {
 			}
 		}
 		go warmCoord.Run(ctx)
+	}
+
+	// RFC 7489 report role: a leader-gated scheduler that turns accumulated
+	// dmarc_agg rows into outbound aggregate reports. Opt-in (sends mail to third
+	// parties) and a cluster singleton with a NON-idempotent side effect, so it is
+	// leader-gated AND epoch-fenced (C2): across a PG promotion two leaders must not
+	// double-send. Reports are submitted as a reserved system tenant/account (the
+	// queue's tenant_id/account_id FKs require real rows for node-originated mail).
+	if cfg.reporter {
+		sysTenantID, sysAccountID, err := s.EnsureSystemAccount(ctx)
+		if err != nil {
+			return fmt.Errorf("provision system account for reporter: %w", err)
+		}
+		orgDomain := cfg.hostname
+		orgEmail := "dmarc-reports@" + cfg.hostname
+		reportResolver := dns.StrictResolver{Pkg: "octo-mail"}
+		// RFC 7489 §7.1 anti-reflection: only send an aggregate report to a rua whose
+		// domain is authorized to receive reports for the reported domain. A rua in
+		// the SAME domain as the reported domain is implicitly authorized (no lookup);
+		// a third-party rua must publish "<reported>._report._dmarc.<rua-domain>".
+		// Without this, a sender could publish rua=mailto:victim@x and steer us into
+		// mailing reports to an arbitrary address.
+		ruaAuthorized := func(ctx context.Context, reportedDomain, ruaAddr string) bool {
+			at := strings.LastIndexByte(ruaAddr, '@')
+			if at < 0 {
+				return false
+			}
+			ruaDomain := ruaAddr[at+1:]
+			if strings.EqualFold(ruaDomain, reportedDomain) {
+				return true // same-domain rua needs no external authorization
+			}
+			rd, err := dns.ParseDomain(reportedDomain)
+			if err != nil {
+				return false
+			}
+			ed, err := dns.ParseDomain(ruaDomain)
+			if err != nil {
+				return false
+			}
+			accepts, _, _, _, _, err := dmarc.LookupExternalReportsAccepted(ctx, nil, reportResolver, rd, ed)
+			return err == nil && accepts
+		}
+		const reportLeaderKey = int64(0x6f6d5f72707274) // "om_rprt"
+		repCoord := ha.NewCoordinator(ha.New(s.Pool, reportLeaderKey, cfg.nodeID), cfg.reportInterval)
+		repCoord.OnElected = func(context.Context) { log.Info("elected dmarc-report leader", "node", cfg.nodeID) }
+		repCoord.OnLost = func() { log.Info("lost dmarc-report leadership", "node", cfg.nodeID) }
+		repCoord.Tick = func(ctx context.Context) {
+			domains, err := reports.UnreportedDMARCDomains(ctx)
+			if err != nil {
+				log.Warn("dmarc report: list domains", "err", err)
+				return
+			}
+			leader := repCoord.Leader()
+			for _, d := range domains {
+				sent, err := reports.SendDMARCReportFenced(ctx, leader.FenceExec, ruaAuthorized, submitter,
+					sysTenantID, sysAccountID, d, orgDomain, orgEmail)
+				if err != nil {
+					if errors.Is(err, ha.ErrFenced) {
+						// Lost leadership mid-run; stop — the new leader takes over.
+						return
+					}
+					log.Warn("dmarc report send", "domain", d, "err", err)
+					continue
+				}
+				if sent {
+					log.Info("dmarc aggregate report sent", "domain", d)
+				}
+			}
+		}
+		go repCoord.Run(ctx)
 	}
 
 	// Webhook delivery worker.

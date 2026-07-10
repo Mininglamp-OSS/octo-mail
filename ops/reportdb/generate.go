@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/mjl-/mox/dmarcrpt"
 	"github.com/mjl-/mox/tlsrpt"
 )
@@ -31,12 +32,23 @@ func (s *Store) RecordDMARCAgg(ctx context.Context, fromDomain, rua, sourceIP, s
 	return err
 }
 
+// querier is the subset of pgxpool.Pool / pgx.Tx that GenerateDMARCReport needs,
+// so the report can be built either standalone (on the pool) or inside a fenced
+// transaction (so its row set exactly matches the reported=true claim).
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
 // GenerateDMARCReport builds an RFC 7489 aggregate report (Feedback) for one
 // from-domain from the unreported aggregate rows, marshaled to XML. Returns the
 // XML, the rua address, and whether there was anything to report. orgDomain and
 // orgEmail identify us (the reporting receiver). reportID must be stable/unique.
 func (s *Store) GenerateDMARCReport(ctx context.Context, fromDomain, orgDomain, orgEmail, reportID string, begin, end time.Time) ([]byte, string, bool, error) {
-	rows, err := s.Pool.Query(ctx,
+	return generateDMARCReport(ctx, s.Pool, fromDomain, orgDomain, orgEmail, reportID, begin, end)
+}
+
+func generateDMARCReport(ctx context.Context, q querier, fromDomain, orgDomain, orgEmail, reportID string, begin, end time.Time) ([]byte, string, bool, error) {
+	rows, err := q.Query(ctx,
 		`SELECT rua, source_ip, spf_result, dkim_result, disposition, count
 		 FROM dmarc_agg WHERE from_domain=$1 AND NOT reported`, fromDomain)
 	if err != nil {
@@ -120,6 +132,106 @@ func (s *Store) SendDMARCReport(ctx context.Context, sender Sender, tenantID, ac
 		return true, err
 	}
 	return true, nil
+}
+
+// FenceFunc runs fn inside a leadership-fenced transaction, committing only if
+// the caller still holds leadership at its epoch (else returns ha.ErrFenced
+// without running fn). It is exactly ha.Leader.FenceExec; taking it as a param
+// keeps reportdb decoupled from ops/ha.
+type FenceFunc func(ctx context.Context, fn func(pgx.Tx) error) error
+
+// RUAAuthorizer reports whether extDestDomain (the domain of the rua address) has
+// opted in to receiving DMARC aggregate reports for reportedDomain, per RFC 7489
+// §7.1 (the "<reported>._report._dmarc.<rua-domain>" TXT record). When the rua is
+// a third-party domain this MUST return true before we send, or octo-mail becomes
+// an attacker-steerable mail reflector: a sender can publish rua=mailto:victim@x
+// and have us email reports to an arbitrary address. Same-domain rua (rua domain
+// == reportedDomain) needs no lookup and should return true. Injected to keep
+// reportdb decoupled from dns/mox.
+type RUAAuthorizer func(ctx context.Context, reportedDomain, ruaAddr string) bool
+
+// SendDMARCReportFenced is the leader-gated, promotion-safe variant of
+// SendDMARCReport (H18): it is the first NON-idempotent leader job, so it must not
+// double-send across a PostgreSQL failover where two nodes briefly believe they
+// lead.
+//
+// Atomicity: the report is generated AND the idempotency claim
+// (UPDATE dmarc_agg SET reported=true) run in the SAME fenced transaction, so the
+// report's row set exactly matches the rows marked reported — no row added between
+// generate and claim can be silently marked reported without appearing in a
+// report. A fenced old leader's transaction rolls back (fence returns
+// ha.ErrFenced) and it never proceeds; only the node whose claim commits enqueues
+// the report, AFTER the fenced commit (Sender.Submit opens its own queue
+// transaction and cannot enroll in the fence's tx). This yields at-most-once
+// marking with an at-least-once send ATTEMPT: a crash (or a Submit error) between
+// the commit and Submit loses a single report window, acceptable for aggregate
+// reports and strictly safer than the double-send the unfenced path allows.
+//
+// authorized verifies the rua's domain is allowed to receive reports for
+// fromDomain (RFC 7489 §7.1) BEFORE any send — the anti-reflection control.
+// Returns whether a report was enqueued.
+func (s *Store) SendDMARCReportFenced(ctx context.Context, fence FenceFunc, authorized RUAAuthorizer, sender Sender, tenantID, accountID int64, fromDomain, orgDomain, orgEmail string) (bool, error) {
+	end := time.Now().UTC()
+	begin := end.Add(-24 * time.Hour)
+	reportID := orgDomain + "-" + fromDomain + "-" + strconv.FormatInt(end.Unix(), 10)
+
+	// Generate the report AND claim its rows in one fenced transaction, so the
+	// report and the reported=true mark cover exactly the same rows.
+	var xmlBody []byte
+	var rua string
+	var claimed bool
+	if err := fence(ctx, func(tx pgx.Tx) error {
+		body, r, ok, e := generateDMARCReport(ctx, tx, fromDomain, orgDomain, orgEmail, reportID, begin, end)
+		if e != nil || !ok {
+			return e // nothing to report → claimed stays false
+		}
+		ct, e := tx.Exec(ctx, `UPDATE dmarc_agg SET reported=true WHERE from_domain=$1 AND NOT reported`, fromDomain)
+		if e != nil {
+			return e
+		}
+		xmlBody, rua, claimed = body, r, ct.RowsAffected() > 0
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if !claimed || rua == "" {
+		return false, nil // nothing to report, already claimed, or no published rua
+	}
+	// RFC 7489 §7.1 anti-reflection: never send to a third-party rua that has not
+	// opted in to receiving our reports for this domain. The rows are already
+	// claimed (marked reported), so a rejected external rua simply drops this
+	// window rather than letting an attacker steer mail to a victim address.
+	if authorized != nil && !authorized(ctx, fromDomain, rua) {
+		return false, nil
+	}
+	// Enqueue exactly once.
+	msg := buildReportMessage(orgEmail, rua, "Report Domain: "+fromDomain+" Submitter: "+orgDomain,
+		"application/xml", "dmarc-report.xml", xmlBody)
+	if _, err := sender.Submit(ctx, tenantID, accountID, orgEmail, []string{rua}, msg); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// UnreportedDMARCDomains returns the from-domains that have unreported aggregate
+// rows with a non-empty reporting address — the work list for the report
+// scheduler. A domain with rows but no published rua is skipped (nothing to send).
+func (s *Store) UnreportedDMARCDomains(ctx context.Context) ([]string, error) {
+	rows, err := s.Pool.Query(ctx,
+		`SELECT DISTINCT from_domain FROM dmarc_agg WHERE NOT reported AND rua <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
 }
 
 // GenerateTLSReport builds a TLS-RPT JSON report for a domain from its stored

@@ -35,3 +35,31 @@ func (s *Store) AccountName(ctx context.Context, id int64) (string, error) {
 	err := s.Pool.QueryRow(ctx, `SELECT name FROM accounts WHERE id=$1`, id).Scan(&name)
 	return name, err
 }
+
+// systemAccountName is the reserved name of the tenant + account outbound reports
+// (DMARC aggregate reports) are submitted as. It is not a real mailbox login — it
+// exists only to satisfy the queue's tenant_id/account_id foreign keys for
+// node-originated mail that belongs to no tenant.
+const systemAccountName = "__octo_system__"
+
+// EnsureSystemAccount idempotently provisions the reserved system tenant + account
+// used to send node-originated mail (outbound DMARC reports) and returns their ids.
+// Safe to call on every node at startup and concurrently: the upserts are keyed on
+// the unique (tenants.name) / (accounts.tenant_id, name) constraints, and the
+// no-op DO UPDATE guarantees RETURNING yields the row whether it was just inserted
+// or already existed.
+func (s *Store) EnsureSystemAccount(ctx context.Context) (tenantID, accountID int64, err error) {
+	if err = s.Pool.QueryRow(ctx,
+		`INSERT INTO tenants (name) VALUES ($1)
+		 ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name
+		 RETURNING id`, systemAccountName).Scan(&tenantID); err != nil {
+		return 0, 0, err
+	}
+	if err = s.Pool.QueryRow(ctx,
+		`INSERT INTO accounts (tenant_id, name) VALUES ($1,$2)
+		 ON CONFLICT (tenant_id, name) DO UPDATE SET name=EXCLUDED.name
+		 RETURNING id`, tenantID, systemAccountName).Scan(&accountID); err != nil {
+		return 0, 0, err
+	}
+	return tenantID, accountID, nil
+}

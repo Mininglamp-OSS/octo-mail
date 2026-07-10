@@ -118,3 +118,10 @@ func (c *Coordinator) Run(ctx context.Context) {
 // consistent with the OnElected/OnLost callbacks and does not race the Run
 // goroutine on the underlying Leader connection.
 func (c *Coordinator) IsLeader() bool { return c.wasLeader.Load() }
+
+// Leader returns the underlying Leader, so a Tick job can reach FenceExec/Epoch
+// to run non-idempotent singleton work under the promotion fence. Only meaningful
+// to call from within Tick (i.e. while this node holds leadership); the campaign
+// goroutine owns the Leader's connection, and FenceExec deliberately borrows a
+// fresh pooled connection so it is safe to call concurrently with the campaign.
+func (c *Coordinator) Leader() *Leader { return c.leader }
