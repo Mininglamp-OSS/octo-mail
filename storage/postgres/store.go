@@ -133,8 +133,12 @@ func Open(ctx context.Context, dsn string, bs blob.Store) (*Store, error) {
 		return nil, fmt.Errorf("bootstrap advisory lock: %w", err)
 	}
 	_, ddlErr := conn.Exec(ctx, ddl)
-	// Release the lock on the same connection before returning it to the pool.
-	_, unlockErr := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, schemaBootstrapKey)
+	// Release the lock on the same connection before returning it to the pool. Use
+	// a ctx detached from cancellation: if the DDL failed because ctx was
+	// cancelled/timed out, the unlock must still reach Postgres rather than fail
+	// alongside it. (pool.Close() on the error paths would also drop the session
+	// and auto-release the lock, but releasing explicitly is not left to teardown.)
+	_, unlockErr := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, schemaBootstrapKey)
 	conn.Release()
 	if ddlErr != nil {
 		pool.Close()

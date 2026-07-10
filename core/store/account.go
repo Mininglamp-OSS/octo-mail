@@ -58,8 +58,9 @@ type Account interface {
 	Tx(ctx context.Context, fn func(Tx) error) error
 
 	// ReadTx runs fn in a read-only transaction: no advisory lock (concurrent
-	// reads don't serialize), a single MVCC snapshot, and no changelog flush or
-	// publish. fn must not mutate — the backend opens it read-only. Use for pure
+	// reads don't serialize), a single MVCC snapshot for the whole tx (RepeatableRead,
+	// so multi-statement reads are internally consistent), and no changelog flush
+	// or publish. fn must not mutate — the backend opens it read-only. Use for pure
 	// reads (IMAP FETCH/SEARCH/STATUS/SORT, read-only JMAP/webapi GETs).
 	ReadTx(ctx context.Context, fn func(Tx) error) error
 

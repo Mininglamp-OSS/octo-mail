@@ -22,7 +22,7 @@ const mboxFrom = "From "
 // by prepending ">". Returns the number of messages exported.
 func ExportMbox(ctx context.Context, acc store.Account, mailbox string, w io.Writer) (int, error) {
 	var msgs []store.Message
-	err := acc.Tx(ctx, func(tx store.Tx) error {
+	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		mb, err := acc.MailboxFind(tx, mailbox)
 		if err != nil {
 			return err

@@ -11,7 +11,7 @@ import (
 // GET /webapi/v0/drafts
 func (s *Server) listDrafts(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
 	var out []messageSummary
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		mb, e := a.acc.MailboxFind(tx, "Drafts")
 		if e != nil {
 			return e
@@ -70,7 +70,7 @@ func (s *Server) sendDraft(ctx context.Context, a authCtx, r *http.Request) (int
 		rcpts  []string
 		mailFr = a.login
 	)
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
 		if e != nil {
 			return e

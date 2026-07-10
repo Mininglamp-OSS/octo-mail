@@ -167,7 +167,10 @@ func (a *account) AddSibling(tx store.Tx, src store.Message, mb *store.Mailbox) 
 	return *nm, changes, nil
 }
 
-// MessageRemove expunges messages: marks rows, records ChangeRemoveUIDs, updates counts.
+// MessageRemove expunges messages: marks rows, records ChangeRemoveUIDs, updates
+// counts. All msgs must belong to mb: the count deltas (including c_deleted) are
+// applied to that single mailbox. Every current caller passes rows from one
+// mailbox; a future multi-mailbox caller would need per-mailbox aggregation.
 func (a *account) MessageRemove(tx store.Tx, modseq store.ModSeq, mb *store.Mailbox, opts store.RemoveOpts, msgs ...store.Message) (store.ChangeRemoveUIDs, store.ChangeMailboxCounts, error) {
 	pt := tx.(*pgTx)
 	if modseq == 0 {

@@ -81,12 +81,17 @@ func (a *account) Tx(ctx context.Context, fn func(store.Tx) error) error {
 
 // ReadTx runs fn in a READ-ONLY transaction: it takes NO advisory lock (so
 // concurrent reads don't serialize against each other or against the writer) and
-// never flushes/publishes. fn sees a single MVCC snapshot. The tx is opened
-// pgx.ReadOnly so any accidental write in fn fails at the database, not silently;
-// the write flag is false so flush is a no-op even if reached. Use for pure IMAP
-// FETCH/SEARCH/STATUS/SORT and read-only JMAP/webapi GETs.
+// never flushes/publishes. fn sees a single MVCC snapshot — the tx runs at
+// RepeatableRead so a multi-statement read (e.g. IMAP STATUS, a webapi list's
+// count+page, a JMAP query's group scans) is internally consistent even though
+// the per-account advisory lock is no longer held to serialize against writers.
+// Read-only RepeatableRead is cheap (no serialization failures for read-only
+// work). The tx is opened pgx.ReadOnly so any accidental write in fn fails at the
+// database, not silently; the write flag is false so flush is a no-op even if
+// reached. Use for pure IMAP FETCH/SEARCH/STATUS/SORT and read-only
+// JMAP/webapi GETs.
 func (a *account) ReadTx(ctx context.Context, fn func(store.Tx) error) error {
-	return pgx.BeginTxFunc(ctx, a.s.Pool, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+	return pgx.BeginTxFunc(ctx, a.s.Pool, pgx.TxOptions{AccessMode: pgx.ReadOnly, IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
 		pt := &pgTx{ctx: ctx, tx: tx, acc: a, write: false}
 		return fn(pt)
 	})
