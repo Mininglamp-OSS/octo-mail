@@ -146,6 +146,56 @@ func TestSendDMARCReportRUAReflectionBlocked(t *testing.T) {
 	t.Logf("OK: report to an unauthorized third-party rua is blocked (no send), rows still claimed")
 }
 
+// TestSendDMARCReportRUAConsistentTarget proves the authorize-target and
+// send-target are the same rua even when one from_domain has rows carrying
+// DIFFERENT rua values (a sender rotating its published rua= mid-window). The
+// authorizer only permits a specific address; the report must be generated for
+// and sent to exactly that authorized rua — never a co-pending unauthorized one.
+func TestSendDMARCReportRUAConsistentTarget(t *testing.T) {
+	ctx := context.Background()
+	pool := openAggPool(t)
+	s := &reportdb.Store{Pool: pool}
+	// Two unreported rows for one from_domain with different rua values. The
+	// canonical (max) rua is the one lexically greater; make that the ONLY one the
+	// authorizer permits, and an attacker-controlled address the other.
+	const authorizedRUA = "zzz-authorized@self.example" // lexical max
+	const evilRUA = "aaa-victim@target.example"
+	if err := s.RecordDMARCAgg(ctx, "sender.example", authorizedRUA, "203.0.113.1", "pass", "pass", "none"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordDMARCAgg(ctx, "sender.example", evilRUA, "203.0.113.2", "fail", "fail", "reject"); err != nil {
+		t.Fatal(err)
+	}
+	// Authorize ONLY the canonical rua; deny anything else.
+	onlyAuthorized := func(ctx context.Context, reportedDomain, ruaAddr string) reportdb.RUAResult {
+		if ruaAddr == authorizedRUA {
+			return reportdb.RUAAuthorized
+		}
+		return reportdb.RUADenied
+	}
+	sender := &stubSender{}
+	sent, err := s.SendDMARCReportFenced(ctx, realFence(pool), onlyAuthorized, sender, 1, 1, "sender.example", "mx.example.com", "postmaster@example.com")
+	if err != nil {
+		t.Fatalf("send err: %v", err)
+	}
+	// A report is sent, and ONLY to the authorized rua — never the evil one.
+	if !sent || len(sender.to) != 1 {
+		t.Fatalf("want exactly one send, got sent=%v to=%v", sent, sender.to)
+	}
+	if sender.to[0] != authorizedRUA {
+		t.Fatalf("report sent to %q, want the authorized rua %q (authorize/send divergence)", sender.to[0], authorizedRUA)
+	}
+	// The evil rua's row must remain unreported (it was never authorized), so it is
+	// re-evaluated on a later tick against its OWN address, not smuggled into this
+	// report.
+	var evilUnreported int
+	pool.QueryRow(ctx, `SELECT count(*) FROM dmarc_agg WHERE from_domain='sender.example' AND rua=$1 AND NOT reported`, evilRUA).Scan(&evilUnreported)
+	if evilUnreported != 1 {
+		t.Fatalf("evil-rua row unreported=%d, want 1 (must not be claimed under the authorized rua's report)", evilUnreported)
+	}
+	t.Logf("OK: report authorized for and sent to the same rua; a co-pending unauthorized rua is neither sent to nor claimed")
+}
+
 // TestSendDMARCReportRUATransient proves a TRANSIENT authorization failure (e.g. a
 // DNS temperror) neither sends nor claims — the rows stay unreported so the next
 // tick retries, rather than permanently dropping a legitimate window (P1-d).

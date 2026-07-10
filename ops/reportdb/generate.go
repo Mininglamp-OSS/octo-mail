@@ -45,33 +45,42 @@ type querier interface {
 // orgEmail identify us (the reporting receiver). reportID must be stable/unique.
 // The report's DateRange is derived from the actual days of the included rows, so
 // it accurately states the window the data covers (RFC 7489 §7.2) rather than a
-// fixed last-24h assumption.
+// fixed last-24h assumption. It reports the canonical (max) rua for the domain,
+// scoping the report to rows carrying exactly that rua.
 func (s *Store) GenerateDMARCReport(ctx context.Context, fromDomain, orgDomain, orgEmail, reportID string) ([]byte, string, bool, error) {
-	body, rua, _, ok, err := generateDMARCReport(ctx, s.Pool, fromDomain, orgDomain, orgEmail, reportID)
+	var rua string
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT COALESCE(max(rua), '') FROM dmarc_agg WHERE from_domain=$1 AND NOT reported AND rua <> ''`,
+		fromDomain).Scan(&rua); err != nil {
+		return nil, "", false, err
+	}
+	if rua == "" {
+		return nil, "", false, nil
+	}
+	body, _, ok, err := generateDMARCReport(ctx, s.Pool, fromDomain, rua, orgDomain, orgEmail, reportID)
 	return body, rua, ok, err
 }
 
-// generateDMARCReport builds the report and also returns the actual [begin,end)
-// window derived from the rows' day column (empty window when ok is false).
-func generateDMARCReport(ctx context.Context, q querier, fromDomain, orgDomain, orgEmail, reportID string) (xmlOut []byte, rua string, window [2]time.Time, ok bool, err error) {
+// generateDMARCReport builds the report for exactly the rows carrying the given
+// rua (so the report's contents match the address it will be sent to — the
+// authorize-target and send-target are the same by construction). It also returns
+// the actual [begin,end) window derived from the rows' day column.
+func generateDMARCReport(ctx context.Context, q querier, fromDomain, rua, orgDomain, orgEmail, reportID string) (xmlOut []byte, window [2]time.Time, ok bool, err error) {
 	rows, err := q.Query(ctx,
-		`SELECT rua, source_ip, spf_result, dkim_result, disposition, count, day
-		 FROM dmarc_agg WHERE from_domain=$1 AND NOT reported`, fromDomain)
+		`SELECT source_ip, spf_result, dkim_result, disposition, count, day
+		 FROM dmarc_agg WHERE from_domain=$1 AND NOT reported AND rua=$2`, fromDomain, rua)
 	if err != nil {
-		return nil, "", window, false, err
+		return nil, window, false, err
 	}
 	var records []dmarcrpt.ReportRecord
 	var minDay, maxDay time.Time
 	for rows.Next() {
-		var r, ip, spf, dkim, disp string
+		var ip, spf, dkim, disp string
 		var cnt int
 		var day time.Time
-		if err := rows.Scan(&r, &ip, &spf, &dkim, &disp, &cnt, &day); err != nil {
+		if err := rows.Scan(&ip, &spf, &dkim, &disp, &cnt, &day); err != nil {
 			rows.Close()
-			return nil, "", window, false, err
-		}
-		if r != "" {
-			rua = r
+			return nil, window, false, err
 		}
 		if minDay.IsZero() || day.Before(minDay) {
 			minDay = day
@@ -97,10 +106,10 @@ func generateDMARCReport(ctx context.Context, q querier, fromDomain, orgDomain, 
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, "", window, false, err
+		return nil, window, false, err
 	}
 	if len(records) == 0 {
-		return nil, "", window, false, nil
+		return nil, window, false, nil
 	}
 	// DateRange spans the included days: from the earliest day's 00:00 UTC to the
 	// end of the latest day (exclusive), matching the rows actually aggregated.
@@ -121,10 +130,10 @@ func generateDMARCReport(ctx context.Context, q querier, fromDomain, orgDomain, 
 	}
 	body, err := xml.MarshalIndent(fb, "", "  ")
 	if err != nil {
-		return nil, "", window, false, err
+		return nil, window, false, err
 	}
 	out := append([]byte(xml.Header), body...)
-	return out, rua, window, true, nil
+	return out, window, true, nil
 }
 
 // FenceFunc runs fn inside a leadership-fenced transaction, committing only if
@@ -186,53 +195,58 @@ type RUAAuthorizer func(ctx context.Context, reportedDomain, ruaAddr string) RUA
 func (s *Store) SendDMARCReportFenced(ctx context.Context, fence FenceFunc, authorized RUAAuthorizer, sender Sender, tenantID, accountID int64, fromDomain, orgDomain, orgEmail string) (bool, error) {
 	reportID := orgDomain + "-" + fromDomain + "-" + strconv.FormatInt(time.Now().UTC().Unix(), 10)
 
-	// Peek at the pending rua (unfenced, cheap) so we can classify authorization
-	// before committing an irreversible claim. The definitive rua used to send is
-	// re-read inside the fence.
-	var pendingRUA string
+	// Pick ONE canonical rua for this domain (the lexical max of pending rows) and
+	// use it for authorization, report generation, AND the claim — so the address
+	// we authorize is exactly the address we send to. `rua` is not in dmarc_agg's
+	// unique key, so one from_domain can hold rows with different rua values (a
+	// sender can rotate its published rua= mid-window); authorizing max(rua) but
+	// sending to some other row's rua would let an unauthorized third-party rua
+	// receive the report. Rows carrying a DIFFERENT rua are left unreported and get
+	// authorized against their own value on a later tick.
+	var rua string
 	if err := s.Pool.QueryRow(ctx,
 		`SELECT COALESCE(max(rua), '') FROM dmarc_agg WHERE from_domain=$1 AND NOT reported AND rua <> ''`,
-		fromDomain).Scan(&pendingRUA); err != nil {
+		fromDomain).Scan(&rua); err != nil {
 		return false, err
 	}
-	if pendingRUA == "" {
+	if rua == "" {
 		return false, nil // nothing pending, or no published rua
 	}
-	// Classify authorization up front. Transient → do not claim, retry next tick.
+	// Classify authorization of the canonical rua. Transient → do not claim, retry.
 	auth := RUAAuthorized
 	if authorized != nil {
-		auth = authorized(ctx, fromDomain, pendingRUA)
+		auth = authorized(ctx, fromDomain, rua)
 	}
 	if auth == RUATransient {
 		return false, nil // leave rows unreported; next tick retries
 	}
 
-	// Generate + claim atomically in the fenced (RepeatableRead) transaction.
+	// Generate + claim atomically in the fenced (RepeatableRead) transaction,
+	// scoped to exactly the canonical rua's rows.
 	var xmlBody []byte
-	var rua string
 	var claimed bool
 	if err := fence(ctx, func(tx pgx.Tx) error {
-		body, r, _, ok, e := generateDMARCReport(ctx, tx, fromDomain, orgDomain, orgEmail, reportID)
+		body, _, ok, e := generateDMARCReport(ctx, tx, fromDomain, rua, orgDomain, orgEmail, reportID)
 		if e != nil || !ok {
-			return e // nothing to report → claimed stays false
+			return e // nothing to report for this rua → claimed stays false
 		}
-		ct, e := tx.Exec(ctx, `UPDATE dmarc_agg SET reported=true WHERE from_domain=$1 AND NOT reported`, fromDomain)
+		ct, e := tx.Exec(ctx, `UPDATE dmarc_agg SET reported=true WHERE from_domain=$1 AND NOT reported AND rua=$2`, fromDomain, rua)
 		if e != nil {
 			return e
 		}
-		xmlBody, rua, claimed = body, r, ct.RowsAffected() > 0
+		xmlBody, claimed = body, ct.RowsAffected() > 0
 		return nil
 	}); err != nil {
 		return false, err
 	}
-	if !claimed || rua == "" {
-		return false, nil // nothing to report, already claimed, or no published rua
+	if !claimed {
+		return false, nil // nothing to report or already claimed
 	}
-	// A permanent denial claimed the rows (so we don't loop) but sends nothing.
+	// A permanent denial claimed this rua's rows (so we don't loop) but sends nothing.
 	if auth == RUADenied {
 		return false, nil
 	}
-	// Enqueue exactly once.
+	// Enqueue exactly once — to the SAME rua we authorized and generated for.
 	msg := buildReportMessage(orgEmail, rua, "Report Domain: "+fromDomain+" Submitter: "+orgDomain,
 		"application/xml", "dmarc-report.xml", xmlBody)
 	if _, err := sender.Submit(ctx, tenantID, accountID, orgEmail, []string{rua}, msg); err != nil {
