@@ -50,9 +50,9 @@ func requireFilter(w http.ResponseWriter, r *http.Request, req filterReq) bool {
 
 // writeCount writes {key: n} on success, or a 500 on error — the common tail of
 // the count-returning queue mutations.
-func writeCount(w http.ResponseWriter, key string, n int64, err error) {
+func (s *Server) writeCount(w http.ResponseWriter, r *http.Request, key string, n int64, err error) {
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.writeErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{key: n})
@@ -70,7 +70,7 @@ func (s *Server) handleQueueList(w http.ResponseWriter, r *http.Request) {
 	f := queue.Filter{TenantID: tid, AccountID: aid, Recipient: q.Get("recipient")}
 	entries, err := queue.List(r.Context(), s.Pool, f)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.writeErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"queue": entries})
@@ -83,7 +83,7 @@ func (s *Server) handleQueueKick(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, err := queue.Kick(r.Context(), s.Pool, req.filter())
-	writeCount(w, "kicked", n, err)
+	s.writeCount(w, r, "kicked", n, err)
 }
 
 // handleQueueHold: POST /admin/queue/hold {hold: bool, ...filter}
@@ -97,7 +97,7 @@ func (s *Server) handleQueueHold(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := queue.HoldSet(r.Context(), s.Pool, req.filter(), req.Hold)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.writeErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"updated": n, "hold": req.Hold})
@@ -110,7 +110,7 @@ func (s *Server) handleQueueDrop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, err := queue.Drop(r.Context(), s.Pool, req.filter())
-	writeCount(w, "dropped", n, err)
+	s.writeCount(w, r, "dropped", n, err)
 }
 
 // handleQueueFail: POST /admin/queue/fail — remove matching messages and send a
@@ -121,7 +121,7 @@ func (s *Server) handleQueueFail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, err := queue.Fail(r.Context(), s.Pool, req.filter(), s.QueueFailDSN)
-	writeCount(w, "failed", n, err)
+	s.writeCount(w, r, "failed", n, err)
 }
 
 // handleQueueSchedule: POST /admin/queue/schedule {delay: "30m", ...filter} —
@@ -140,7 +140,7 @@ func (s *Server) handleQueueSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, err := queue.Schedule(r.Context(), s.Pool, req.filter(), d)
-	writeCount(w, "scheduled", n, err)
+	s.writeCount(w, r, "scheduled", n, err)
 }
 
 // handleHoldRules: GET (list), POST (add), DELETE (remove) hold rules.
@@ -150,7 +150,7 @@ func (s *Server) handleHoldRules(w http.ResponseWriter, r *http.Request) {
 		tid, _ := strconv.ParseInt(r.URL.Query().Get("tenant_id"), 10, 64)
 		rules, err := queue.HoldRuleList(r.Context(), s.Pool, tid)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			s.writeErr(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"rules": rules})
@@ -166,7 +166,7 @@ func (s *Server) handleHoldRules(w http.ResponseWriter, r *http.Request) {
 		}
 		id, held, err := queue.HoldRuleAdd(r.Context(), s.Pool, hr)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			s.writeErr(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "held": held})
@@ -177,7 +177,7 @@ func (s *Server) handleHoldRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := queue.HoldRuleRemove(r.Context(), s.Pool, id); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			s.writeErr(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"removed": id})
@@ -202,7 +202,7 @@ func (s *Server) handleQueueScheduleAt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, err := queue.ScheduleAt(r.Context(), s.Pool, req.filter(), t)
-	writeCount(w, "scheduled", n, err)
+	s.writeCount(w, r, "scheduled", n, err)
 }
 
 // handleQueueRequireTLS: POST /admin/queue/requiretls {mode: "policy"|"yes"|"no", ...filter}
@@ -230,7 +230,7 @@ func (s *Server) handleQueueRequireTLS(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := queue.RequireTLSSet(r.Context(), s.Pool, req.filter(), val)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.writeErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"updated": n, "mode": req.Mode})
@@ -248,7 +248,7 @@ func (s *Server) handleQueueRetired(w http.ResponseWriter, r *http.Request) {
 	aid, _ := strconv.ParseInt(q.Get("account_id"), 10, 64)
 	entries, err := queue.RetiredList(r.Context(), s.Pool, queue.Filter{TenantID: tid, AccountID: aid})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.writeErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"retired": entries})
@@ -268,7 +268,7 @@ func (s *Server) handleQueueResults(w http.ResponseWriter, r *http.Request) {
 	}
 	results, err := queue.Results(r.Context(), s.Pool, id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.writeErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})

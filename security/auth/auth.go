@@ -122,6 +122,25 @@ func Verify(credJSON []byte, password string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
+// decoySalt is a fixed salt for the dummy argon2 verification below. Its only
+// purpose is to give VerifyDummy the same computational cost as a real Verify;
+// it protects no secret.
+var decoySalt = make([]byte, a2SaltLen)
+
+// VerifyDummy performs one argon2id derivation with the standard parameters and
+// discards the result, always returning false. Auth paths call it on the
+// "no such principal" branch so a missing login costs the same wall-clock as an
+// existing one — closing the timing oracle that would otherwise reveal which
+// logins exist. Always give it the caller's actual password so the input length
+// can't distinguish the branches either.
+func VerifyDummy(password string) bool {
+	got := argon2.IDKey([]byte(password), decoySalt, a2Time, a2Memory, a2Threads, a2KeyLen)
+	// Constant-time compare against an all-zero want, so the compare cost matches
+	// too; the result is meaningless and forced to false.
+	_ = subtle.ConstantTimeCompare(got, make([]byte, a2KeyLen))
+	return false
+}
+
 // SCRAMVerifier decodes the stored SCRAM-SHA-256 verifier (salt, salted
 // password, iterations) for driving the SASL exchange. Returns ok=false when no
 // SCRAM verifier is stored for this credential.
@@ -171,4 +190,13 @@ func VerifyAPIKey(credJSON []byte, secret string) bool {
 	}
 	got := sha256.Sum256([]byte(secret))
 	return subtle.ConstantTimeCompare(got[:], want) == 1
+}
+
+// VerifyAPIKeyDummy mirrors VerifyAPIKey's work (one SHA-256 + constant-time
+// compare) and always returns false, so the "no such key prefix" branch of
+// API-key auth costs the same as a real verify — no prefix-existence oracle.
+func VerifyAPIKeyDummy(secret string) bool {
+	got := sha256.Sum256([]byte(secret))
+	_ = subtle.ConstantTimeCompare(got[:], make([]byte, sha256.Size))
+	return false
 }

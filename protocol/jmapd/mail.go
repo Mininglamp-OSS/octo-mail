@@ -96,7 +96,7 @@ func (s *Server) mailboxGet(ctx context.Context, acc store.Account, inv invocati
 		return nil
 	})
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 	return "Mailbox/get", map[string]any{
 		"accountId": strconv.FormatInt(acc.ID(), 10),
@@ -341,7 +341,7 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 		return nil
 	})
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 	if ids == nil {
 		ids = []string{}
@@ -545,7 +545,7 @@ func (s *Server) emailGet(ctx context.Context, acc store.Account, inv invocation
 		return nil
 	})
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 	st, _ := accountState(ctx, acc)
 	return "Email/get", map[string]any{
@@ -593,7 +593,7 @@ func (s *Server) emailChanges(ctx context.Context, acc store.Account, inv invoca
 		return nil
 	})
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 	newState, _ := accountState(ctx, acc)
 	return "Email/changes", map[string]any{
@@ -655,7 +655,7 @@ func (s *Server) emailSet(ctx context.Context, acc store.Account, inv invocation
 		return nil
 	})
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 
 	// destroy: expunge every row of the email group (all its mailbox memberships).
@@ -854,8 +854,11 @@ func (s *Server) emailCreate(ctx context.Context, acc store.Account, obj map[str
 	if err != nil {
 		return nil, false
 	}
-	data, _ := io.ReadAll(rd)
+	data, err := io.ReadAll(rd)
 	rd.Close()
+	if err != nil {
+		return nil, false
+	}
 
 	m := &store.Message{}
 	// Apply keywords from the create object.
@@ -988,7 +991,7 @@ func (s *Server) threadGet(ctx context.Context, acc store.Account, inv invocatio
 		return nil
 	})
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 	st, _ := accountState(ctx, acc)
 	return "Thread/get", map[string]any{
@@ -1054,7 +1057,7 @@ func (s *Server) mailboxSet(ctx context.Context, acc store.Account, inv invocati
 		return nil
 	})
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 	newState, _ := accountState(ctx, acc)
 	return "Mailbox/set", map[string]any{
@@ -1451,7 +1454,7 @@ func (s *Server) emailSubmissionSet(ctx context.Context, acc store.Account, scop
 		}
 
 		if _, err := s.Submission.Submit(ctx, scope.Tenant().ID, acc.ID(), mailFrom, rcpts, raw); err != nil {
-			notCreated[cid] = map[string]any{"type": "serverFail", "description": err.Error()}
+			notCreated[cid] = s.serverFailObj(err)
 			continue
 		}
 		created[cid] = map[string]any{
@@ -1612,7 +1615,7 @@ func (s *Server) emailCopy(ctx context.Context, acc store.Account, inv invocatio
 			if err == store.ErrOverQuota {
 				notCreated[cid] = map[string]any{"type": "overQuota"}
 			} else {
-				notCreated[cid] = map[string]any{"type": "serverFail", "description": err.Error()}
+				notCreated[cid] = s.serverFailObj(err)
 			}
 			continue
 		}
@@ -1661,8 +1664,12 @@ func (s *Server) searchSnippetGet(ctx context.Context, acc store.Account, inv in
 				continue
 			}
 			br := acc.MessageReader(group[0])
-			data, _ := io.ReadAll(br)
+			data, e := io.ReadAll(br)
 			br.Close()
+			if e != nil {
+				notFound = append(notFound, id)
+				continue
+			}
 
 			subject, body := subjectAndText(data)
 			snip := map[string]any{
@@ -1675,7 +1682,7 @@ func (s *Server) searchSnippetGet(ctx context.Context, acc store.Account, inv in
 		return nil
 	})
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 	if list == nil {
 		list = []map[string]any{}
@@ -1806,7 +1813,7 @@ func htmlEscape(s string) string {
 func (s *Server) vacationGet(ctx context.Context, acc store.Account, inv invocation) (string, any) {
 	v, _, err := acc.VacationGet(ctx)
 	if err != nil {
-		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+		return s.serverFail(err)
 	}
 	obj := map[string]any{
 		"id":        "singleton",
@@ -1840,11 +1847,11 @@ func (s *Server) vacationSet(ctx context.Context, acc store.Account, inv invocat
 		}
 		cur, _, err := acc.VacationGet(ctx)
 		if err != nil {
-			return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+			return s.serverFail(err)
 		}
 		applyVacationPatch(&cur, patch)
 		if err := acc.VacationSet(ctx, cur); err != nil {
-			return "error", map[string]any{"type": "serverFail", "description": err.Error()}
+			return s.serverFail(err)
 		}
 		updated[id] = nil
 	}

@@ -14,14 +14,18 @@ package webapi
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/directory"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/deliverability"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
+	"github.com/mjl-/mox/ratelimit"
 	"github.com/mjl-/mox/smtp"
 )
 
@@ -31,6 +35,12 @@ type Server struct {
 	Dir          directory.Directory
 	Submission   *submit.Submitter
 	Suppressions *deliverability.Suppressions
+	// Log, if set, records the full internal error behind a 500; the client only
+	// ever gets a generic message, so raw DB/driver text can't leak. Optional.
+	Log *slog.Logger
+	// LoginLimiter, if set, throttles failed authentication attempts per client IP
+	// (brute-force / credential-stuffing + enumeration defense). Optional.
+	LoginLimiter *ratelimit.Limiter
 }
 
 // Handler mounts the REST routes under /webapi/v0 using method+path patterns
@@ -71,21 +81,47 @@ type authCtx struct {
 	login string
 }
 
+// auth authenticates the request, throttling by client IP: it refuses once the
+// per-IP failed-attempt window is exceeded (before any credential work), and
+// counts each failure — so brute-force / credential-stuffing and login/API-key
+// enumeration are bounded.
 func (s *Server) auth(r *http.Request) (authCtx, error) {
+	ip := clientIP(r)
+	if s.LoginLimiter != nil && ip != nil && !s.LoginLimiter.CanAdd(ip, time.Now(), 1) {
+		return authCtx{}, errStatus(http.StatusTooManyRequests, "rate_limited", "too many authentication attempts")
+	}
+	a, err := s.authenticate(r)
+	if err != nil && s.LoginLimiter != nil && ip != nil {
+		s.LoginLimiter.Add(ip, time.Now(), 1) // count only failures
+	}
+	return a, err
+}
+
+// clientIP extracts the client IP from the request's RemoteAddr. It intentionally
+// does NOT trust X-Forwarded-For (that would let a client spoof its rate-limit
+// key); a fronting proxy must set RemoteAddr or terminate limiting itself.
+func clientIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return net.ParseIP(host)
+}
+
+func (s *Server) authenticate(r *http.Request) (authCtx, error) {
 	// API key first: Authorization: Bearer omk_<prefix>_<secret>.
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer omk_") {
 		token := strings.TrimPrefix(h, "Bearer ")
-		scope, princ, _, err := s.Dir.AuthenticateAPIKey(r.Context(), token)
+		scope, princ, accountID, err := s.Dir.AuthenticateAPIKey(r.Context(), token)
 		if err != nil {
 			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "authentication failed")
 		}
-		addr, err := smtp.ParseAddress(princ.Login)
+		// Open the account the key was BOUND to (accountID), not one re-derived from
+		// the login address — a repointed address must not change which account the
+		// key acts as.
+		acc, err := scope.AccountForID(r.Context(), accountID)
 		if err != nil {
-			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "bad login address")
-		}
-		acc, err := scope.AccountForAddress(r.Context(), addr.Path())
-		if err != nil {
-			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "no account for login")
+			return authCtx{}, errStatus(http.StatusUnauthorized, "unauthorized", "no account for key")
 		}
 		return authCtx{acc: acc, scope: scope, login: princ.Login}, nil
 	}
@@ -118,12 +154,12 @@ func (s *Server) h(fn handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		a, err := s.auth(r)
 		if err != nil {
-			writeErr(w, err)
+			s.writeErr(w, r, err)
 			return
 		}
 		status, body, err := fn(r.Context(), a, r)
 		if err != nil {
-			writeErr(w, err)
+			s.writeErr(w, r, err)
 			return
 		}
 		if status == http.StatusNoContent || body == nil {
@@ -139,12 +175,12 @@ func (s *Server) hRaw(fn func(ctx context.Context, a authCtx, r *http.Request) (
 	return func(w http.ResponseWriter, r *http.Request) {
 		a, err := s.auth(r)
 		if err != nil {
-			writeErr(w, err)
+			s.writeErr(w, r, err)
 			return
 		}
 		rc, err := fn(r.Context(), a, r)
 		if err != nil {
-			writeErr(w, err)
+			s.writeErr(w, r, err)
 			return
 		}
 		defer rc.Close()
@@ -211,24 +247,44 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// statusError carries an HTTP status + machine code + message.
+// statusError carries an HTTP status + machine code + client-safe message. An
+// optional cause holds the underlying internal error for server-side logging
+// only — it is NEVER sent to the client. Build client-facing errors with
+// errStatus (msg is shown verbatim) and internal failures with internalErr
+// (msg is generic, the real error goes only to the log).
 type statusError struct {
 	status int
 	code   string
 	msg    string
+	cause  error
 }
 
 func (e *statusError) Error() string { return e.msg }
+func (e *statusError) Unwrap() error { return e.cause }
 
 func errStatus(status int, code, msg string) *statusError {
 	return &statusError{status: status, code: code, msg: msg}
 }
 
-// writeErr renders an error: a *statusError uses its status; anything else is 500.
-func writeErr(w http.ResponseWriter, err error) {
+// internalErr wraps an internal failure as a 500 whose client-facing message is
+// generic; cause is retained for server-side logging in writeErr and never
+// reaches the client, so DB constraint names, SQL, and filesystem paths don't
+// leak. code stays meaningful (e.g. "submit_failed") for client dispatch.
+func internalErr(code string, cause error) *statusError {
+	return &statusError{status: http.StatusInternalServerError, code: code, msg: "internal error", cause: cause}
+}
+
+// writeErr renders an error: a *statusError uses its status and crafted message
+// (logging its cause server-side, if any); anything else is logged server-side
+// (if Log is set) and returned as a generic 500 so raw internal error text (DB
+// constraint names, SQL, paths) never reaches the client.
+func (s *Server) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	se, ok := err.(*statusError)
 	if !ok {
-		se = errStatus(http.StatusInternalServerError, "internal", err.Error())
+		se = internalErr("internal", err)
+	}
+	if se.cause != nil && s.Log != nil {
+		s.Log.WarnContext(r.Context(), "webapi internal error", "method", r.Method, "path", r.URL.Path, "code", se.code, "err", se.cause)
 	}
 	writeJSON(w, se.status, map[string]any{
 		"error": map[string]string{"code": se.code, "message": se.msg},

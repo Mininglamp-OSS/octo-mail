@@ -182,7 +182,7 @@ func (s *Server) sendMessage(ctx context.Context, a authCtx, r *http.Request) (i
 	rcpts := allRecipients(req.To, req.Cc, req.Bcc)
 	ids, err := s.Submission.Submit(ctx, a.scope.Tenant().ID, a.acc.ID(), a.login, rcpts, raw)
 	if err != nil {
-		return 0, nil, errStatus(http.StatusInternalServerError, "submit_failed", err.Error())
+		return 0, nil, internalErr("submit_failed", err)
 	}
 	return http.StatusAccepted, map[string]any{"submissionIds": ids}, nil
 }
@@ -247,7 +247,7 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 	}
 	ids, err := s.Submission.Submit(ctx, a.scope.Tenant().ID, a.acc.ID(), a.login, allRecipients(to, cc, nil), raw)
 	if err != nil {
-		return 0, nil, errStatus(http.StatusInternalServerError, "submit_failed", err.Error())
+		return 0, nil, internalErr("submit_failed", err)
 	}
 	return http.StatusAccepted, map[string]any{"submissionIds": ids}, nil
 }
@@ -302,7 +302,7 @@ func (s *Server) forwardMessage(ctx context.Context, a authCtx, r *http.Request)
 	}
 	ids, err := s.Submission.Submit(ctx, a.scope.Tenant().ID, a.acc.ID(), a.login, req.To, raw)
 	if err != nil {
-		return 0, nil, errStatus(http.StatusInternalServerError, "submit_failed", err.Error())
+		return 0, nil, internalErr("submit_failed", err)
 	}
 	return http.StatusAccepted, map[string]any{"submissionIds": ids}, nil
 }

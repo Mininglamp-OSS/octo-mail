@@ -7,10 +7,18 @@ import (
 )
 
 // Trusted account accessors: they open an account handle by a numeric id,
-// bypassing the directory's authenticated resolution. They are for internal
-// subsystems that already hold a trusted account id from a delivery or queue
-// row (DSN generation, vacation auto-reply) — NOT for anything driven by
-// unauthenticated network input, which must go through the directory.
+// bypassing the directory's authenticated, tenant-scoped resolution. They are for
+// internal subsystems that already hold a trusted account id from a delivery or
+// queue row (DSN generation, vacation auto-reply, CLI ops) — NOT for anything
+// driven by unauthenticated network input, which must go through the directory's
+// TenantScope (AccountForAddress / AccountForID), whose isolation is structural.
+//
+// SECURITY: these deliberately have NO production caller under protocol/* — that
+// invariant (checked by review) is what keeps the tenant-crossing capability out
+// of request-driven code. Any new protocol-layer caller must instead resolve the
+// account through the authenticated TenantScope. (A future hardening tracked as a
+// follow-up moves these behind a distinct capability type / internal package so
+// the boundary is compiler-enforced rather than convention.)
 
 // OpenAccountByID opens an account handle by id. name may be empty.
 func (s *Store) OpenAccountByID(id, tenantID int64, name string) store.Account {

@@ -30,13 +30,13 @@ func (c *conn) cmdLogin(tag, args string) {
 		c.no(tag, "[PRIVACYREQUIRED] LOGIN disabled until STARTTLS")
 		return
 	}
-	// Brute-force throttle: count every attempt per client IP; refuse once the
-	// window limit is exceeded, before any credential check.
-	if c.srv.LoginLimiter != nil {
-		if !c.srv.LoginLimiter.Add(c.remoteIP(), time.Now(), 1) {
-			c.no(tag, "[UNAVAILABLE] too many login attempts, slow down")
-			return
-		}
+	// Brute-force throttle: refuse once the per-IP failed-attempt window is
+	// exceeded, before any credential check. Only failures are counted (below),
+	// so a client that logs in successfully — even repeatedly, e.g. a polling
+	// mail client or several users behind one NAT — is never locked out.
+	if c.srv.LoginLimiter != nil && !c.srv.LoginLimiter.CanAdd(c.remoteIP(), time.Now(), 1) {
+		c.no(tag, "[UNAVAILABLE] too many login attempts, slow down")
+		return
 	}
 
 	userTok, passTok := cut(args, " ")
@@ -51,11 +51,13 @@ func (c *conn) cmdLogin(tag, args string) {
 	// Authenticate via the directory with the presented password.
 	scope, _, err := c.srv.Dir.AuthenticatePrincipal(c.ctx, user, directory.PasswordCredential(pass))
 	if err != nil {
+		c.countLoginFailure()
 		c.no(tag, "authentication failed")
 		return
 	}
 	acc, err := scope.AccountForAddress(c.ctx, addr.Path())
 	if err != nil {
+		c.countLoginFailure()
 		c.no(tag, "no such account")
 		return
 	}
@@ -93,8 +95,9 @@ func (c *conn) cmdAuthenticate(tag, args string) {
 		st := tc.ConnectionState()
 		cs = &st
 	}
-	// Rate-limit auth attempts (same budget as LOGIN).
-	if c.srv.LoginLimiter != nil && !c.srv.LoginLimiter.Add(c.remoteIP(), time.Now(), 1) {
+	// Rate-limit auth attempts (same budget as LOGIN): refuse when the per-IP
+	// failed-attempt window is exceeded; only failures are counted (below).
+	if c.srv.LoginLimiter != nil && !c.srv.LoginLimiter.CanAdd(c.remoteIP(), time.Now(), 1) {
 		c.no(tag, "[UNAVAILABLE] too many login attempts, slow down")
 		return
 	}
@@ -127,17 +130,20 @@ func (c *conn) cmdAuthenticate(tag, args string) {
 
 	srv, err := scram.NewServer(sha256.New, clientFirst, cs, plus)
 	if err != nil {
+		c.countLoginFailure()
 		c.no(tag, "authentication failed")
 		return
 	}
 	login := srv.Authentication
 	ver, err := sa.LookupSCRAM(c.ctx, login)
 	if err != nil {
+		c.countLoginFailure()
 		c.no(tag, "authentication failed")
 		return
 	}
 	serverFirst, err := srv.ServerFirst(ver.Iterations, ver.Salt)
 	if err != nil {
+		c.countLoginFailure()
 		c.no(tag, "authentication failed")
 		return
 	}
@@ -158,6 +164,7 @@ func (c *conn) cmdAuthenticate(tag, args string) {
 	serverFinal, err := srv.Finish(clientFinal, ver.SaltedPassword)
 	if err != nil {
 		// Send the SCRAM error as a final failure.
+		c.countLoginFailure()
 		c.no(tag, "authentication failed")
 		return
 	}
@@ -189,6 +196,15 @@ func (c *conn) cmdAuthenticate(tag, args string) {
 	c.scope = scope
 	c.acc = acc
 	c.ok(tag, "[CAPABILITY IMAP4rev1 UIDPLUS] authenticated")
+}
+
+// countLoginFailure records one failed authentication attempt against the
+// per-IP brute-force limiter. Only failures are counted, so successful logins
+// (including high-volume clients behind a shared NAT) are never throttled.
+func (c *conn) countLoginFailure() {
+	if c.srv.LoginLimiter != nil {
+		c.srv.LoginLimiter.Add(c.remoteIP(), time.Now(), 1)
+	}
 }
 
 func (c *conn) requireAuth(tag string) bool {

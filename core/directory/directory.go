@@ -86,6 +86,11 @@ type TenantScope interface {
 	// owning account (address localpart may differ from account name). Used by
 	// submission auth, where the login is an email address.
 	AccountForAddress(ctx context.Context, addr smtp.Path) (store.Account, error)
+	// AccountForID resolves an account by id WITHIN this tenant. An id belonging to
+	// another tenant matches nothing (structural isolation). Used by API-key auth
+	// to open the exact account the key was bound to at issuance, rather than
+	// re-deriving it from the login address (which can be repointed).
+	AccountForID(ctx context.Context, id int64) (store.Account, error)
 	Accounts(ctx context.Context) ([]store.Account, error)
 	Domain(ctx context.Context, d dns.Domain) (Domain, error)
 	Quota() TenantQuota

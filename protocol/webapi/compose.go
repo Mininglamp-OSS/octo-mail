@@ -151,10 +151,14 @@ func writeAttachment(mw *multipart.Writer, at attachment) error {
 			ct = "application/octet-stream"
 		}
 	}
+	// Both ct and the filename are client-supplied and go into MIME part headers;
+	// mime/multipart's CreatePart does NOT sanitize newlines, so strip CR/LF to
+	// prevent header injection into the outbound part (a crafted Content-Type or
+	// filename could otherwise inject additional headers or split the part).
 	h := textproto.MIMEHeader{
-		"Content-Type":              {ct},
+		"Content-Type":              {stripCRLF(ct)},
 		"Content-Transfer-Encoding": {"base64"},
-		"Content-Disposition":       {fmt.Sprintf("attachment; filename=%q", at.Filename)},
+		"Content-Disposition":       {stripCRLF(fmt.Sprintf("attachment; filename=%q", at.Filename))},
 	}
 	pw, err := mw.CreatePart(h)
 	if err != nil {

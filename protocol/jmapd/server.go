@@ -15,14 +15,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/directory"
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
+	"github.com/mjl-/mox/ratelimit"
 	"github.com/mjl-/mox/smtp"
 )
 
@@ -38,6 +42,33 @@ type Server struct {
 	// message bytes are stored here (content-addressed, per tenant) and referenced
 	// by blobId.
 	Blob blob.Store
+	// Log, if set, records the full internal error behind a serverFail; the client
+	// only ever gets a generic description, so raw DB/driver text can't leak.
+	Log *slog.Logger
+	// LoginLimiter, if set, throttles failed authentication attempts per client IP
+	// (brute-force + login/API-key enumeration defense). Optional.
+	LoginLimiter *ratelimit.Limiter
+}
+
+// serverFail builds a JMAP method-level error, logging the underlying error
+// server-side (if Log is set) and returning a GENERIC description — raw internal
+// error text (DB constraint names, SQL, filesystem paths) must never reach a
+// client. Use for any error derived from internal failures.
+func (s *Server) serverFail(err error) (string, any) {
+	if s.Log != nil && err != nil {
+		s.Log.Warn("jmap serverFail", "err", err)
+	}
+	return "error", map[string]any{"type": "serverFail", "description": "internal error"}
+}
+
+// serverFailObj is serverFail's value-only form, for per-object error maps (e.g.
+// Email/set notCreated) where only the error object is needed, not the (name,
+// args) pair.
+func (s *Server) serverFailObj(err error) map[string]any {
+	if s.Log != nil && err != nil {
+		s.Log.Warn("jmap serverFail", "err", err)
+	}
+	return map[string]any{"type": "serverFail", "description": "internal error"}
 }
 
 // JMAP request limits (RFC 8620 §2.1). These are both advertised in the session
@@ -78,7 +109,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	acc, scope, _, err := s.authAccount(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeAuthErr(w, err)
 		return
 	}
 	if s.Blob == nil {
@@ -125,7 +156,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 	acc, _, _, err := s.authAccount(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeAuthErr(w, err)
 		return
 	}
 	flusher, ok := w.(http.Flusher)
@@ -172,7 +203,7 @@ func (s *Server) handleEventSource(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	acc, _, _, err := s.authAccount(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeAuthErr(w, err)
 		return
 	}
 	// Parse /jmap/download/<accountId>/<blobId>/<name>.
@@ -183,44 +214,97 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	blobID := segs[1]
-	var data []byte
+	// Resolve the message inside the tx, then STREAM its bytes to the client in
+	// bounded chunks — never buffer the whole (potentially large) message in memory
+	// (an unauthenticated-size DoS multiplier). Mirrors webapi's raw-message stream.
+	var msg store.Message
 	err = acc.Tx(r.Context(), func(tx store.Tx) error {
 		group, ok := s.emailGroup(tx, acc, blobID)
 		if !ok {
 			return errNotFoundJMAP
 		}
-		br := acc.MessageReader(group[0])
-		defer br.Close()
-		var e error
-		data, e = io.ReadAll(br)
-		return e
+		msg = group[0]
+		return nil
 	})
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	br := acc.MessageReader(msg)
+	defer br.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	buf := make([]byte, 32*1024)
+	for {
+		n, e := br.Read(buf)
+		if n > 0 {
+			if _, we := w.Write(buf[:n]); we != nil {
+				return
+			}
+		}
+		if e != nil {
+			return
+		}
+	}
 }
 
 // authAccount extracts the account from the request's credentials via the
 // directory. It accepts either an API key (Authorization: Bearer omk_...) or
 // HTTP Basic auth (login + password). Both resolve to the same
-// (account, scope, login) tuple, so every endpoint handles them uniformly.
+// (account, scope, login) tuple, so every endpoint handles them uniformly. It
+// throttles by client IP: refusing once the per-IP failed-attempt window is
+// exceeded and counting each failure, to bound brute-force and enumeration.
 func (s *Server) authAccount(r *http.Request) (store.Account, directory.TenantScope, string, error) {
+	ip := clientIP(r)
+	if s.LoginLimiter != nil && ip != nil && !s.LoginLimiter.CanAdd(ip, time.Now(), 1) {
+		return nil, nil, "", errRateLimited
+	}
+	acc, scope, login, err := s.authAccountInner(r)
+	if err != nil && s.LoginLimiter != nil && ip != nil {
+		s.LoginLimiter.Add(ip, time.Now(), 1) // count only failures
+	}
+	return acc, scope, login, err
+}
+
+// errRateLimited is returned by authAccount when the per-IP attempt window is
+// exhausted, so callers can answer 429 rather than 401 (a throttled client is
+// not necessarily unauthenticated, and 429 tells it to back off).
+var errRateLimited = errors.New("too many authentication attempts")
+
+// writeAuthErr renders an authAccount failure: a rate-limit rejection is 429,
+// anything else is a generic 401 (no internal detail).
+func writeAuthErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, errRateLimited) {
+		http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
+		return
+	}
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+}
+
+// clientIP extracts the client IP from RemoteAddr. It does NOT trust
+// X-Forwarded-For (a client could spoof its rate-limit key); a fronting proxy
+// must set RemoteAddr or limit itself.
+func clientIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return net.ParseIP(host)
+}
+
+func (s *Server) authAccountInner(r *http.Request) (store.Account, directory.TenantScope, string, error) {
 	// API key first: Authorization: Bearer omk_<prefix>_<secret>.
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer omk_") {
 		token := strings.TrimPrefix(h, "Bearer ")
-		scope, princ, _, err := s.Dir.AuthenticateAPIKey(r.Context(), token)
+		scope, princ, accountID, err := s.Dir.AuthenticateAPIKey(r.Context(), token)
 		if err != nil {
 			return nil, nil, "", err
 		}
-		addr, err := smtp.ParseAddress(princ.Login)
-		if err != nil {
-			return nil, nil, "", err
-		}
-		acc, err := scope.AccountForAddress(r.Context(), addr.Path())
+		// Open the account the key was BOUND to at issuance (accountID), not one
+		// re-derived from the login address — an address repointed to a different
+		// account after issuance must not silently change which account the key acts
+		// as.
+		acc, err := scope.AccountForID(r.Context(), accountID)
 		if err != nil {
 			return nil, nil, "", err
 		}
@@ -260,7 +344,7 @@ func accountState(ctx context.Context, acc store.Account) (string, error) {
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	acc, scope, login, err := s.authAccount(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeAuthErr(w, err)
 		return
 	}
 	accID := strconv.FormatInt(acc.ID(), 10)
@@ -316,7 +400,7 @@ type invocation struct {
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	acc, scope, login, err := s.authAccount(r)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeAuthErr(w, err)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxAPIRequestSize)
