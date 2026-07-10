@@ -243,7 +243,7 @@ func run() error {
 	// SMTP receive (MX, :25).
 	if cfg.smtpAddr != "" {
 		vacation := &autoreply.Responder{Lookup: s.LookupAccountByID, Submitter: submitter}
-		mx := &smtpd.Server{Dir: dir, Hostname: cfg.hostname, MaxSize: cfg.maxSize, TLSConfig: nil, Auth: authenticator, RejectDMARCFail: cfg.rejectDMARC, Junk: junkMgr, Decider: decider,
+		mx := &smtpd.Server{Dir: dir, Hostname: cfg.hostname, MaxSize: cfg.maxSize, TLSConfig: nil, Auth: authenticator, RejectDMARCFail: cfg.rejectDMARC, MaxHops: cfg.maxHops, Junk: junkMgr, Decider: decider,
 			DMARCRecorder: func(ctx context.Context, fromDomain, rua, sourceIP, spf, dkim, disposition string) {
 				_ = reports.RecordDMARCAgg(ctx, fromDomain, rua, sourceIP, spf, dkim, disposition)
 			},
@@ -423,7 +423,8 @@ func run() error {
 		}
 	}
 	worker := &queue.Worker{Pool: s.Pool, NodeID: cfg.nodeID, Deliver: deliverer.Deliver, Batch: 20,
-		Backoff: cfg.queueBackoff, DelayThreshold: cfg.queueDelayDSN, RetiredKeep: cfg.queueRetKeep,
+		Backoff: cfg.queueBackoff, MaxBackoff: cfg.queueMaxBackoff, MaxLifetime: cfg.queueMaxLifetime,
+		DelayThreshold: cfg.queueDelayDSN, RetiredKeep: cfg.queueRetKeep,
 		ObserveDelivery: func(d time.Duration, result string) {
 			obs.QueueDeliveryDuration.WithLabelValues(result).Observe(d.Seconds())
 		},
@@ -433,23 +434,40 @@ func run() error {
 				map[string]any{"rcpt": m.RcptTo, "msgid": m.ID, "attempts": m.Attempts})
 			return nil
 		},
-		OnFailed: func(ctx context.Context, m queue.Msg) error {
-			// Permanent failure: suppress the recipient, record a bounce for
-			// reputation, and emit a webhook. Best-effort; errors are logged.
-			if err := suppress.Add(ctx, m.TenantID, m.AccountID, m.RcptTo, "hard bounce (max attempts)"); err != nil {
-				log.Warn("suppress on bounce", "err", err)
-			}
+		OnFailed: func(ctx context.Context, m queue.Msg, cause error) error {
 			dom := ""
 			if at := strings.LastIndexByte(m.RcptTo, '@'); at >= 0 {
 				dom = m.RcptTo[at+1:]
 			}
-			if dom != "" {
-				// Delivery-time hard bounce: no single signed msgID to dedup on, so
-				// pass 0 (non-idempotent — these are our own authenticated events).
-				_ = repo.RecordEvent(ctx, m.TenantID, m.AccountID, deliverability.KindBounce, dom, 0)
+			// Distinguish a genuine hard bounce (permanent 5xx) from transient
+			// exhaustion (the destination kept deferring until the retry lifetime /
+			// attempt budget ran out, or we never got an SMTP code at all — e.g. a
+			// connection error). Only a real 5xx should suppress the recipient and
+			// count as a reputation bounce; suppressing on transient exhaustion would
+			// wrongly blacklist a recipient whose server was merely down.
+			var perm queue.PermanentError
+			permanent := errors.As(cause, &perm) && perm.Permanent()
+			if permanent {
+				if err := suppress.Add(ctx, m.TenantID, m.AccountID, m.RcptTo, "hard bounce (5xx)"); err != nil {
+					log.Warn("suppress on bounce", "err", err)
+				}
+				if dom != "" {
+					// Delivery-time hard bounce: no single signed msgID to dedup on, so
+					// pass 0 (non-idempotent — these are our own authenticated events).
+					_ = repo.RecordEvent(ctx, m.TenantID, m.AccountID, deliverability.KindBounce, dom, 0)
+				}
+				_ = webhooks.Enqueue(ctx, m.TenantID, m.AccountID, cfg.webhookURL, "bounced",
+					map[string]any{"rcpt": m.RcptTo, "msgid": m.ID})
+				return nil
 			}
-			_ = webhooks.Enqueue(ctx, m.TenantID, m.AccountID, cfg.webhookURL, "bounced",
-				map[string]any{"rcpt": m.RcptTo, "msgid": m.ID})
+			// Transient exhaustion: record a deferral (feeds the windowed reputation
+			// view without moving the pause needle) and DO NOT suppress. Still emit a
+			// webhook so the sender learns delivery was abandoned, tagged as such.
+			if dom != "" {
+				_ = repo.RecordEvent(ctx, m.TenantID, m.AccountID, deliverability.KindDeferral, dom, 0)
+			}
+			_ = webhooks.Enqueue(ctx, m.TenantID, m.AccountID, cfg.webhookURL, "failed",
+				map[string]any{"rcpt": m.RcptTo, "msgid": m.ID, "reason": "retry lifetime exhausted"})
 			return nil
 		},
 	}
@@ -537,6 +555,25 @@ func run() error {
 		go warmCoord.Run(ctx)
 	}
 
+	// Reputation auto-unpause: a cluster singleton that periodically clears the
+	// pause flag for (tenant, domain) pairs whose recent windowed bounce/complaint
+	// rates have recovered. Leader-gated because it is a shared-state sweep; without
+	// it an auto-paused domain stays paused until a manual DB edit (issue #33).
+	{
+		const reputLeaderKey = int64(0x6f6d5f7265707574) // "om_reput"
+		repuCoord := ha.NewCoordinator(ha.New(s.Pool, reputLeaderKey, cfg.nodeID), 15*time.Minute)
+		repuCoord.OnElected = func(context.Context) { log.Info("elected reputation-unpause leader", "node", cfg.nodeID) }
+		repuCoord.OnLost = func() { log.Info("lost reputation-unpause leadership", "node", cfg.nodeID) }
+		repuCoord.Tick = func(ctx context.Context) {
+			if n, err := repo.UnpauseRecovered(ctx); err != nil {
+				log.Warn("reputation auto-unpause", "err", err)
+			} else if n > 0 {
+				log.Info("reputation auto-unpause", "unpaused", n)
+			}
+		}
+		go repuCoord.Run(ctx)
+	}
+
 	// RFC 7489 report role: a leader-gated scheduler that turns accumulated
 	// dmarc_agg rows into outbound aggregate reports. Opt-in (sends mail to third
 	// parties) and a cluster singleton with a NON-idempotent side effect, so it is
@@ -612,7 +649,7 @@ func run() error {
 	}
 
 	// Webhook delivery worker.
-	whWorker := &deliverability.WebhookWorker{Pool: s.Pool, NodeID: cfg.nodeID, Batch: 50}
+	whWorker := &deliverability.WebhookWorker{Pool: s.Pool, NodeID: cfg.nodeID, Batch: 50, Secret: cfg.webhookSecret, Log: log}
 	go runLoop(ctx, log, "webhook-worker", cfg.queueInterval, func() {
 		if n, err := whWorker.RunOnce(ctx); err != nil {
 			log.Warn("webhook worker", "err", err)

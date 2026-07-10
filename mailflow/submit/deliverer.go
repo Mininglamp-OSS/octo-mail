@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 	"github.com/mjl-/adns"
 	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/message"
 	"github.com/mjl-/mox/smtpclient"
 )
 
@@ -150,7 +151,14 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, m queue.Msg) error {
 		if err != nil {
 			return fmt.Errorf("read body: %w", err)
 		}
-		fromDomain := addr.Domain(m.MailFrom)
+		// DKIM d= must align with the From: header domain for DMARC (RFC 6376/7489),
+		// not the envelope MAIL FROM — they differ for auto-replies (null return
+		// path) and any bounce/DSN. Prefer the From-header domain; fall back to the
+		// envelope only when the header is unparseable.
+		fromDomain := fromHeaderDomain(raw)
+		if fromDomain == "" {
+			fromDomain = addr.Domain(m.MailFrom)
+		}
 		header, err := d.Sign(ctx, m.TenantID, fromDomain, raw)
 		if err != nil {
 			return fmt.Errorf("dkim sign: %w", err)
@@ -278,4 +286,28 @@ func smtpResultErr(wrapped, cause error) error {
 		return &resultErr{err: wrapped, code: se.Code, secode: se.Secode, permanent: se.Permanent}
 	}
 	return wrapped
+}
+
+// fromHeaderDomain returns the domain of the message's From: header (the DKIM/
+// DMARC alignment identity), or "" if it can't be parsed. Uses mox's canonical
+// RFC 5322 parser, matching the inbound authentication path.
+func fromHeaderDomain(raw []byte) string {
+	a, _, _, err := message.From(nil, false, byteReaderAt(raw), nil)
+	if err != nil {
+		return ""
+	}
+	return a.Domain.ASCII
+}
+
+type byteReaderAt []byte
+
+func (b byteReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(b)) {
+		return 0, io.EOF
+	}
+	n := copy(p, b[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }

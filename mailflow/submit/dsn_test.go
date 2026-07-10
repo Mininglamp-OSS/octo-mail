@@ -49,7 +49,7 @@ func TestDSNOnPermanentFailure(t *testing.T) {
 	w := &queue.Worker{
 		Pool: s.Pool, NodeID: "n1", Batch: 5,
 		Deliver:  func(ctx context.Context, m queue.Msg) error { return fmt.Errorf("simulated permanent failure") },
-		OnFailed: dsnGen.Generate,
+		OnFailed: func(ctx context.Context, m queue.Msg, cause error) error { return dsnGen.Generate(ctx, m) },
 	}
 	// One pass: attempt=1 reaches max_attempts=1 → permanent fail → DSN.
 	if _, err := w.RunOnce(ctx); err != nil {

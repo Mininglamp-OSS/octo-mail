@@ -105,7 +105,10 @@ func TestAdminProvisionEndToEnd(t *testing.T) {
 	if err := wh.Enqueue(ctx, tid, 1, sink.URL, "delivered", map[string]any{"rcpt": "bob@remote.example"}); err != nil {
 		t.Fatal(err)
 	}
-	worker := &deliverability.WebhookWorker{Pool: s.Pool, NodeID: "n1"}
+	// The default worker client blocks loopback/private IPs (SSRF guard), but the
+	// httptest sink IS loopback — inject a plain client so this delivery test can
+	// reach it. Production uses the guarded default.
+	worker := &deliverability.WebhookWorker{Pool: s.Pool, NodeID: "n1", Client: &http.Client{}}
 	n, err := worker.RunOnce(ctx)
 	if err != nil {
 		t.Fatalf("webhook worker: %v", err)

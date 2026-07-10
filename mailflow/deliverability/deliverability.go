@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -36,10 +37,53 @@ const verpPrefix = "bounces+"
 // Thresholds beyond which a (tenant, domain) is auto-paused. Deliberately simple
 // and explicit; real deployments tune these per remote.
 const (
-	MinSample        = 20   // don't judge before this many sends
+	MinSample        = 20   // don't judge before this many sends (within the window)
 	ComplaintRateMax = 0.01 // 1% complaints -> pause this tenant for this domain
 	BounceRateMax    = 0.10 // 10% bounces -> pause
 )
+
+// DefaultWindow is the sliding window over which bounce/complaint RATES are judged
+// for both auto-pause and auto-unpause. Reputation is a recent-behavior signal, so
+// old events must age out — a domain healthy for a week should recover regardless
+// of ancient history. Overridable via the Service field for tuning/tests.
+const DefaultWindow = 7 * 24 * time.Hour
+
+// breaches reports whether the windowed complaint/bounce rates exceed the pause
+// thresholds. Caller must have already checked the MinSample floor.
+func breaches(sent, complaints, bounces int64) bool {
+	if sent <= 0 {
+		return false
+	}
+	return float64(complaints)/float64(sent) > ComplaintRateMax ||
+		float64(bounces)/float64(sent) > BounceRateMax
+}
+
+// windowedCounts sums the per-day reputation buckets for a (tenant, domain) whose
+// day falls within the trailing window, giving the recent sent/complaint/bounce
+// totals the rate decision uses.
+func windowedCounts(ctx context.Context, q rowQuerier, tenantID int64, remoteDomain string, window time.Duration) (sent, complaints, bounces int64, err error) {
+	// An N-day window is today plus the N-1 prior daily buckets, so the cutoff is
+	// today-(N-1). (days-1 with days rounded up from the duration.) For the 7d
+	// default this yields exactly 7 buckets, not 8/9.
+	days := int(window.Hours() / 24)
+	if days < 1 {
+		days = 1
+	}
+	cutoff := days - 1
+	err = q.QueryRow(ctx,
+		`SELECT COALESCE(sum(sent),0), COALESCE(sum(complaints),0), COALESCE(sum(bounces),0)
+		 FROM reputation_daily
+		 WHERE tenant_id=$1 AND remote_domain=$2
+		   AND day >= (now() AT TIME ZONE 'utc')::date - $3::int`,
+		tenantID, remoteDomain, cutoff).Scan(&sent, &complaints, &bounces)
+	return
+}
+
+// rowQuerier is satisfied by both *pgxpool.Pool and pgx.Tx, so windowedCounts
+// serves the in-transaction pause check and the standalone unpause sweep.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 // Service records reputation and gates sending.
 type Service struct {
@@ -73,12 +117,29 @@ func (s *Service) Gate(ctx context.Context, tenantID int64, remoteDomain string)
 	return GateResult{Allowed: true}, nil
 }
 
-// RecordSent increments the send counter for a (tenant, domain).
+// RecordSent increments the send counter for a (tenant, domain): both the
+// lifetime total and today's rollup bucket (for the sliding-window rate).
 func (s *Service) RecordSent(ctx context.Context, tenantID int64, remoteDomain string) error {
-	_, err := s.Pool.Exec(ctx,
-		`INSERT INTO reputation_score (tenant_id, remote_domain, sent) VALUES ($1,$2,1)
-		 ON CONFLICT (tenant_id, remote_domain)
-		 DO UPDATE SET sent = reputation_score.sent + 1, updated_at = now()`,
+	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO reputation_score (tenant_id, remote_domain, sent) VALUES ($1,$2,1)
+			 ON CONFLICT (tenant_id, remote_domain)
+			 DO UPDATE SET sent = reputation_score.sent + 1, updated_at = now()`,
+			tenantID, remoteDomain); err != nil {
+			return err
+		}
+		return bumpDaily(ctx, tx, tenantID, remoteDomain, "sent")
+	})
+}
+
+// bumpDaily increments one counter column of today's (UTC) rollup bucket. col is
+// a trusted literal from RecordSent/RecordEvent (never user input).
+func bumpDaily(ctx context.Context, tx pgx.Tx, tenantID int64, remoteDomain, col string) error {
+	_, err := tx.Exec(ctx, fmt.Sprintf(
+		`INSERT INTO reputation_daily (tenant_id, remote_domain, day, %s)
+		 VALUES ($1,$2,(now() AT TIME ZONE 'utc')::date,1)
+		 ON CONFLICT (tenant_id, remote_domain, day)
+		 DO UPDATE SET %s = reputation_daily.%s + 1`, col, col, col),
 		tenantID, remoteDomain)
 	return err
 }
@@ -126,6 +187,7 @@ func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, ki
 		default:
 			return nil // delivered/deferral don't move the pause needle here
 		}
+		// Bump the lifetime total (kept for reporting) AND today's rollup bucket.
 		if _, err := tx.Exec(ctx, fmt.Sprintf(
 			`INSERT INTO reputation_score (tenant_id, remote_domain, %s) VALUES ($1,$2,1)
 			 ON CONFLICT (tenant_id, remote_domain)
@@ -133,26 +195,105 @@ func (s *Service) RecordEvent(ctx context.Context, tenantID, accountID int64, ki
 			tenantID, remoteDomain); err != nil {
 			return err
 		}
-		// Re-evaluate pause for THIS tenant+domain only.
-		var sent, complaints, bounces int64
-		if err := tx.QueryRow(ctx,
-			`SELECT sent, complaints, bounces FROM reputation_score WHERE tenant_id=$1 AND remote_domain=$2`,
-			tenantID, remoteDomain).Scan(&sent, &complaints, &bounces); err != nil {
+		if err := bumpDaily(ctx, tx, tenantID, remoteDomain, col); err != nil {
 			return err
 		}
-		if sent >= MinSample {
-			cr := float64(complaints) / float64(sent)
-			br := float64(bounces) / float64(sent)
-			if cr > ComplaintRateMax || br > BounceRateMax {
-				if _, err := tx.Exec(ctx,
-					`UPDATE reputation_score SET paused=true, updated_at=now()
-					 WHERE tenant_id=$1 AND remote_domain=$2`, tenantID, remoteDomain); err != nil {
-					return err
-				}
+		// Re-evaluate pause over the SLIDING WINDOW (not lifetime): a domain that
+		// bounced heavily months ago but is healthy now must not stay judged on
+		// stale cumulative ratios. Sum the daily buckets within DefaultWindow.
+		sent, complaints, bounces, err := windowedCounts(ctx, tx, tenantID, remoteDomain, DefaultWindow)
+		if err != nil {
+			return err
+		}
+		if sent >= MinSample && breaches(sent, complaints, bounces) {
+			if _, err := tx.Exec(ctx,
+				`UPDATE reputation_score SET paused=true, paused_at=now(), updated_at=now()
+				 WHERE tenant_id=$1 AND remote_domain=$2 AND NOT paused`, tenantID, remoteDomain); err != nil {
+				return err
 			}
 		}
 		return nil
 	})
+}
+
+// MinPauseDwell is the minimum time a (tenant, domain) stays paused before the
+// auto-unpause sweep will consider clearing it. Without a dwell floor, a
+// chronically-bad low-volume domain could oscillate (pause → bad buckets age out
+// → few recent sends → unpause → resend → re-breach → re-pause) on a
+// window-length period. The dwell damps that: a domain that keeps re-breaching
+// stays paused for at least this long each time.
+const MinPauseDwell = 24 * time.Hour
+
+// UnpauseRecovered clears the paused flag for every (tenant, domain) whose recent
+// windowed bounce/complaint rates have fallen back under threshold — the decay
+// path that makes auto-pause self-healing instead of permanent-until-manual-DB-edit
+// (issue #33). A paused domain is unpaused when it has been paused at least
+// MinPauseDwell AND, over the window, EITHER it has enough recent sample and no
+// longer breaches, OR it has essentially no recent activity (the window has aged
+// out the bad events, so keeping it paused would judge it on history that no
+// longer exists). Runs as a cluster singleton (leader-gated) on a periodic tick.
+// Returns the number of (tenant, domain) pairs unpaused.
+func (s *Service) UnpauseRecovered(ctx context.Context) (int, error) {
+	// Only consider rows past the dwell floor. A NULL paused_at (legacy rows paused
+	// before the column existed) is treated as eligible.
+	rows, err := s.Pool.Query(ctx,
+		`SELECT tenant_id, remote_domain FROM reputation_score
+		 WHERE paused AND (paused_at IS NULL OR paused_at <= now() - make_interval(secs => $1))`,
+		MinPauseDwell.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	type key struct {
+		tid int64
+		dom string
+	}
+	var paused []key
+	for rows.Next() {
+		var k key
+		if err := rows.Scan(&k.tid, &k.dom); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		paused = append(paused, k)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	unpaused := 0
+	for _, k := range paused {
+		sent, complaints, bounces, err := windowedCounts(ctx, s.Pool, k.tid, k.dom, DefaultWindow)
+		if err != nil {
+			return unpaused, err
+		}
+		// Recover when the recent window is clean: either not enough recent volume to
+		// judge (bad events aged out), or enough volume and now under threshold.
+		recovered := sent < MinSample || !breaches(sent, complaints, bounces)
+		if !recovered {
+			continue
+		}
+		ct, err := s.Pool.Exec(ctx,
+			`UPDATE reputation_score SET paused=false, paused_at=NULL, updated_at=now()
+			 WHERE tenant_id=$1 AND remote_domain=$2 AND paused`, k.tid, k.dom)
+		if err != nil {
+			return unpaused, err
+		}
+		if ct.RowsAffected() > 0 {
+			unpaused++
+		}
+	}
+	return unpaused, nil
+}
+
+// Unpause clears the paused flag for one (tenant, domain) — the operator override
+// behind the admin API, for when a domain must be re-enabled immediately rather
+// than waiting for the windowed auto-unpause sweep.
+func (s *Service) Unpause(ctx context.Context, tenantID int64, remoteDomain string) error {
+	_, err := s.Pool.Exec(ctx,
+		`UPDATE reputation_score SET paused=false, paused_at=NULL, updated_at=now()
+		 WHERE tenant_id=$1 AND remote_domain=$2`, tenantID, remoteDomain)
+	return err
 }
 
 // --- VERP return-path attribution ---

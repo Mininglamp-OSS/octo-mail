@@ -78,6 +78,28 @@ CREATE TABLE IF NOT EXISTS reputation_score (
     updated_at     timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, remote_domain)
 );
+-- paused_at records when paused last flipped true, so the auto-unpause job can
+-- require a minimum pause dwell and the admin can report pause age. NULL when not
+-- paused. Additive for existing databases.
+ALTER TABLE reputation_score ADD COLUMN IF NOT EXISTS paused_at timestamptz;
+
+-- Per-day reputation rollup: bounded-cardinality time buckets (one row per
+-- tenant/remote-domain/UTC-day) that make a SLIDING-WINDOW rate cheap and exact,
+-- without a per-delivered-message event row (which would be write-amplifying at
+-- mail volume). The pause/unpause decision sums the buckets whose day falls in
+-- the window (default 7d). reputation_score stays as the lifetime total + the
+-- pause flag the hot send-gate reads.
+CREATE TABLE IF NOT EXISTS reputation_daily (
+    tenant_id     bigint NOT NULL REFERENCES tenants(id),
+    remote_domain text NOT NULL,
+    day           date NOT NULL,                       -- UTC day bucket
+    sent          bigint NOT NULL DEFAULT 0,
+    bounces       bigint NOT NULL DEFAULT 0,
+    complaints    bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, remote_domain, day)
+);
+CREATE INDEX IF NOT EXISTS reputation_daily_scope_idx
+    ON reputation_daily (tenant_id, remote_domain, day);
 
 -- Suppression list: recipient addresses we must stop sending to (hard bounces,
 -- complaints). Per (tenant, account) so one tenant's suppression never blocks
