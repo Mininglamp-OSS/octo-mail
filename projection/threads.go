@@ -12,11 +12,14 @@
 package projection
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/mail"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -30,6 +33,17 @@ type ThreadWorker struct {
 	Pool  *pgxpool.Pool
 	Blob  blob.Store
 	Batch int
+	// Log, if set, records quarantined rows (a permanently-missing/invalid blob
+	// folded best-effort so it can't wedge the projection). Optional.
+	Log *slog.Logger
+}
+
+// isPermanentBlobErr reports whether a parseMessage error is a PERMANENT blob
+// condition (missing/invalid content ref) rather than a transient I/O or network
+// error. Only permanent errors are quarantined; transient ones are returned so
+// the projection retries instead of silently dropping a message from the fold.
+func isPermanentBlobErr(err error) bool {
+	return errors.Is(err, blob.ErrNotFound) || errors.Is(err, blob.ErrBadRef)
 }
 
 const threadCursor = "threads"
@@ -86,16 +100,40 @@ func (w *ThreadWorker) RunOnceAccount(ctx context.Context, tenantID, accountID i
 
 	maxSeq := cursor
 	for _, m := range msgs {
-		refs, err := w.references(ctx, tenantID, m.blobRef, m.prefix)
+		refs, sum, err := w.parseMessage(ctx, tenantID, m.blobRef, m.prefix)
 		if err != nil {
-			return 0, err
+			if !isPermanentBlobErr(err) {
+				return 0, err // transient: retry this batch rather than skip
+			}
+			// Permanent blob failure (missing/invalid ref): quarantine so one poison
+			// row can't wedge the fold for every higher-id message. Thread to self,
+			// empty summary, mark folded, advance the cursor past it.
+			if w.Log != nil {
+				w.Log.Warn("thread fold: quarantining message with unreadable blob",
+					"account", accountID, "msg", m.id, "blob_ref", m.blobRef, "err", err)
+			}
+			if _, err := w.Pool.Exec(ctx,
+				`UPDATE messages SET thread_id=$1, summary_folded=true,
+				   subject='', from_addr='', to_addrs='', from_search='', to_search='', preview=''
+				 WHERE id=$2 AND account_id=$3`,
+				m.id, m.id, accountID); err != nil {
+				return 0, err
+			}
+			if m.seq > maxSeq {
+				maxSeq = m.seq
+			}
+			continue
 		}
 		threadID, err := w.assignThread(ctx, accountID, m.id, refs)
 		if err != nil {
 			return 0, err
 		}
 		if _, err := w.Pool.Exec(ctx,
-			`UPDATE messages SET thread_id=$1 WHERE id=$2`, threadID, m.id); err != nil {
+			`UPDATE messages SET thread_id=$1,
+			   subject=$3, from_addr=$4, to_addrs=$5, from_search=$6, to_search=$7,
+			   preview=$8, summary_folded=true
+			 WHERE id=$2`,
+			threadID, m.id, sum.subject, sum.from, sum.to, sum.fromSearch, sum.toSearch, sum.preview); err != nil {
 			return 0, err
 		}
 		if m.seq > maxSeq {
@@ -149,38 +187,182 @@ func (w *ThreadWorker) assignThread(ctx context.Context, accountID, msgID int64,
 	return threadID, nil
 }
 
-// references extracts the canonical Message-ID plus all In-Reply-To/References
-// ids from a stored message.
-func (w *ThreadWorker) references(ctx context.Context, tenantID int64, blobRef string, prefix []byte) ([]string, error) {
+// msgSummary holds the denormalized list-summary fields extracted during the fold.
+type msgSummary struct {
+	subject    string
+	from       string // sender address (display)
+	to         string // space-joined recipient addresses (display)
+	fromSearch string // sender name + address (filter)
+	toSearch   string // recipient names + addresses (filter)
+	preview    string // first ~140 chars of body text
+}
+
+// parseMessage reads a stored message once and extracts BOTH its threading
+// references (canonical Message-ID + In-Reply-To/References) AND its list-summary
+// fields (subject/from/to/preview), so the fold populates thread_id and the
+// summary columns from a single blob read + parse.
+func (w *ThreadWorker) parseMessage(ctx context.Context, tenantID int64, blobRef string, prefix []byte) ([]string, msgSummary, error) {
 	r, err := w.Blob.Open(ctx, tenantID, blob.Ref(blobRef))
 	if err != nil {
-		return nil, err
+		return nil, msgSummary{}, err
 	}
 	defer r.Close()
 	body, err := io.ReadAll(r)
 	if err != nil {
-		return nil, err
+		return nil, msgSummary{}, err
 	}
 	full := append(append([]byte{}, prefix...), body...)
-	msg, err := mail.ReadMessage(strings.NewReader(string(full)))
-	if err != nil {
-		// Unparseable header: no references, threads to itself.
-		return nil, nil
+
+	var refs []string
+	var sum msgSummary
+
+	// Headers + references via the stdlib parser (matches the prior behavior).
+	if msg, err := mail.ReadMessage(strings.NewReader(string(full))); err == nil {
+		seen := map[string]bool{}
+		add := func(raw string) {
+			for _, tok := range splitIDs(raw) {
+				if c, _, err := moxmessage.MessageIDCanonical(tok); err == nil && c != "" && !seen[c] {
+					seen[c] = true
+					refs = append(refs, c)
+				}
+			}
+		}
+		add(msg.Header.Get("Message-Id"))
+		add(msg.Header.Get("In-Reply-To"))
+		add(msg.Header.Get("References"))
 	}
-	seen := map[string]bool{}
-	var out []string
-	add := func(raw string) {
-		for _, tok := range splitIDs(raw) {
-			if c, _, err := moxmessage.MessageIDCanonical(tok); err == nil && c != "" && !seen[c] {
-				seen[c] = true
-				out = append(out, c)
+	// else: unparseable header → threads to itself, empty summary.
+
+	// Structured envelope + body preview via mox's parser (one parse of full).
+	if part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(full), int64(len(full))); err == nil || part.Envelope != nil {
+		if env := part.Envelope; env != nil {
+			sum.subject = env.Subject
+			sum.from = addrDisplay(env.From)
+			sum.to = addrDisplay(env.To)
+			sum.fromSearch = addrSearch(env.From)
+			sum.toSearch = addrSearch(env.To)
+		}
+		sum.preview = previewOf(&part)
+	}
+	// Every summary field is written to a Postgres text column, which rejects
+	// invalid UTF-8 (SQLSTATE 22021) — that would error the fold UPDATE and wedge
+	// the projection forever. Headers can carry invalid UTF-8 (malformed/encoded),
+	// and a body part may be a non-UTF-8 charset that the reader doesn't transcode
+	// (so even a short preview can be invalid). Scrub ALL of them unconditionally.
+	sum.subject = toValidUTF8(sum.subject)
+	sum.from = toValidUTF8(sum.from)
+	sum.to = toValidUTF8(sum.to)
+	sum.fromSearch = toValidUTF8(sum.fromSearch)
+	sum.toSearch = toValidUTF8(sum.toSearch)
+	sum.preview = toValidUTF8(sum.preview)
+	return refs, sum, nil
+}
+
+// addrDisplay renders an address list to bare "user@host" values, space-joined —
+// the DISPLAY form stored in from_addr/to_addrs (clients get real addresses and a
+// correct recipient count; no display-name tokens shattering the split).
+func addrDisplay(as []moxmessage.Address) string {
+	var parts []string
+	for _, a := range as {
+		parts = append(parts, a.User+"@"+a.Host)
+	}
+	return strings.Join(parts, " ")
+}
+
+// addrSearch renders an address list to "Name user@host" per address, space-joined
+// — the FILTER form stored in from_search/to_search, so a substring search matches
+// either a display name or an address. Kept separate from the display form so the
+// name tokens never corrupt the displayed from/to (see summarize).
+func addrSearch(as []moxmessage.Address) string {
+	var parts []string
+	for _, a := range as {
+		s := a.User + "@" + a.Host
+		if a.Name != "" {
+			s = a.Name + " " + s
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, " ")
+}
+
+// toValidUTF8 makes a header/body-derived string safe for a Postgres text column:
+// it strips NUL (0x00) — which IS valid UTF-8 but Postgres text rejects with
+// SQLSTATE 22021 — and replaces any invalid UTF-8 sequences. Either, unhandled,
+// would error the fold UPDATE and wedge the projection forever.
+func toValidUTF8(s string) string {
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+	return s
+}
+
+// previewOf returns the first ~140 chars of a message's text body (falling back
+// to stripped HTML), whitespace-collapsed — the list-view preview snippet.
+func previewOf(part *moxmessage.Part) string {
+	var text, html string
+	var walk func(p *moxmessage.Part)
+	walk = func(p *moxmessage.Part) {
+		if len(p.Parts) > 0 {
+			for i := range p.Parts {
+				walk(&p.Parts[i])
+			}
+			return
+		}
+		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
+			return
+		}
+		rd := p.Reader()
+		if rd == nil {
+			return
+		}
+		b, _ := io.ReadAll(rd)
+		if strings.EqualFold(p.MediaSubType, "HTML") {
+			if html == "" {
+				html = string(b)
+			}
+		} else if text == "" {
+			text = string(b)
+		}
+	}
+	walk(part)
+	s := text
+	if s == "" {
+		s = stripHTMLTags(html)
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	// Truncate on a rune boundary (not a byte offset): a mid-rune byte slice would
+	// yield invalid UTF-8, which a Postgres text column rejects.
+	if len(s) > 140 {
+		s = s[:140]
+		for len(s) > 0 && !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
+
+// stripHTMLTags removes tags for a text preview of an HTML-only body.
+func stripHTMLTags(s string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
 			}
 		}
 	}
-	add(msg.Header.Get("Message-Id"))
-	add(msg.Header.Get("In-Reply-To"))
-	add(msg.Header.Get("References"))
-	return out, nil
+	return b.String()
 }
 
 // splitIDs splits a header value into individual <id> tokens.
@@ -214,10 +396,89 @@ func (w *ThreadWorker) DrainAccount(ctx context.Context, tenantID, accountID int
 	}
 }
 
+// BackfillSummaries populates the summary columns for rows the forward fold
+// already passed but that predate those columns (summary_folded=false with
+// createseq <= cursor) — i.e. every row on an in-place upgrade, since the thread
+// cursor is already at head so DrainAccount never revisits them. It re-parses
+// each such row and writes the summary columns (leaving thread_id as-is, which is
+// already correct), marking summary_folded=true. Idempotent and bounded per call;
+// once every legacy row is backfilled it becomes a no-op. Without this, filtered
+// search would silently omit all pre-existing mail (its search columns stay ”).
+func (w *ThreadWorker) BackfillSummaries(ctx context.Context, tenantID, accountID int64) error {
+	batch := w.Batch
+	if batch <= 0 {
+		batch = 100
+	}
+	for {
+		rows, err := w.Pool.Query(ctx,
+			`SELECT id, blob_ref, msg_prefix FROM messages
+			 WHERE account_id=$1 AND NOT summary_folded
+			 ORDER BY id LIMIT $2`, accountID, batch)
+		if err != nil {
+			return err
+		}
+		type row struct {
+			id      int64
+			blobRef string
+			prefix  []byte
+		}
+		var todo []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.blobRef, &r.prefix); err != nil {
+				rows.Close()
+				return err
+			}
+			todo = append(todo, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(todo) == 0 {
+			return nil
+		}
+		for _, r := range todo {
+			_, sum, err := w.parseMessage(ctx, tenantID, r.blobRef, r.prefix)
+			if err != nil {
+				if !isPermanentBlobErr(err) {
+					return err // transient: retry rather than skip
+				}
+				// Permanent blob failure: quarantine (empty summary, folded) so this
+				// poison row can't block backfilling every higher-id row. Leave
+				// thread_id alone — the forward fold owns threading; backfill only
+				// populates the summary columns.
+				if w.Log != nil {
+					w.Log.Warn("summary backfill: quarantining message with unreadable blob",
+						"account", accountID, "msg", r.id, "blob_ref", r.blobRef, "err", err)
+				}
+				if _, err := w.Pool.Exec(ctx,
+					`UPDATE messages SET subject='', from_addr='', to_addrs='',
+					   from_search='', to_search='', preview='', summary_folded=true
+					 WHERE id=$1 AND account_id=$2`,
+					r.id, accountID); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := w.Pool.Exec(ctx,
+				`UPDATE messages SET subject=$2, from_addr=$3, to_addrs=$4,
+				   from_search=$5, to_search=$6, preview=$7, summary_folded=true
+				 WHERE id=$1 AND account_id=$8`,
+				r.id, sum.subject, sum.from, sum.to, sum.fromSearch, sum.toSearch, sum.preview, accountID); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 // RebuildAccount clears thread_id + thread_refs and resets the cursor, re-folding
 // the whole log from seq 0.
 func (w *ThreadWorker) RebuildAccount(ctx context.Context, tenantID, accountID int64) error {
-	if _, err := w.Pool.Exec(ctx, `UPDATE messages SET thread_id=NULL WHERE account_id=$1`, accountID); err != nil {
+	if _, err := w.Pool.Exec(ctx,
+		`UPDATE messages SET thread_id=NULL, summary_folded=false,
+		   subject='', from_addr='', to_addrs='', from_search='', to_search='', preview=''
+		 WHERE account_id=$1`, accountID); err != nil {
 		return err
 	}
 	if _, err := w.Pool.Exec(ctx, `DELETE FROM thread_refs WHERE account_id=$1`, accountID); err != nil {

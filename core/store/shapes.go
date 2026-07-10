@@ -101,6 +101,20 @@ type Message struct {
 	SaveDate time.Time // When this row entered its mailbox (IMAP SAVEDATE, RFC 8514).
 
 	MsgPrefix []byte // Generated headers, prepended to the blob on read.
+
+	// Denormalized list-summary fields (H13), populated by the threading
+	// projection fold so list/query paths need not MIME-parse the body per row.
+	// SummaryFolded is false until the fold has run for this row; list endpoints
+	// fall back to an on-the-fly parse while false (see summarize).
+	// FromAddr/ToAddrs are DISPLAY forms (bare addresses); FromSearch/ToSearch add
+	// display names for substring filtering.
+	Subject       string
+	FromAddr      string
+	ToAddrs       string // space-joined recipient addresses (display)
+	FromSearch    string // sender name + address (filter)
+	ToSearch      string // recipient names + addresses (filter)
+	Preview       string
+	SummaryFolded bool
 }
 
 // EffectiveEmailID returns the message's JMAP email identity: its EmailID group

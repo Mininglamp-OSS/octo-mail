@@ -77,6 +77,30 @@ CREATE TABLE IF NOT EXISTS messages_p3 PARTITION OF messages FOR VALUES WITH (MO
 CREATE INDEX IF NOT EXISTS messages_modseq_idx ON messages (account_id, mailbox_id, modseq);
 CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages (account_id, thread_id);
 CREATE INDEX IF NOT EXISTS messages_email_idx ON messages (account_id, email_id);
+-- Email-group dedup (JMAP Email/query, webapi list) sorts by COALESCE(email_id, id)
+-- for DISTINCT ON. The bare-column messages_email_idx can't back that expression,
+-- so this expression index lets the dedup sort be index-served on large mailboxes.
+CREATE INDEX IF NOT EXISTS messages_email_group_idx ON messages (account_id, (COALESCE(email_id, id)));
+
+-- H13: denormalized list-summary columns so list/query paths don't MIME-parse
+-- every message body per request. Populated asynchronously by the threading
+-- projection fold (which already opens+parses each message). On an in-place
+-- upgrade, pre-existing (already-folded) rows are repopulated by the projection
+-- worker's BackfillSummaries pass (drainProjections), which folds rows still
+-- marked summary_folded=false without a full rethread. summary_folded
+-- distinguishes "folded, genuinely empty" from "not yet folded" so list endpoints
+-- fall back to an on-the-fly parse only for the (rare, recent) unfolded rows.
+-- ADD COLUMN cascades to the hash partitions.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS subject        text NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS from_addr      text NOT NULL DEFAULT ''; -- display: bare sender address
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS to_addrs       text NOT NULL DEFAULT ''; -- display: space-joined recipient addresses
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS from_search    text NOT NULL DEFAULT ''; -- filter: sender name + address, substring-searchable
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS to_search      text NOT NULL DEFAULT ''; -- filter: recipient names + addresses
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview        text NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS summary_folded boolean NOT NULL DEFAULT false;
+-- Received-desc list ordering + email-group dedup (DISTINCT ON) are the hot
+-- list/query access pattern; back them with an index.
+CREATE INDEX IF NOT EXISTS messages_received_idx ON messages (account_id, received_at DESC, id DESC);
 
 -- IMAP METADATA (RFC 5464): per-mailbox and server (mailbox_id=0) annotations.
 CREATE TABLE IF NOT EXISTS annotations (

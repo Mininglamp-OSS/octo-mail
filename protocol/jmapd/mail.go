@@ -135,93 +135,216 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 	sortProp, sortAsc := parseEmailSort(inv.args["sort"])
 	position := int(jsonNum(inv.args["position"]))
 	limit := int(jsonNum(inv.args["limit"]))
-
-	// Precompute fts hits for a text/body term if present. Keyed by message ID
-	// (globally unique) — NOT UID, which is only unique per mailbox and would
-	// collide across mailboxes when no inMailbox filter is set.
-	var ftsHits map[int64]bool
-	if filt.text != "" {
-		ftsHits = map[int64]bool{}
-		_ = acc.Tx(ctx, func(tx store.Tx) error {
-			q := tx.QueryMessage()
-			if filt.mailboxID != 0 {
-				q = q.FilterMailbox(filt.mailboxID)
-			}
-			ms, e := q.FilterFTS(filt.text).List()
-			if e != nil {
-				return e
-			}
-			for _, mm := range ms {
-				ftsHits[mm.ID] = true
-			}
-			return nil
-		})
+	// Bound the result window: an absent/zero/oversized limit must not return the
+	// whole account in one response. maxObjectsInQuery caps it; clients page with
+	// position for more.
+	if limit <= 0 || limit > maxObjectsInQuery {
+		limit = maxObjectsInQuery
+	}
+	if position < 0 {
+		position = 0
 	}
 
-	type row struct {
-		id  string
-		rcv int64
-		sz  int64
-	}
-	var rows []row
-	err := acc.Tx(ctx, func(tx store.Tx) error {
-		q := tx.QueryMessage()
+	// A message not yet folded by the summary projection has empty summary columns,
+	// so the SQL header filters can't match it. To keep filtered search from
+	// silently dropping just-delivered mail, also evaluate the (small, recent)
+	// unfolded set live. Only needed when a column-backed predicate is used; pure
+	// mailbox/size/date/fts filters already match unfolded rows.
+	//
+	// keyword filters are the subtle case: `keywords` is populated at delivery,
+	// independent of summary_folded, so the SQL keyword predicate DOES match
+	// unfolded rows — which would then be counted both in the SQL total and in the
+	// live set. So whenever we run the live fallback, we restrict the SQL side to
+	// folded rows (FilterFolded) so the two sets are provably disjoint.
+	needsLiveFallback := filt.from != "" || filt.to != "" || filt.subject != "" ||
+		filt.hasKeyword != "" || filt.notKeyword != ""
+
+	// Build the filter query in SQL: header substrings hit the denormalized
+	// summary columns, size/date/keyword hit their columns, text/body hits the fts
+	// projection — so no message body is parsed and the whole account is not
+	// loaded. Email-group dedup, sort, and paging are pushed down too. When the
+	// live fallback is active, folded-only keeps the SQL set disjoint from live.
+	build := func(tx store.Tx) store.MessageQuery {
+		q := tx.QueryMessage().DistinctEmail()
+		if needsLiveFallback {
+			q = q.FilterFolded()
+		}
 		if filt.mailboxID != 0 {
 			q = q.FilterMailbox(filt.mailboxID)
 		}
-		msgs, e := q.SortUID().List()
+		if filt.text != "" {
+			q = q.FilterFTS(filt.text)
+		}
+		if filt.subject != "" {
+			q = q.FilterSubject(filt.subject)
+		}
+		if filt.from != "" {
+			q = q.FilterFrom(filt.from)
+		}
+		if filt.to != "" {
+			q = q.FilterTo(filt.to)
+		}
+		if filt.after != "" || filt.before != "" {
+			q = q.FilterReceivedRange(filt.after, filt.before)
+		}
+		if filt.minSize > 0 || filt.maxSize > 0 {
+			q = q.FilterSizeRange(filt.minSize, filt.maxSize)
+		}
+		if filt.hasKeyword != "" {
+			q = q.FilterKeyword(filt.hasKeyword, true)
+		}
+		if filt.notKeyword != "" {
+			q = q.FilterKeyword(filt.notKeyword, false)
+		}
+		return q
+	}
+	sortIt := func(q store.MessageQuery) store.MessageQuery {
+		if sortProp == "size" {
+			if sortAsc {
+				return q.SortSizeAsc()
+			}
+			return q.SortSizeDesc()
+		}
+		if sortAsc {
+			return q.SortReceivedAsc()
+		}
+		return q.SortReceivedDesc()
+	}
+
+	type qrow struct {
+		gid int64
+		rcv int64
+		sz  int64
+	}
+	var ids []string
+	var total int
+	err := acc.Tx(ctx, func(tx store.Tx) error {
+		// Live matches: the small set of not-yet-folded rows evaluated per row.
+		// Collected first so they can be folded into both the total and the page.
+		var live []qrow
+		liveSeen := map[int64]bool{}
+		if needsLiveFallback {
+			uq := tx.QueryMessage().FilterUnfolded()
+			if filt.mailboxID != 0 {
+				uq = uq.FilterMailbox(filt.mailboxID)
+			}
+			if filt.after != "" || filt.before != "" {
+				uq = uq.FilterReceivedRange(filt.after, filt.before)
+			}
+			if filt.minSize > 0 || filt.maxSize > 0 {
+				uq = uq.FilterSizeRange(filt.minSize, filt.maxSize)
+			}
+			if filt.text != "" {
+				uq = uq.FilterFTS(filt.text)
+			}
+			umsgs, e := uq.Limit(maxObjectsInQuery).List()
+			if e != nil {
+				return e
+			}
+			for _, m := range umsgs {
+				if !matchesLiveFilter(acc, m, filt) {
+					continue
+				}
+				gid := m.EffectiveEmailID()
+				if liveSeen[gid] {
+					continue
+				}
+				liveSeen[gid] = true
+				live = append(live, qrow{gid, m.Received.UnixNano(), m.Size})
+			}
+		}
+
+		// Accurate total, deduped at the EMAIL-GROUP granularity. foldedTotal counts
+		// distinct folded groups; len(live) counts distinct unfolded groups. These are
+		// row-disjoint (FilterFolded vs FilterUnfolded) but a copied message mid-fold
+		// can have a folded sibling AND an unfolded sibling sharing one email_id — so
+		// the same group appears in both. Subtract that overlap: the count of live
+		// groups that also have a folded matching sibling.
+		foldedTotal, e := build(tx).Count()
 		if e != nil {
 			return e
 		}
-		// Dedup by email group: one row may match per mailbox, but an Email is a
-		// single object. Keep the first matching row per effective email id.
+		total = foldedTotal + len(live)
+		if len(live) > 0 {
+			liveGids := make([]int64, 0, len(live))
+			for _, r := range live {
+				liveGids = append(liveGids, r.gid)
+			}
+			overlap, e := build(tx).FilterEmailGroupIn(liveGids).Count()
+			if e != nil {
+				return e
+			}
+			total -= overlap
+		}
+
+		if len(live) == 0 {
+			// Fast path: no unfolded matches — page entirely in SQL, so total/paging
+			// are exact regardless of result-set size.
+			q := sortIt(build(tx)).Offset(position).Limit(limit)
+			msgs, e := q.List()
+			if e != nil {
+				return e
+			}
+			for _, m := range msgs {
+				ids = append(ids, emailID(m))
+			}
+			return nil
+		}
+
+		// Merge path: a few live rows exist. Fetch the folded page window plus enough
+		// context to interleave the live rows correctly, then sort+page in Go across
+		// the union. The folded fetch is bounded by position+limit+len(live).
+		foldedWindow := position + limit + len(live)
+		fmsgs, e := sortIt(build(tx)).Limit(foldedWindow).List()
+		if e != nil {
+			return e
+		}
+		rows := make([]qrow, 0, len(fmsgs)+len(live))
+		for _, m := range fmsgs {
+			rows = append(rows, qrow{m.EffectiveEmailID(), m.Received.UnixNano(), m.Size})
+		}
+		rows = append(rows, live...)
+		// Dedup (a row could fold between the count and this read).
 		seen := map[int64]bool{}
-		for _, m := range msgs {
-			if !s.emailMatchesFilter(acc, m, filt, ftsHits) {
+		uniq := rows[:0]
+		for _, r := range rows {
+			if seen[r.gid] {
 				continue
 			}
-			gid := m.EffectiveEmailID()
-			if seen[gid] {
-				continue
+			seen[r.gid] = true
+			uniq = append(uniq, r)
+		}
+		rows = uniq
+		sort.SliceStable(rows, func(i, j int) bool {
+			var less bool
+			if sortProp == "size" {
+				less = rows[i].sz < rows[j].sz
+			} else {
+				less = rows[i].rcv < rows[j].rcv
 			}
-			seen[gid] = true
-			rows = append(rows, row{id: emailID(m), rcv: m.Received.UnixNano(), sz: m.Size})
+			if !sortAsc {
+				return !less
+			}
+			return less
+		})
+		if position < len(rows) {
+			rows = rows[position:]
+		} else {
+			rows = nil
+		}
+		if limit < len(rows) {
+			rows = rows[:limit]
+		}
+		for _, r := range rows {
+			ids = append(ids, "E"+strconv.FormatInt(r.gid, 10))
 		}
 		return nil
 	})
 	if err != nil {
 		return "error", map[string]any{"type": "serverFail", "description": err.Error()}
 	}
-
-	// Sort.
-	sort.SliceStable(rows, func(i, j int) bool {
-		var less bool
-		switch sortProp {
-		case "size":
-			less = rows[i].sz < rows[j].sz
-		default: // receivedAt
-			less = rows[i].rcv < rows[j].rcv
-		}
-		if !sortAsc {
-			return !less
-		}
-		return less
-	})
-
-	total := len(rows)
-	if position < 0 {
-		position = 0
-	}
-	if position > len(rows) {
-		position = len(rows)
-	}
-	rows = rows[position:]
-	if limit > 0 && limit < len(rows) {
-		rows = rows[:limit]
-	}
-	ids := make([]string, 0, len(rows))
-	for _, r := range rows {
-		ids = append(ids, r.id)
+	if ids == nil {
+		ids = []string{}
 	}
 
 	st, _ := accountState(ctx, acc)
@@ -281,6 +404,78 @@ func parseEmailFilter(raw json.RawMessage) emailFilter {
 	return f
 }
 
+// matchesLiveFilter evaluates the header/keyword predicates of a filter against a
+// message's live-parsed envelope. Used only for the small set of not-yet-folded
+// rows in Email/query, so a filtered search doesn't miss just-delivered mail (the
+// column-backed filters can't match a row whose summary columns aren't populated
+// yet). Size/date/mailbox/fts are already applied in SQL by the caller.
+func matchesLiveFilter(acc store.Account, m store.Message, f emailFilter) bool {
+	if f.hasKeyword != "" && !hasKeyword(m, f.hasKeyword) {
+		return false
+	}
+	if f.notKeyword != "" && hasKeyword(m, f.notKeyword) {
+		return false
+	}
+	if f.from == "" && f.to == "" && f.subject == "" {
+		return true
+	}
+	br := acc.MessageReader(m)
+	data, _ := io.ReadAll(br)
+	br.Close()
+	part, _ := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
+	env := part.Envelope
+	if env == nil {
+		return false
+	}
+	if f.subject != "" && !strings.Contains(strings.ToLower(env.Subject), strings.ToLower(f.subject)) {
+		return false
+	}
+	if f.from != "" && !addrsContain(env.From, f.from) {
+		return false
+	}
+	if f.to != "" && !addrsContain(env.To, f.to) {
+		return false
+	}
+	return true
+}
+
+// addrsContain reports whether any address matches sub (case-insensitive), over
+// the display name + address — matching the folded from_addr/to_addrs content.
+func addrsContain(as []moxmessage.Address, sub string) bool {
+	sub = strings.ToLower(sub)
+	for _, a := range as {
+		if strings.Contains(strings.ToLower(a.Name+" "+a.User+"@"+a.Host), sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasKeyword reports whether a message has the given JMAP keyword ($seen etc.),
+// matching the keyword filter applied to folded rows in SQL.
+func hasKeyword(m store.Message, kw string) bool {
+	switch strings.ToLower(kw) {
+	case "$seen", `\seen`:
+		return m.Seen
+	case "$flagged", `\flagged`:
+		return m.Flagged
+	case "$answered", `\answered`:
+		return m.Answered
+	case "$draft", `\draft`:
+		return m.Draft
+	case "$deleted", `\deleted`:
+		return m.Deleted
+	case "$junk", `\junk`:
+		return m.Junk
+	}
+	for _, k := range m.Keywords {
+		if strings.EqualFold(k, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 func parseEmailSort(raw json.RawMessage) (prop string, asc bool) {
 	prop, asc = "receivedAt", true
 	if raw == nil {
@@ -298,84 +493,6 @@ func parseEmailSort(raw json.RawMessage) (prop string, asc bool) {
 		_ = json.Unmarshal(v, &asc)
 	}
 	return
-}
-
-// emailMatchesFilter evaluates the non-mailbox filter predicates for a message.
-func (s *Server) emailMatchesFilter(acc store.Account, m store.Message, f emailFilter, ftsHits map[int64]bool) bool {
-	if f.minSize > 0 && m.Size < f.minSize {
-		return false
-	}
-	if f.maxSize > 0 && m.Size > f.maxSize {
-		return false
-	}
-	if f.after != "" && !m.Received.IsZero() && m.Received.UTC().Format("2006-01-02T15:04:05Z") < f.after {
-		return false
-	}
-	if f.before != "" && !m.Received.IsZero() && m.Received.UTC().Format("2006-01-02T15:04:05Z") >= f.before {
-		return false
-	}
-	if f.hasKeyword != "" && !hasKeyword(m, f.hasKeyword) {
-		return false
-	}
-	if f.notKeyword != "" && hasKeyword(m, f.notKeyword) {
-		return false
-	}
-	if f.text != "" && (ftsHits == nil || !ftsHits[m.ID]) {
-		return false
-	}
-	// Header substring filters need the parsed message.
-	if f.from != "" || f.to != "" || f.subject != "" {
-		br := acc.MessageReader(m)
-		data, _ := io.ReadAll(br)
-		br.Close()
-		part, _ := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
-		env := part.Envelope
-		if env == nil {
-			return false
-		}
-		if f.subject != "" && !strings.Contains(strings.ToLower(env.Subject), strings.ToLower(f.subject)) {
-			return false
-		}
-		if f.from != "" && !addrsContain(env.From, f.from) {
-			return false
-		}
-		if f.to != "" && !addrsContain(env.To, f.to) {
-			return false
-		}
-	}
-	return true
-}
-
-func addrsContain(as []moxmessage.Address, sub string) bool {
-	sub = strings.ToLower(sub)
-	for _, a := range as {
-		if strings.Contains(strings.ToLower(a.Name+" "+a.User+"@"+a.Host), sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasKeyword reports whether a message has the given JMAP keyword ($seen etc).
-func hasKeyword(m store.Message, kw string) bool {
-	switch strings.ToLower(kw) {
-	case "$seen":
-		return m.Seen
-	case "$flagged":
-		return m.Flagged
-	case "$answered":
-		return m.Answered
-	case "$draft":
-		return m.Draft
-	case "$junk":
-		return m.Junk
-	}
-	for _, k := range m.Keywords {
-		if strings.EqualFold(k, kw) {
-			return true
-		}
-	}
-	return false
 }
 
 func jsonNum(raw json.RawMessage) int64 {

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
@@ -170,3 +171,148 @@ func uids(ms []store.Message) []store.UID {
 	}
 	return out
 }
+
+// TestMessageQuerySummaryFilters proves the H13 PR2 query-builder pushdowns:
+// FilterFrom/Subject (ILIKE on summary columns), FilterSizeRange/ReceivedRange,
+// FilterKeyword, DistinctEmail dedup, and Count over the deduped set. Rows are
+// inserted directly (columns set) so the test targets the query layer.
+func TestMessageQuerySummaryFilters(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	t.Cleanup(s.Close)
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, mbID int64
+	must(t, s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`).Scan(&tenantID))
+	must(t, s.Pool.QueryRow(ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u') RETURNING id`, tenantID).Scan(&accID))
+	must(t, s.Pool.QueryRow(ctx,
+		`INSERT INTO mailboxes (account_id, name, uidvalidity, uidnext, createseq, modseq) VALUES ($1,'Inbox',1,10,1,1) RETURNING id`,
+		accID).Scan(&mbID))
+
+	ins := func(uid int, from, subj string, size int64, kw []string, folded bool) int64 {
+		var id int64
+		// from_search mirrors the fold: FilterFrom targets from_search, not the
+		// display-only from_addr column.
+		must(t, s.Pool.QueryRow(ctx,
+			`INSERT INTO messages (account_id, mailbox_id, uid, createseq, modseq, blob_ref, size,
+			   from_addr, from_search, subject, keywords, summary_folded, received_at, save_date)
+			 VALUES ($1,$2,$3,$3,$3,'r',$4,$5,$5,$6,$7,$8, now(), now()) RETURNING id`,
+			accID, mbID, uid, size, from, subj, kw, folded).Scan(&id))
+		return id
+	}
+	ins(1, "alice@x.example", "Invoice #5", 100, []string{"$important"}, true)
+	ins(2, "bob@x.example", "Lunch plans", 9000, []string{}, true)
+	id3 := ins(3, "ALICE@x.example", "re: Invoice", 500, []string{}, true)
+
+	acc := s.OpenAccountByID(accID, tenantID, "u")
+	err = acc.Tx(ctx, func(tx store.Tx) error {
+		// FilterFrom is case-insensitive substring → both alice rows.
+		fr, e := tx.QueryMessage().FilterFrom("alice@").List()
+		if e != nil {
+			return e
+		}
+		if len(fr) != 2 {
+			return fmtErrf("FilterFrom(alice@) = %d rows, want 2", len(fr))
+		}
+		// FilterSubject substring.
+		sj, _ := tx.QueryMessage().FilterSubject("invoice").List()
+		if len(sj) != 2 {
+			return fmtErrf("FilterSubject(invoice) = %d, want 2", len(sj))
+		}
+		// FilterSizeRange.
+		sz, _ := tx.QueryMessage().FilterSizeRange(1000, 0).List()
+		if len(sz) != 1 || sz[0].UID != 2 {
+			return fmtErrf("FilterSizeRange(min=1000) = %v, want uid 2", uids(sz))
+		}
+		// FilterKeyword has/lacks.
+		hk, _ := tx.QueryMessage().FilterKeyword("$important", true).List()
+		if len(hk) != 1 || hk[0].UID != 1 {
+			return fmtErrf("FilterKeyword($important,true) = %v, want uid 1", uids(hk))
+		}
+		nk, _ := tx.QueryMessage().FilterKeyword("$important", false).List()
+		if len(nk) != 2 {
+			return fmtErrf("FilterKeyword($important,false) = %d, want 2", len(nk))
+		}
+		// LIKE metachars are escaped: "%" matches nothing (no literal % in data).
+		pc, _ := tx.QueryMessage().FilterSubject("%").List()
+		if len(pc) != 0 {
+			return fmtErrf("FilterSubject(%%) = %d, want 0 (escaped)", len(pc))
+		}
+		// Count matches List length for a filter.
+		n, _ := tx.QueryMessage().FilterFrom("alice@").Count()
+		if n != 2 {
+			return fmtErrf("Count(FilterFrom alice@) = %d, want 2", n)
+		}
+		_ = id3
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("OK: from/subject/size/keyword filters + escaping + Count all correct")
+}
+
+// TestMessageQueryDistinctEmail proves DistinctEmail collapses sibling rows of one
+// Email (shared email_id) so Count and List page over Emails, not rows.
+func TestMessageQueryDistinctEmail(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	t.Cleanup(s.Close)
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, mb1, mb2 int64
+	must(t, s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`).Scan(&tenantID))
+	must(t, s.Pool.QueryRow(ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u') RETURNING id`, tenantID).Scan(&accID))
+	must(t, s.Pool.QueryRow(ctx, `INSERT INTO mailboxes (account_id, name, uidvalidity, uidnext, createseq, modseq) VALUES ($1,'Inbox',1,10,1,1) RETURNING id`, accID).Scan(&mb1))
+	must(t, s.Pool.QueryRow(ctx, `INSERT INTO mailboxes (account_id, name, uidvalidity, uidnext, createseq, modseq) VALUES ($1,'Archive',1,10,1,1) RETURNING id`, accID).Scan(&mb2))
+
+	// One standalone Email (id A) and one Email present in two mailboxes (the
+	// original id B in Inbox + a sibling in Archive with email_id=B).
+	var a, b int64
+	must(t, s.Pool.QueryRow(ctx, `INSERT INTO messages (account_id, mailbox_id, uid, createseq, modseq, blob_ref, size, summary_folded, received_at, save_date) VALUES ($1,$2,1,1,1,'r',10,true, now(), now()) RETURNING id`, accID, mb1).Scan(&a))
+	must(t, s.Pool.QueryRow(ctx, `INSERT INTO messages (account_id, mailbox_id, uid, createseq, modseq, blob_ref, size, summary_folded, received_at, save_date) VALUES ($1,$2,2,2,2,'r',10,true, now(), now()) RETURNING id`, accID, mb1).Scan(&b))
+	if _, err := s.Pool.Exec(ctx, `INSERT INTO messages (account_id, mailbox_id, uid, createseq, modseq, blob_ref, size, email_id, summary_folded, received_at, save_date) VALUES ($1,$2,1,3,3,'r',10,$3,true, now(), now())`, accID, mb2, b); err != nil {
+		t.Fatal(err)
+	}
+
+	acc := s.OpenAccountByID(accID, tenantID, "u")
+	err = acc.Tx(ctx, func(tx store.Tx) error {
+		// 3 rows, but 2 Emails.
+		all, _ := tx.QueryMessage().List()
+		if len(all) != 3 {
+			return fmtErrf("rows = %d, want 3", len(all))
+		}
+		n, _ := tx.QueryMessage().DistinctEmail().Count()
+		if n != 2 {
+			return fmtErrf("DistinctEmail Count = %d, want 2 Emails", n)
+		}
+		ded, _ := tx.QueryMessage().DistinctEmail().SortReceivedDesc().List()
+		if len(ded) != 2 {
+			return fmtErrf("DistinctEmail List = %d, want 2", len(ded))
+		}
+		_ = a
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("OK: DistinctEmail collapses sibling rows to one Email for Count + List")
+}
+
+func fmtErrf(f string, a ...any) error { return fmt.Errorf(f, a...) }

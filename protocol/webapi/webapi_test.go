@@ -7,12 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-mail/core/store"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/deliverability"
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/submit"
+	"github.com/Mininglamp-OSS/octo-mail/projection"
 	"github.com/Mininglamp-OSS/octo-mail/protocol/webapi"
 	"github.com/Mininglamp-OSS/octo-mail/storage/blob"
 	"github.com/Mininglamp-OSS/octo-mail/storage/postgres"
@@ -129,6 +131,11 @@ func TestRESTAPI(t *testing.T) {
 	}
 	if m0["unread"] != true {
 		t.Fatalf("new message should be unread: %v", m0)
+	}
+	// The projection hasn't folded this just-delivered row, so the summary comes
+	// from the hybrid on-the-fly fallback — it must still be correct (H13 PR2).
+	if m0["subject"] != "hi" {
+		t.Fatalf("list subject = %v, want 'hi' (hybrid fallback for unfolded row)", m0["subject"])
 	}
 
 	// --- get: bodies + subject. ---
@@ -311,3 +318,119 @@ type memBlob struct {
 
 func (m *memBlob) Close() error { return nil }
 func (m *memBlob) Size() int64  { return m.n }
+
+// TestListPagingAndFold proves the H13 PR2 list path: with the projection folded,
+// summaries come from the columns (no body parse), total is accurate across many
+// messages, and deep paging (offset past the first page) returns the right
+// window newest-first.
+func TestListPagingAndFold(t *testing.T) {
+	ctx := context.Background()
+	bs, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, queue, suppressions, projection_cursor, thread_refs RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, domID int64
+	scan(t, s, ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`, &tenantID)
+	scan(t, s, ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'u1') RETURNING id`, &accID, tenantID)
+	scan(t, s, ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'example.com') RETURNING id`, &domID, tenantID)
+	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'u1')`, tenantID, domID, accID)
+	s.Pool.Exec(ctx, `INSERT INTO principals (tenant_id, login) VALUES ($1,'u1@example.com')`, tenantID)
+	dir := s.NewDirectory()
+	if err := dir.SetPassword(ctx, "u1@example.com", "pw"); err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := smtp.ParseAddress("u1@example.com")
+	target, _ := dir.ResolveInbound(ctx, addr.Path())
+	const n = 25
+	for i := 0; i < n; i++ {
+		raw := "From: s" + itoa(i) + "@remote.example\r\nTo: u1@example.com\r\nSubject: msg" + itoa(i) + "\r\n\r\nbody" + itoa(i) + "\r\n"
+		if _, err := target.Deliver(ctx, &store.Message{}, mem(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One message with display-named sender + two named recipients, to prove the
+	// display columns hold bare addresses (correct count) not name-shattered tokens.
+	named := "From: Alice Smith <alice@remote.example>\r\nTo: Bob Jones <bob@x.example>, Carol <carol@y.example>\r\nSubject: msg25\r\n\r\nbody25\r\n"
+	if _, err := target.Deliver(ctx, &store.Message{}, mem(named)); err != nil {
+		t.Fatal(err)
+	}
+	// Fold so summaries read from columns.
+	tw := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100}
+	if err := tw.DrainAccount(ctx, tenantID, accID); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &webapi.Server{Dir: dir, Submission: &submit.Submitter{Pool: s.Pool, Blob: bs}, Suppressions: &deliverability.Suppressions{Pool: s.Pool}}
+	hs := httptest.NewServer(srv.Handler())
+	defer hs.Close()
+	get := func(path string) map[string]any {
+		req, _ := http.NewRequest("GET", hs.URL+path, nil)
+		req.SetBasicAuth("u1@example.com", "pw")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		json.NewDecoder(resp.Body).Decode(&out)
+		return out
+	}
+
+	// Page 1: limit 10 → 10 messages, accurate total (not capped).
+	total := n + 1 // the 25 plain messages + the display-named one
+	p1 := get("/webapi/v0/messages?limit=10&offset=0")
+	if int(p1["total"].(float64)) != total {
+		t.Fatalf("total = %v, want %d", p1["total"], total)
+	}
+	m1, _ := p1["messages"].([]any)
+	if len(m1) != 10 {
+		t.Fatalf("page1 = %d messages, want 10", len(m1))
+	}
+	// Newest first: the display-named msg25 is first (delivered last). Its display
+	// fields must be bare addresses, NOT name-shattered: from="alice@…" (no name),
+	// to=["bob@x.example","carol@y.example"] (2 recipients, not 4 name tokens).
+	top := m1[0].(map[string]any)
+	if top["subject"] != "msg25" {
+		t.Fatalf("page1[0] subject = %v, want msg25 (newest-first)", top["subject"])
+	}
+	if top["from"] != "alice@remote.example" {
+		t.Fatalf("display from = %v, want bare 'alice@remote.example' (no display-name prefix)", top["from"])
+	}
+	toList, _ := top["to"].([]any)
+	if len(toList) != 2 || toList[0] != "bob@x.example" || toList[1] != "carol@y.example" {
+		t.Fatalf("display to = %v, want [bob@x.example carol@y.example] (not name-shattered)", toList)
+	}
+	// Deep page: offset 21, limit 10 → last 5 (msg4..msg0).
+	p3 := get("/webapi/v0/messages?limit=10&offset=21")
+	m3, _ := p3["messages"].([]any)
+	if len(m3) != 5 {
+		t.Fatalf("offset=21 page = %d messages, want 5 (deep paging)", len(m3))
+	}
+	if s0 := m3[0].(map[string]any)["subject"]; s0 != "msg4" {
+		t.Fatalf("offset=21 page[0] subject = %v, want msg4", s0)
+	}
+	// limit clamp: ?limit=0 and ?limit=<huge> must NOT return the whole account
+	// uncapped — they clamp to maxListLimit (1000), so all `total` rows return
+	// (bounded), never more than the cap.
+	for _, path := range []string{"/webapi/v0/messages?limit=0", "/webapi/v0/messages?limit=999999999"} {
+		p := get(path)
+		mm, _ := p["messages"].([]any)
+		if len(mm) != total {
+			t.Fatalf("%s = %d messages, want %d (clamped, all returned)", path, len(mm), total)
+		}
+		if lim := int(p["limit"].(float64)); lim != 1000 {
+			t.Fatalf("%s echoed limit=%d, want 1000 (clamped)", path, lim)
+		}
+	}
+	t.Logf("OK: accurate total(%d), newest-first, deep paging, bare-address display, limit clamp", total)
+}
+
+func itoa(i int) string { return strconv.Itoa(i) }
