@@ -479,7 +479,7 @@ func run() error {
 	fts := &projection.FTSWorker{Pool: s.Pool, Blob: bs, Batch: 100}
 	threads := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100, Log: log}
 	const projLeaderKey = int64(0x6f63746f6d61696c) // "octomail"
-	projCoord := ha.NewCoordinator(ha.New(s.Pool, projLeaderKey), cfg.projInterval)
+	projCoord := ha.NewCoordinator(ha.New(s.Pool, projLeaderKey, cfg.nodeID), cfg.projInterval)
 	projCoord.OnElected = func(context.Context) { log.Info("elected projection-drain leader", "node", cfg.nodeID) }
 	projCoord.OnLost = func() { log.Info("lost projection-drain leadership", "node", cfg.nodeID) }
 	projCoord.Tick = func(ctx context.Context) { drainProjections(ctx, log, s, fts, threads) }
@@ -493,7 +493,7 @@ func run() error {
 	if cfg.egressPool {
 		ipr := &deliverability.IPRouter{Pool: s.Pool}
 		const warmupLeaderKey = int64(0x6f6d5f77726d70) // "om_wrmp"
-		warmCoord := ha.NewCoordinator(ha.New(s.Pool, warmupLeaderKey), time.Hour)
+		warmCoord := ha.NewCoordinator(ha.New(s.Pool, warmupLeaderKey, cfg.nodeID), time.Hour)
 		warmCoord.OnElected = func(context.Context) { log.Info("elected warmup-maintenance leader", "node", cfg.nodeID) }
 		warmCoord.OnLost = func() { log.Info("lost warmup-maintenance leadership", "node", cfg.nodeID) }
 		warmCoord.Tick = func(ctx context.Context) {

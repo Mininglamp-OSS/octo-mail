@@ -33,8 +33,15 @@ func TestLeaderElection(t *testing.T) {
 
 	const key = int64(0x6f63746f6d61696c) // "octomail"
 
-	a := ha.New(poolA, key)
-	b := ha.New(poolB, key)
+	// leader_lease must exist for TryAcquire's lease claim; the raw pools here
+	// don't run the full schema. Clean any leftover row for this key.
+	ensureLeaseSchema(t, poolB)
+	if _, err := poolB.Exec(ctx, `DELETE FROM leader_lease WHERE key=$1`, key); err != nil {
+		t.Fatal(err)
+	}
+
+	a := ha.New(poolA, key, "node-A")
+	b := ha.New(poolB, key, "node-B")
 
 	// A campaigns and wins.
 	okA, err := a.TryAcquire(ctx)
@@ -104,7 +111,7 @@ func TestLeaderElection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer poolC.Close()
-	c := ha.New(poolC, key)
+	c := ha.New(poolC, key, "node-C")
 	okC, err := c.TryAcquire(ctx)
 	if err != nil {
 		t.Fatal(err)

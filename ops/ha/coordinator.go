@@ -57,11 +57,30 @@ func (c *Coordinator) Run(ctx context.Context) {
 
 	campaign := func() {
 		// wasLeader is written only here (the Run goroutine); load once, compute
-		// the new state, publish once. A leader whose held connection has dropped
-		// counts as no-longer-leader and must re-acquire, so OnLost fires across the
-		// gap (another node may have held leadership in between).
+		// the new state, publish once.
 		prev := c.wasLeader.Load()
-		now := prev && c.leader.IsLeader(ctx)
+		now := prev
+		if now {
+			switch {
+			case !c.leader.IsLeader(ctx):
+				// Lost the advisory lock (our backend crashed/was terminated). This is
+				// the fast same-primary failover path: fall through to re-acquire on
+				// THIS tick so a standby-or-self takes over without delay.
+				now = false
+			case !c.leader.Heartbeat(ctx):
+				// Fenced: the replicated lease was taken over (a promotion left us a
+				// stale/demoted primary) or our heartbeat write failed on a now
+				// read-only backend. Step DOWN this tick — fire OnLost and do NOT
+				// re-acquire on the same tick, or we'd silently re-stamp the lease and
+				// mask the fence. The next tick re-campaigns cleanly (and the
+				// pg_is_in_recovery gate keeps a demoted node from re-winning).
+				c.wasLeader.Store(false)
+				if c.OnLost != nil {
+					c.OnLost()
+				}
+				return
+			}
+		}
 		if !now {
 			if ok, err := c.leader.TryAcquire(ctx); err == nil && ok {
 				now = true
