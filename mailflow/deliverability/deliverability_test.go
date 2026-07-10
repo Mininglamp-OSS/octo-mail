@@ -22,7 +22,7 @@ func setup(t *testing.T) (*deliverability.Service, int64, int64) {
 		t.Skipf("postgres not available (%v)", err)
 	}
 	t.Cleanup(s.Close)
-	if _, err := s.Pool.Exec(ctx, `TRUNCATE reputation_events, reputation_score, tenants RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE reputation_events, reputation_score, reputation_daily, tenants RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	var a, b int64
@@ -98,6 +98,61 @@ func TestVERPAttribution(t *testing.T) {
 		t.Fatalf("VERP misattribution: A=%d B=%d, want A=1 B=0", aCount, bCount)
 	}
 	t.Logf("OK: complaint via VERP token attributed to sending tenant A (A=%d, B=%d)", aCount, bCount)
+}
+
+// TestAutoUnpauseRecovered proves the #22-2 / #33 decay path: a domain auto-paused
+// on a bad window is automatically unpaused once its recent windowed rates recover
+// — no manual DB edit. Recovery here is modeled by aging the bad events out of the
+// window (moving the bad day outside DefaultWindow) and adding fresh clean volume.
+func TestAutoUnpauseRecovered(t *testing.T) {
+	ctx := context.Background()
+	svc, tenantA, _ := setup(t)
+	const remote = "gmail.com"
+
+	// Healthy volume, then enough complaints to breach and pause (today's window).
+	for i := 0; i < 50; i++ {
+		if err := svc.RecordSent(ctx, tenantA, remote); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := svc.RecordEvent(ctx, tenantA, 0, deliverability.KindComplaint, remote, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustAllow(t, svc, tenantA, remote, false) // paused
+
+	// Auto-unpause with the bad events still in-window must NOT unpause it.
+	if n, err := svc.UnpauseRecovered(ctx); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Fatalf("unpaused %d while still breaching in-window; want 0", n)
+	}
+	mustAllow(t, svc, tenantA, remote, false)
+
+	// Age the breach out of the window: move all of this (tenant, domain)'s daily
+	// buckets to well before DefaultWindow. Now the recent window is empty →
+	// recovered (bad history has aged out). Also age paused_at past MinPauseDwell so
+	// the dwell floor doesn't hold it.
+	if _, err := svc.Pool.Exec(ctx,
+		`UPDATE reputation_daily SET day = (now() AT TIME ZONE 'utc')::date - 60
+		 WHERE tenant_id=$1 AND remote_domain=$2`, tenantA, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Pool.Exec(ctx,
+		`UPDATE reputation_score SET paused_at = now() - interval '48 hours'
+		 WHERE tenant_id=$1 AND remote_domain=$2`, tenantA, remote); err != nil {
+		t.Fatal(err)
+	}
+	n, err := svc.UnpauseRecovered(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("UnpauseRecovered unpaused %d, want 1 (window aged out the breach)", n)
+	}
+	mustAllow(t, svc, tenantA, remote, true) // recovered
+	t.Logf("OK: auto-paused domain auto-unpaused once the bad window aged out (decay path, #33)")
 }
 
 func mustAllow(t *testing.T, svc *deliverability.Service, tenantID int64, remote string, want bool) {

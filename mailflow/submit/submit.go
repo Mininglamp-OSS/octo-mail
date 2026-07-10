@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Mininglamp-OSS/octo-mail/mailflow/queue"
@@ -67,25 +68,37 @@ func (s *Submitter) SubmitDSN(ctx context.Context, tenantID, accountID int64, ma
 		return nil, fmt.Errorf("storing message body: %w", err)
 	}
 
+	// Enqueue every recipient row in ONE transaction: a multi-recipient submission
+	// is all-or-nothing, so a mid-loop failure can't leave some recipients queued
+	// (which a client retry would then re-enqueue → duplicate delivery to the
+	// earlier recipients). The blob Put above stays outside the tx — it is
+	// content-addressed, so an orphaned body on rollback is harmless and dedups.
 	ids := make([]int64, 0, len(rcptTo))
-	for _, r := range rcptTo {
-		id, err := queue.Enqueue(ctx, s.Pool, queue.Msg{
-			TenantID:  tenantID,
-			AccountID: accountID,
-			MailFrom:  mailFrom,
-			RcptTo:    r,
-			BlobRef:   string(ref),
-			Size:      size,
-			NotBefore: notBefore,
-			Ret:       dsnp.Ret,
-			EnvID:     dsnp.EnvID,
-			Notify:    dsnp.Notify[r],
-			ORcpt:     dsnp.ORcpt[r],
-		})
-		if err != nil {
-			return ids, fmt.Errorf("enqueue for %s: %w", r, err)
+	err = pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		ids = ids[:0]
+		for _, r := range rcptTo {
+			id, e := queue.EnqueueTx(ctx, tx, queue.Msg{
+				TenantID:  tenantID,
+				AccountID: accountID,
+				MailFrom:  mailFrom,
+				RcptTo:    r,
+				BlobRef:   string(ref),
+				Size:      size,
+				NotBefore: notBefore,
+				Ret:       dsnp.Ret,
+				EnvID:     dsnp.EnvID,
+				Notify:    dsnp.Notify[r],
+				ORcpt:     dsnp.ORcpt[r],
+			})
+			if e != nil {
+				return fmt.Errorf("enqueue for %s: %w", r, e)
+			}
+			ids = append(ids, id)
 		}
-		ids = append(ids, id)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return ids, nil
 }

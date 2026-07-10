@@ -57,6 +57,10 @@ type Msg struct {
 	Ret    string
 	EnvID  string
 	ORcpt  string
+	// CreatedAt is when the message was first enqueued. Used to bound the total
+	// retry lifetime (give up once the message is older than MaxLifetime),
+	// independent of the attempt count. Zero if not loaded.
+	CreatedAt time.Time
 }
 
 // ResultError is optionally implemented by a Deliverer's returned error to carry
@@ -82,12 +86,22 @@ type PermanentError interface {
 // tries, given a base interval. It mirrors mox: exponential doubling per attempt
 // (base, 2×base, 4×base, ...) with ±10% jitter so a fleet of workers retrying a
 // down destination don't synchronize into a thundering herd. attempts is the
-// number of tries already made (>=1 when rescheduling).
-func backoffFor(base time.Duration, attempts int) time.Duration {
+// number of tries already made (>=1 when rescheduling). The interval is capped at
+// maxCap (Postfix maximal_backoff_time) so late retries settle at a steady
+// cadence instead of ballooning to days — combined with the time-bounded lifetime
+// this yields many more attempts near the end of the window. maxCap<=0 = no cap.
+func backoffFor(base time.Duration, attempts int, maxCap time.Duration) time.Duration {
 	d := base
 	// attempts-1 doublings: first retry waits `base`, second `2×base`, etc.
 	for i := 1; i < attempts && d < 512*base; i++ {
 		d *= 2
+		if maxCap > 0 && d >= maxCap {
+			d = maxCap
+			break
+		}
+	}
+	if maxCap > 0 && d > maxCap {
+		d = maxCap
 	}
 	// ±10% jitter.
 	jitter := 1.0 + (rand.Float64()*0.2 - 0.1)
@@ -148,30 +162,44 @@ func appendLog(ctx context.Context, db execer, m Msg, kind string, payload any, 
 // not delivered until an operator resumes it.
 func Enqueue(ctx context.Context, pool *pgxpool.Pool, m Msg) (int64, error) {
 	var id int64
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		var e error
+		id, e = EnqueueTx(ctx, tx, m)
+		return e
+	})
+	return id, err
+}
+
+// EnqueueTx enqueues a message within the caller's transaction, so a batch of
+// recipients can be committed atomically (all rows or none). It performs the same
+// projection insert + hold-rule check + source-of-truth log append as Enqueue,
+// but enrolled in tx rather than opening its own. Returns the new queue id.
+func EnqueueTx(ctx context.Context, tx pgx.Tx, m Msg) (int64, error) {
 	// next_attempt defaults to now(); a non-zero NotBefore defers the first
 	// attempt (FUTURERELEASE) via COALESCE.
 	var notBefore any
 	if !m.NotBefore.IsZero() {
 		notBefore = m.NotBefore
 	}
-	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
-		hold, herr := matchesHoldRule(ctx, tx, m)
-		if herr != nil {
-			return herr
-		}
-		if err := tx.QueryRow(ctx,
-			`INSERT INTO queue (tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, next_attempt, hold, require_tls, dsn_notify, dsn_ret, dsn_envid, dsn_orcpt)
-			 VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,now()),$8,$9,$10,$11,$12,$13) RETURNING id`,
-			m.TenantID, m.AccountID, m.MailFrom, m.RcptTo, m.BlobRef, m.Size, notBefore, hold, m.RequireTLS,
-			m.Notify, m.Ret, m.EnvID, m.ORcpt).Scan(&id); err != nil {
-			return err
-		}
-		// Append the enqueued fact to the source-of-truth log (same tx as the
-		// projection insert). m.ID is now known.
-		m.ID = id
-		return appendLog(ctx, tx, m, kindEnqueued, map[string]any{"hold": hold, "size": m.Size}, nil)
-	})
-	return id, err
+	hold, herr := matchesHoldRule(ctx, tx, m)
+	if herr != nil {
+		return 0, herr
+	}
+	var id int64
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO queue (tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, next_attempt, hold, require_tls, dsn_notify, dsn_ret, dsn_envid, dsn_orcpt)
+		 VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,now()),$8,$9,$10,$11,$12,$13) RETURNING id`,
+		m.TenantID, m.AccountID, m.MailFrom, m.RcptTo, m.BlobRef, m.Size, notBefore, hold, m.RequireTLS,
+		m.Notify, m.Ret, m.EnvID, m.ORcpt).Scan(&id); err != nil {
+		return 0, err
+	}
+	// Append the enqueued fact to the source-of-truth log (same tx as the
+	// projection insert). m.ID is now known.
+	m.ID = id
+	if err := appendLog(ctx, tx, m, kindEnqueued, map[string]any{"hold": hold, "size": m.Size}, nil); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // Worker claims and delivers due messages on one node.
@@ -182,6 +210,14 @@ type Worker struct {
 	Lease   time.Duration // how long a claim is held (default 30s)
 	Batch   int           // max messages per claim (default 10)
 	Backoff time.Duration // base retry delay; doubles per attempt (default 5s)
+	// MaxBackoff caps a single retry interval (Postfix maximal_backoff_time). Zero
+	// uses defaultMaxBackoff. Prevents late retries from ballooning to days.
+	MaxBackoff time.Duration
+	// MaxLifetime bounds the total time a message may stay queued before it is
+	// given up as failed, independent of the attempt count (Postfix
+	// maximal_queue_lifetime). Zero uses defaultMaxLifetime. This is the primary
+	// give-up criterion; MaxAttempts remains a secondary safety cap.
+	MaxLifetime time.Duration
 
 	// RetiredKeep is how long a retired message (and its results) is kept before
 	// the cleanup sweep removes it. Zero uses the schema default (7 days).
@@ -191,11 +227,15 @@ type Worker struct {
 	// warning DSN is sent (once). Zero disables delayed DSNs.
 	DelayThreshold int
 
-	// OnFailed, if set, is called once when a message is permanently failed
-	// (max attempts reached) and successfully retired by THIS worker. Used to
-	// generate a DSN (bounce) back to the sender. Best-effort: an error is
-	// returned up from RunOnce but the message is already retired.
-	OnFailed func(ctx context.Context, m Msg) error
+	// OnFailed, if set, is called once when a message is permanently failed and
+	// successfully retired by THIS worker — either because delivery returned a
+	// permanent (5xx) error or because the retry lifetime/attempt budget was
+	// exhausted. cause is the terminal delivery error (may satisfy PermanentError /
+	// ResultError so the callback can distinguish a genuine hard bounce from
+	// transient-exhaustion, and act differently — e.g. suppress only on a real
+	// 5xx). Used to generate a DSN (bounce) back to the sender. Best-effort: an
+	// error is returned up from RunOnce but the message is already retired.
+	OnFailed func(ctx context.Context, m Msg, cause error) error
 
 	// OnDelayed, if set, is called once per message when its attempt count first
 	// reaches DelayThreshold (and it is still being retried). Used to send a
@@ -242,10 +282,10 @@ func (w *Worker) deliveryTimeout() time.Duration {
 // new attempt number so the caller uses the authoritative persisted value.
 func (w *Worker) renewLease(ctx context.Context, m Msg) (held bool, attempts int, err error) {
 	err = w.Pool.QueryRow(ctx,
-		`UPDATE queue SET lease_until=now()+$3::interval, attempts=attempts+1, last_attempt=now()
+		`UPDATE queue SET lease_until=now()+make_interval(secs => $3), attempts=attempts+1, last_attempt=now()
 		 WHERE id=$1 AND leased_by=$2 AND lease_until > now()
 		 RETURNING attempts`,
-		m.ID, w.NodeID, w.lease().String()).Scan(&attempts)
+		m.ID, w.NodeID, w.lease().Seconds()).Scan(&attempts)
 	if err == pgx.ErrNoRows {
 		return false, 0, nil // lease lost; another node owns this message now
 	}
@@ -265,6 +305,27 @@ func (w *Worker) backoff() time.Duration {
 		return 5 * time.Second
 	}
 	return w.Backoff
+}
+
+// defaultMaxBackoff caps a single retry interval when MaxBackoff is unset.
+const defaultMaxBackoff = 4 * time.Hour
+
+// defaultMaxLifetime bounds total queue time when MaxLifetime is unset (RFC 5321
+// §4.5.4.1 recommends giving up after 4–5 days; Postfix defaults to 5).
+const defaultMaxLifetime = 5 * 24 * time.Hour
+
+func (w *Worker) maxBackoff() time.Duration {
+	if w.MaxBackoff <= 0 {
+		return defaultMaxBackoff
+	}
+	return w.MaxBackoff
+}
+
+func (w *Worker) maxLifetime() time.Duration {
+	if w.MaxLifetime <= 0 {
+		return defaultMaxLifetime
+	}
+	return w.MaxLifetime
 }
 
 // RunOnce claims up to Batch due messages, delivers each, and retires or
@@ -365,7 +426,7 @@ func (w *Worker) recordResult(ctx context.Context, m Msg, start time.Time, dur t
 // unleased or its lease has expired (the owning node is presumed dead).
 func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 	rows, err := w.Pool.Query(ctx,
-		`UPDATE queue SET leased_by=$1, lease_until=now()+$2::interval, last_attempt=now()
+		`UPDATE queue SET leased_by=$1, lease_until=now()+make_interval(secs => $2), last_attempt=now()
 		 WHERE id IN (
 		     SELECT id FROM queue
 		     WHERE next_attempt <= now()
@@ -376,8 +437,8 @@ func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 		     LIMIT $3
 		 )
 		 RETURNING id, tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, attempts, max_attempts, require_tls,
-		           COALESCE(dsn_notify,''), COALESCE(dsn_ret,''), COALESCE(dsn_envid,''), COALESCE(dsn_orcpt,'')`,
-		w.NodeID, w.lease().String(), w.batch())
+		           COALESCE(dsn_notify,''), COALESCE(dsn_ret,''), COALESCE(dsn_envid,''), COALESCE(dsn_orcpt,''), created_at`,
+		w.NodeID, w.lease().Seconds(), w.batch())
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +447,7 @@ func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 	for rows.Next() {
 		var m Msg
 		if err := rows.Scan(&m.ID, &m.TenantID, &m.AccountID, &m.MailFrom, &m.RcptTo, &m.BlobRef, &m.Size, &m.Attempts, &m.MaxAttempts, &m.RequireTLS,
-			&m.Notify, &m.Ret, &m.EnvID, &m.ORcpt); err != nil {
+			&m.Notify, &m.Ret, &m.EnvID, &m.ORcpt, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -443,18 +504,25 @@ func (w *Worker) retiredKeep() time.Duration {
 // sets delayed_dsn (deduping the warning), plus the rescheduled/delayed log
 // appends — the log and its fold move together.
 func (w *Worker) reschedule(ctx context.Context, m Msg, lastErr error) error {
-	// Permanent (5xx) failure, or the retry budget is exhausted: fail now — retire
-	// as failed and fire OnFailed (bounce DSN + suppression). A permanent error
-	// short-circuits the remaining retry schedule (mox failMsgsTx permanent path).
+	// Give up now — retire as failed and fire OnFailed — when any of:
+	//   - the error is permanent (5xx): no point retrying (mox failMsgsTx path);
+	//   - the message has been queued longer than MaxLifetime (the primary,
+	//     time-bounded give-up criterion, RFC 5321 §4.5.4.1 / Postfix
+	//     maximal_queue_lifetime);
+	//   - the attempt budget is exhausted (secondary safety cap).
+	// The terminal cause is passed to OnFailed so it can distinguish a genuine hard
+	// bounce (permanent) from transient exhaustion (age/attempts) and act
+	// accordingly (e.g. suppress the recipient only on a real 5xx).
 	var perm PermanentError
 	permanent := errors.As(lastErr, &perm) && perm.Permanent()
-	if permanent || m.Attempts >= m.MaxAttempts {
+	aged := !m.CreatedAt.IsZero() && time.Since(m.CreatedAt) >= w.maxLifetime()
+	if permanent || aged || m.Attempts >= m.MaxAttempts {
 		acted, rerr := w.retire(ctx, m, false)
 		if rerr != nil {
 			return rerr
 		}
 		if acted && w.OnFailed != nil {
-			return w.OnFailed(ctx, m)
+			return w.OnFailed(ctx, m, lastErr)
 		}
 		return nil
 	}
@@ -462,7 +530,7 @@ func (w *Worker) reschedule(ctx context.Context, m Msg, lastErr error) error {
 	if lastErr != nil {
 		errStr = lastErr.Error()
 	}
-	backoff := backoffFor(w.backoff(), m.Attempts)
+	backoff := backoffFor(w.backoff(), m.Attempts, w.maxBackoff())
 	wantDelay := w.OnDelayed != nil && w.DelayThreshold > 0 && m.Attempts >= w.DelayThreshold
 
 	// Single transaction: release the lease + back off + record the error, and
@@ -477,11 +545,11 @@ func (w *Worker) reschedule(ctx context.Context, m Msg, lastErr error) error {
 			     SELECT id, delayed_dsn AS old FROM queue
 			     WHERE id=$1 AND leased_by=$2 FOR UPDATE
 			 )
-			 UPDATE queue q SET leased_by=NULL, lease_until=NULL, next_attempt=now()+$3::interval,
+			 UPDATE queue q SET leased_by=NULL, lease_until=NULL, next_attempt=now()+make_interval(secs => $3),
 			     last_error=$4, delayed_dsn=q.delayed_dsn OR $5
 			 FROM prev WHERE q.id=prev.id
 			 RETURNING prev.old`,
-			m.ID, w.NodeID, backoff.String(), errStr, wantDelay).Scan(&wasDelayed)
+			m.ID, w.NodeID, backoff.Seconds(), errStr, wantDelay).Scan(&wasDelayed)
 		if err == pgx.ErrNoRows {
 			return nil // reclaimed/retired by another node; not ours anymore
 		}

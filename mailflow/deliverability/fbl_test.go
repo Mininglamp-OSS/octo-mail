@@ -54,14 +54,15 @@ func TestFBLAttributionAndIsolation(t *testing.T) {
 	}
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS reputation_events (id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY, tenant_id bigint NOT NULL, account_id bigint, kind smallint NOT NULL, remote_domain text NOT NULL, ip_id bigint, at timestamptz NOT NULL DEFAULT now())`,
-		`CREATE TABLE IF NOT EXISTS reputation_score (tenant_id bigint NOT NULL, remote_domain text NOT NULL, sent bigint NOT NULL DEFAULT 0, complaints bigint NOT NULL DEFAULT 0, bounces bigint NOT NULL DEFAULT 0, paused boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, remote_domain))`,
+		`CREATE TABLE IF NOT EXISTS reputation_score (tenant_id bigint NOT NULL, remote_domain text NOT NULL, sent bigint NOT NULL DEFAULT 0, complaints bigint NOT NULL DEFAULT 0, bounces bigint NOT NULL DEFAULT 0, paused boolean NOT NULL DEFAULT false, paused_at timestamptz, updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, remote_domain))`,
+		`CREATE TABLE IF NOT EXISTS reputation_daily (tenant_id bigint NOT NULL, remote_domain text NOT NULL, day date NOT NULL, sent bigint NOT NULL DEFAULT 0, bounces bigint NOT NULL DEFAULT 0, complaints bigint NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, remote_domain, day))`,
 		`CREATE TABLE IF NOT EXISTS queue_log (id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY, queue_id bigint NOT NULL, tenant_id bigint NOT NULL, account_id bigint NOT NULL DEFAULT 0, rcpt_to text NOT NULL DEFAULT '', kind text NOT NULL DEFAULT '', payload jsonb NOT NULL DEFAULT '{}', keep_until timestamptz, created_at timestamptz NOT NULL DEFAULT now())`,
 	} {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `TRUNCATE reputation_events, reputation_score, queue_log RESTART IDENTITY`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE reputation_events, reputation_score, reputation_daily, queue_log RESTART IDENTITY`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -81,9 +82,16 @@ func TestFBLAttributionAndIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Both tenants have sent plenty to gmail.com (past the min sample).
+	// Both tenants have sent plenty to gmail.com (past the min sample). The pause
+	// decision is windowed, so seed today's rollup bucket (what RecordSent writes),
+	// not just the lifetime counter.
 	for _, tid := range []int64{tenantA, tenantB} {
 		if _, err := pool.Exec(ctx, `INSERT INTO reputation_score (tenant_id, remote_domain, sent) VALUES ($1,$2,1000)`, tid, domain); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reputation_daily (tenant_id, remote_domain, day, sent) VALUES ($1,$2,(now() AT TIME ZONE 'utc')::date,1000)`,
+			tid, domain); err != nil {
 			t.Fatal(err)
 		}
 	}

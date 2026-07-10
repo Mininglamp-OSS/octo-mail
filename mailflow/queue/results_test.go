@@ -51,7 +51,7 @@ func TestPermanentFailureFastPath(t *testing.T) {
 			calls++
 			return &permErr{code: 550, perm: true}
 		},
-		OnFailed: func(ctx context.Context, m queue.Msg) error { bounced++; return nil },
+		OnFailed: func(ctx context.Context, m queue.Msg, cause error) error { bounced++; return nil },
 	}
 	if _, err := w.RunOnce(ctx); err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestPermanentFailureFastPath(t *testing.T) {
 	wt := &queue.Worker{
 		Pool: p, NodeID: "n2", Lease: 30 * time.Second, Batch: 1, Backoff: time.Second,
 		Deliver: func(ctx context.Context, m queue.Msg) error { return &permErr{code: 451, perm: false} },
-		OnFailed: func(ctx context.Context, m queue.Msg) error {
+		OnFailed: func(ctx context.Context, m queue.Msg, cause error) error {
 			t.Fatalf("transient error must not fire OnFailed on attempt 1")
 			return nil
 		},

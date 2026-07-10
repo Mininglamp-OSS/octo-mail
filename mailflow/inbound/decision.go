@@ -390,7 +390,7 @@ func (d *Decider) matchRuleset(ctx context.Context, accountID int64, raw []byte)
 // parseHeaders extracts folded header name→value pairs from a raw message (only
 // the header block; first value wins per name). Lowercased names as keys.
 func parseHeaders(raw []byte) map[string]string {
-	s := string(raw)
+	s := string(NormalizeEOL(raw))
 	end := strings.Index(s, "\r\n\r\n")
 	if end < 0 {
 		end = len(s)

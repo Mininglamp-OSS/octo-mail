@@ -9,6 +9,7 @@
 package inbound
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -218,4 +219,34 @@ func (b byteReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+// NormalizeEOL rewrites line endings to canonical CRLF: a bare LF (not preceded
+// by CR) becomes CRLF, and a bare CR (not followed by LF) becomes CRLF. Inbound
+// message scanners (header/body split, per-line header parsing) assume CRLF; a
+// message that arrives with bare-LF endings would otherwise collapse into one
+// unparseable blob and silently defeat ruleset/forward/subjectpass/auto-reply
+// detection. Normalizing first makes those scanners robust regardless of the
+// sender's line-ending discipline. Returns the input unchanged when already CRLF.
+func NormalizeEOL(b []byte) []byte {
+	if !bytes.ContainsAny(b, "\r\n") {
+		return b
+	}
+	out := make([]byte, 0, len(b)+16)
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch c {
+		case '\r':
+			// Emit CRLF; consume a following LF so CRLF stays a single break.
+			out = append(out, '\r', '\n')
+			if i+1 < len(b) && b[i+1] == '\n' {
+				i++
+			}
+		case '\n':
+			out = append(out, '\r', '\n')
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
 }

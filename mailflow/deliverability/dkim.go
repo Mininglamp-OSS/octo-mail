@@ -174,9 +174,22 @@ func (d *DKIMSigner) Sign(ctx context.Context, tenantID int64, fromDomain string
 			Hash:          "sha256",
 			HeaderRelaxed: true,
 			BodyRelaxed:   true,
-			Headers:       []string{"From", "To", "Subject", "Date", "Message-Id"},
-			PrivateKey:    signer,
-			Domain:        dns.Domain{ASCII: kr.selector},
+			// RFC 6376 §5.4 / §5.4.1 recommended set plus the MIME headers, so a
+			// message's rendering (Content-Type/CTE), reply routing (Reply-To),
+			// visible recipients (Cc), and author (Sender) are all covered — not just
+			// From/To/Subject/Date/Message-Id.
+			Headers: []string{
+				"From", "To", "Cc", "Subject", "Date", "Message-Id",
+				"Reply-To", "Sender", "MIME-Version", "Content-Type",
+				"Content-Transfer-Encoding",
+			},
+			// Oversign: list each header once more than it appears so an intermediary
+			// cannot ADD a second From:/Subject:/etc. that still verifies (a header
+			// added beyond the signed count breaks the signature). Defends against
+			// the "double From" spoof that a non-oversigned signature permits.
+			SealHeaders: true,
+			PrivateKey:  signer,
+			Domain:      dns.Domain{ASCII: kr.selector},
 		})
 	}
 

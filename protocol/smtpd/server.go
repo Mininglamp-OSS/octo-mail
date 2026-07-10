@@ -70,6 +70,12 @@ type Server struct {
 	// junk filter / account rules to act on.
 	RejectDMARCFail bool
 
+	// MaxHops bounds the number of Received: header fields an inbound (MX) message
+	// may already carry; beyond it the message is rejected as a mail loop (RFC 5321
+	// §6.3). 0 uses defaultMaxHops. Only the upstream Received headers in the body
+	// are counted — this server's own Received is stored separately (MsgPrefix).
+	MaxHops int
+
 	// Junk, when set, classifies each accepted message per recipient account; a
 	// message classified as spam is delivered to the account's "Junk" mailbox
 	// instead of "Inbox". Injected as an interface to avoid an import cycle.
@@ -133,6 +139,12 @@ type JunkClassifier interface {
 // defaultMaxRcpt is the RCPT-per-message cap used when Server.MaxRcpt is unset.
 const defaultMaxRcpt = 1000
 
+// defaultMaxHops bounds the Received: header count on an inbound message before
+// it is rejected as a loop. RFC 5321 §6.3 requires accepting at least 100; a
+// tighter operational default (Postfix uses 50) catches loops far sooner while
+// leaving ample headroom for legitimate multi-hop paths.
+const defaultMaxHops = 50
+
 // maxFutureRelease bounds the FUTURERELEASE (RFC 4865) hold interval: a client
 // may defer delivery up to this far in the future.
 const maxFutureRelease = 90 * 24 * time.Hour
@@ -143,6 +155,45 @@ func (s *Server) maxRcpt() int {
 		return s.MaxRcpt
 	}
 	return defaultMaxRcpt
+}
+
+// countReceivedHeaders counts the "Received:" header fields in a message's header
+// block. It stops at the header/body boundary (a blank line) and counts only
+// lines that BEGIN a header (not folded continuation lines), so a "Received:" in
+// the body or a folded value can't inflate the count. Tolerant of bare-LF and
+// CRLF line endings so a non-CRLF loop still trips the guard.
+func countReceivedHeaders(data []byte) int {
+	n := 0
+	i := 0
+	for i < len(data) {
+		// End of one line (handles \n and \r\n).
+		j := bytes.IndexByte(data[i:], '\n')
+		var line []byte
+		if j < 0 {
+			line = data[i:]
+			i = len(data)
+		} else {
+			line = data[i : i+j]
+			i += j + 1
+		}
+		line = bytes.TrimRight(line, "\r")
+		// Blank line = end of the header block.
+		if len(line) == 0 {
+			break
+		}
+		// Folded continuation (leading space/tab) belongs to the previous header.
+		if line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		// A header field starting with "Received:" (case-insensitive).
+		if len(line) >= 9 {
+			name := line[:9]
+			if (name[0] == 'R' || name[0] == 'r') && bytes.EqualFold(name, []byte("Received:")) {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // Serve handles one connection until QUIT/close.
@@ -967,6 +1018,21 @@ func (c *conn) processData(data []byte) error {
 
 	// MX receive: authenticate the message (SPF/DKIM/DMARC/iprev/DNSBL), then
 	// deliver to each resolved recipient's change-log with the auth header prefix.
+	//
+	// Loop guard first (RFC 5321 §6.3): if the message already carries more than
+	// MaxHops Received: headers, it is circulating — reject before doing any auth
+	// or delivery work. Only the upstream headers in data are counted; this
+	// server's own Received is added later as MsgPrefix, outside data.
+	maxHops := c.srv.MaxHops
+	if maxHops <= 0 {
+		maxHops = defaultMaxHops
+	}
+	if countReceivedHeaders(data) > maxHops {
+		c.reset()
+		obs.InboundRejected.WithLabelValues("loop").Inc()
+		return c.writef("554 5.4.6 too many hops (mail loop): more than %d Received headers", maxHops)
+	}
+
 	var authRes inbound.Result
 	var sess inbound.Session
 	authenticated := false

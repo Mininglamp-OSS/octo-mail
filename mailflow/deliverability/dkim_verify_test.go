@@ -69,6 +69,13 @@ func TestPerTenantDKIMSignAndVerify(t *testing.T) {
 	if !strings.HasPrefix(strings.ToLower(header), "dkim-signature:") {
 		t.Fatalf("no DKIM-Signature produced: %q", header)
 	}
+	// #22-3: the signature must OVERSIGN — list From (and the other covered headers)
+	// more than once in h= so an intermediary can't add a second From:/Subject:
+	// that still verifies. mox emits each sealed header once per occurrence plus one
+	// extra, so a single-From message shows "from" twice in the h= tag.
+	if lh := strings.ToLower(header); strings.Count(lh, "from:") < 2 {
+		t.Fatalf("DKIM h= does not oversign From (want it listed ≥2×): %q", header)
+	}
 
 	// Prepend the signature and verify with the real dkim.Verify against the
 	// published TXT record.

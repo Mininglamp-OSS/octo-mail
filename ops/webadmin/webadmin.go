@@ -47,26 +47,27 @@ type Server struct {
 // Handler returns the HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/tenants", s.requireAdmin(s.handleCreateTenant))              // POST {name}
-	mux.HandleFunc("/admin/accounts", s.requireAdmin(s.handleCreateAccount))            // POST {tenant_id,name}
-	mux.HandleFunc("/admin/addresses", s.requireAdmin(s.handleCreateAddress))           // POST {tenant_id,domain,localpart,account}
-	mux.HandleFunc("/admin/domains", s.requireAdmin(s.handleCreateDomain))              // POST {tenant_id,domain}
-	mux.HandleFunc("/admin/password", s.requireAdmin(s.handleSetPassword))              // POST {login,password}
-	mux.HandleFunc("/admin/quota", s.requireAdmin(s.handleQuota))                       // GET ?account_id=
-	mux.HandleFunc("/admin/reputation", s.requireAdmin(s.handleReputation))             // GET ?tenant_id=&domain=
-	mux.HandleFunc("/admin/queue", s.requireAdmin(s.handleQueueList))                   // GET ?tenant_id=&account_id=
-	mux.HandleFunc("/admin/queue/kick", s.requireAdmin(s.handleQueueKick))              // POST {ids|tenant_id|account_id}
-	mux.HandleFunc("/admin/queue/schedule", s.requireAdmin(s.handleQueueSchedule))      // POST {delay, ids|tenant_id|account_id}
-	mux.HandleFunc("/admin/queue/schedule-at", s.requireAdmin(s.handleQueueScheduleAt)) // POST {at, filter}
-	mux.HandleFunc("/admin/queue/requiretls", s.requireAdmin(s.handleQueueRequireTLS))  // POST {mode, filter}
-	mux.HandleFunc("/admin/queue/hold", s.requireAdmin(s.handleQueueHold))              // POST {hold, ids|tenant_id|account_id}
-	mux.HandleFunc("/admin/queue/drop", s.requireAdmin(s.handleQueueDrop))              // POST {ids|tenant_id|account_id}
-	mux.HandleFunc("/admin/queue/fail", s.requireAdmin(s.handleQueueFail))              // POST {ids|tenant_id|account_id}
-	mux.HandleFunc("/admin/queue/retired", s.requireAdmin(s.handleQueueRetired))        // GET ?tenant_id=&account_id=
-	mux.HandleFunc("/admin/queue/results", s.requireAdmin(s.handleQueueResults))        // GET ?id=
-	mux.HandleFunc("/admin/queue/holdrules", s.requireAdmin(s.handleHoldRules))         // GET ?tenant_id= | POST {tenant_id,...} | DELETE ?id=
-	mux.HandleFunc("/healthz", s.handleHealth)                                          // GET (no auth)
-	mux.Handle("/metrics", s.requireAdmin(obs.Handler().ServeHTTP))                     // Prometheus metrics (admin-gated)
+	mux.HandleFunc("/admin/tenants", s.requireAdmin(s.handleCreateTenant))                 // POST {name}
+	mux.HandleFunc("/admin/accounts", s.requireAdmin(s.handleCreateAccount))               // POST {tenant_id,name}
+	mux.HandleFunc("/admin/addresses", s.requireAdmin(s.handleCreateAddress))              // POST {tenant_id,domain,localpart,account}
+	mux.HandleFunc("/admin/domains", s.requireAdmin(s.handleCreateDomain))                 // POST {tenant_id,domain}
+	mux.HandleFunc("/admin/password", s.requireAdmin(s.handleSetPassword))                 // POST {login,password}
+	mux.HandleFunc("/admin/quota", s.requireAdmin(s.handleQuota))                          // GET ?account_id=
+	mux.HandleFunc("/admin/reputation", s.requireAdmin(s.handleReputation))                // GET ?tenant_id=&domain=
+	mux.HandleFunc("/admin/reputation/unpause", s.requireAdmin(s.handleReputationUnpause)) // POST {tenant_id,domain}
+	mux.HandleFunc("/admin/queue", s.requireAdmin(s.handleQueueList))                      // GET ?tenant_id=&account_id=
+	mux.HandleFunc("/admin/queue/kick", s.requireAdmin(s.handleQueueKick))                 // POST {ids|tenant_id|account_id}
+	mux.HandleFunc("/admin/queue/schedule", s.requireAdmin(s.handleQueueSchedule))         // POST {delay, ids|tenant_id|account_id}
+	mux.HandleFunc("/admin/queue/schedule-at", s.requireAdmin(s.handleQueueScheduleAt))    // POST {at, filter}
+	mux.HandleFunc("/admin/queue/requiretls", s.requireAdmin(s.handleQueueRequireTLS))     // POST {mode, filter}
+	mux.HandleFunc("/admin/queue/hold", s.requireAdmin(s.handleQueueHold))                 // POST {hold, ids|tenant_id|account_id}
+	mux.HandleFunc("/admin/queue/drop", s.requireAdmin(s.handleQueueDrop))                 // POST {ids|tenant_id|account_id}
+	mux.HandleFunc("/admin/queue/fail", s.requireAdmin(s.handleQueueFail))                 // POST {ids|tenant_id|account_id}
+	mux.HandleFunc("/admin/queue/retired", s.requireAdmin(s.handleQueueRetired))           // GET ?tenant_id=&account_id=
+	mux.HandleFunc("/admin/queue/results", s.requireAdmin(s.handleQueueResults))           // GET ?id=
+	mux.HandleFunc("/admin/queue/holdrules", s.requireAdmin(s.handleHoldRules))            // GET ?tenant_id= | POST {tenant_id,...} | DELETE ?id=
+	mux.HandleFunc("/healthz", s.handleHealth)                                             // GET (no auth)
+	mux.Handle("/metrics", s.requireAdmin(obs.Handler().ServeHTTP))                        // Prometheus metrics (admin-gated)
 	return mux
 }
 
@@ -252,6 +253,32 @@ func (s *Server) handleReputation(w http.ResponseWriter, r *http.Request) {
 		"tenant_id": tid, "domain": domain, "known": true,
 		"sent": sent, "complaints": complaints, "bounces": bounces, "paused": paused,
 	})
+}
+
+// handleReputationUnpause is the operator override for the windowed auto-unpause
+// job: it immediately clears the paused flag for one (tenant, domain), for when a
+// domain must be re-enabled now rather than waiting for the periodic sweep.
+func (s *Server) handleReputationUnpause(w http.ResponseWriter, r *http.Request) {
+	if s.Reputation == nil {
+		s.writeErr(w, r, errStatus(http.StatusServiceUnavailable, "reputation service not configured"))
+		return
+	}
+	var req struct {
+		TenantID int64  `json:"tenant_id"`
+		Domain   string `json:"domain"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.TenantID == 0 || req.Domain == "" {
+		s.writeErr(w, r, errStatus(http.StatusBadRequest, "tenant_id and domain are required"))
+		return
+	}
+	if err := s.Reputation.Unpause(r.Context(), req.TenantID, req.Domain); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tenant_id": req.TenantID, "domain": req.Domain, "paused": false})
 }
 
 // --- helpers ---

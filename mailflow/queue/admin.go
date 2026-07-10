@@ -156,9 +156,12 @@ func Kick(ctx context.Context, pool *pgxpool.Pool, f Filter) (int64, error) {
 // d moves delivery earlier. Returns the number affected.
 func Schedule(ctx context.Context, pool *pgxpool.Pool, f Filter, d time.Duration) (int64, error) {
 	cond, args := f.where(2)
-	args = append([]any{d.String()}, args...)
+	// Pass seconds through make_interval rather than d.String(): Go's duration
+	// format ("7m30s", "980µs") is not valid Postgres interval syntax and "m"
+	// would be read as months.
+	args = append([]any{d.Seconds()}, args...)
 	return mutateLog(ctx, pool, kindScheduled, map[string]any{"op": "schedule", "delta": d.String()}, nil,
-		`UPDATE queue SET next_attempt=next_attempt+$1::interval WHERE leased_by IS NULL AND (`+cond+`)`+returningIdent, args...)
+		`UPDATE queue SET next_attempt=next_attempt+make_interval(secs => $1) WHERE leased_by IS NULL AND (`+cond+`)`+returningIdent, args...)
 }
 
 // ScheduleAt sets next_attempt to an absolute time for matching (unleased)

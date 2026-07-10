@@ -136,14 +136,17 @@ type config struct {
 	jmapAddr       string
 	jmapBaseURL    string
 
-	queueInterval time.Duration
-	projInterval  time.Duration
-	queueBackoff  time.Duration // base retry delay; doubles per attempt
-	queueDelayDSN int           // attempts before a "still trying" warning DSN (0=off)
-	queueRetKeep  time.Duration // how long to keep retired queue messages before cleanup
+	queueInterval    time.Duration
+	projInterval     time.Duration
+	queueBackoff     time.Duration // base retry delay; doubles per attempt (capped at queueMaxBackoff)
+	queueMaxBackoff  time.Duration // cap on a single retry interval (Postfix maximal_backoff_time)
+	queueMaxLifetime time.Duration // give up on a message older than this (Postfix maximal_queue_lifetime)
+	queueDelayDSN    int           // attempts before a "still trying" warning DSN (0=off)
+	queueRetKeep     time.Duration // how long to keep retired queue messages before cleanup
 
 	dnsblZones  []dns.Domain
 	rejectDMARC bool
+	maxHops     int // inbound Received-header loop limit (0 = smtpd default)
 	greylist    bool
 
 	junkDir       string
@@ -157,6 +160,9 @@ type config struct {
 	subjectPassPeriod time.Duration
 
 	webhookURL string
+	// webhookSecret, when set, HMAC-SHA256-signs outbound webhook payloads
+	// (X-Octo-Mail-Signature) so receivers can verify authenticity. Empty = unsigned.
+	webhookSecret []byte
 
 	adminAddr  string
 	adminToken string
@@ -203,14 +209,17 @@ func loadConfig() config {
 		jmapAddr:       envDefault("OCTO_MAIL_JMAP_ADDR", ":8080"),
 		jmapBaseURL:    envDefault("OCTO_MAIL_JMAP_BASEURL", "http://localhost:8080"),
 
-		queueInterval: envDuration("OCTO_MAIL_QUEUE_INTERVAL", 5*time.Second),
-		projInterval:  envDuration("OCTO_MAIL_PROJECTION_INTERVAL", 10*time.Second),
-		queueBackoff:  envDuration("OCTO_MAIL_QUEUE_BACKOFF", 7*time.Minute+30*time.Second),
-		queueDelayDSN: int(envInt64("OCTO_MAIL_QUEUE_DELAY_DSN", 5)),
-		queueRetKeep:  envDuration("OCTO_MAIL_QUEUE_RETIRED_KEEP", 7*24*time.Hour),
+		queueInterval:    envDuration("OCTO_MAIL_QUEUE_INTERVAL", 5*time.Second),
+		projInterval:     envDuration("OCTO_MAIL_PROJECTION_INTERVAL", 10*time.Second),
+		queueBackoff:     envDuration("OCTO_MAIL_QUEUE_BACKOFF", 7*time.Minute+30*time.Second),
+		queueMaxBackoff:  envDuration("OCTO_MAIL_QUEUE_MAX_BACKOFF", 4*time.Hour),
+		queueMaxLifetime: envDuration("OCTO_MAIL_QUEUE_MAX_LIFETIME", 5*24*time.Hour),
+		queueDelayDSN:    int(envInt64("OCTO_MAIL_QUEUE_DELAY_DSN", 5)),
+		queueRetKeep:     envDuration("OCTO_MAIL_QUEUE_RETIRED_KEEP", 7*24*time.Hour),
 
 		dnsblZones:  parseDomainList(os.Getenv("OCTO_MAIL_DNSBL_ZONES")),
 		rejectDMARC: os.Getenv("OCTO_MAIL_REJECT_DMARC") == "1",
+		maxHops:     int(envInt64("OCTO_MAIL_MAX_HOPS", 50)),
 		greylist:    os.Getenv("OCTO_MAIL_GREYLIST") == "1",
 
 		junkDir:       envDefault("OCTO_MAIL_JUNK_DIR", "./junk"),
@@ -222,7 +231,8 @@ func loadConfig() config {
 		subjectPassKey:    []byte(os.Getenv("OCTO_MAIL_SUBJECTPASS_KEY")),
 		subjectPassPeriod: envDuration("OCTO_MAIL_SUBJECTPASS_PERIOD", 0),
 
-		webhookURL: os.Getenv("OCTO_MAIL_WEBHOOK_URL"),
+		webhookURL:    os.Getenv("OCTO_MAIL_WEBHOOK_URL"),
+		webhookSecret: []byte(os.Getenv("OCTO_MAIL_WEBHOOK_SECRET")),
 
 		adminAddr:  envDefault("OCTO_MAIL_ADMIN_ADDR", ":8081"),
 		adminToken: os.Getenv("OCTO_MAIL_ADMIN_TOKEN"),
