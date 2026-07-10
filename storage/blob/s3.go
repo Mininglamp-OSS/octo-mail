@@ -131,7 +131,7 @@ func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 	key := s.key(tenantID, ref)
 
 	// Idempotent: skip if the object already exists.
-	if ok, _ := s.head(ctx, key); ok {
+	if ok, _, _ := s.head(ctx, key); ok {
 		return ref, size, nil
 	}
 
@@ -171,23 +171,29 @@ func (s *s3Store) Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, in
 	return ref, size, nil
 }
 
-func (s *s3Store) head(ctx context.Context, key string) (bool, int64) {
+// head probes a key. It returns (found, size, err): err is non-nil only for a
+// transient failure (network, signing, non-404 status) — the caller should
+// retry. A definitive 404 is (false, 0, nil): the object is permanently absent.
+func (s *s3Store) head(ctx context.Context, key string) (bool, int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, s.endpoint+"/"+s.bucket+"/"+key, nil)
 	if err != nil {
-		return false, 0
+		return false, 0, err
 	}
 	if err := s.sign(req, emptyHash, nil); err != nil {
-		return false, 0
+		return false, 0, err
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return false, 0
+		return false, 0, err
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false, 0
+	if resp.StatusCode == http.StatusNotFound {
+		return false, 0, nil // definitively absent
 	}
-	return true, resp.ContentLength
+	if resp.StatusCode != http.StatusOK {
+		return false, 0, fmt.Errorf("s3 head: %s", resp.Status) // transient/unexpected
+	}
+	return true, resp.ContentLength, nil
 }
 
 func (s *s3Store) Open(ctx context.Context, tenantID int64, ref Ref) (Reader, error) {
@@ -195,9 +201,12 @@ func (s *s3Store) Open(ctx context.Context, tenantID int64, ref Ref) (Reader, er
 		return nil, ErrBadRef
 	}
 	key := s.key(tenantID, ref)
-	ok, size := s.head(ctx, key)
+	ok, size, err := s.head(ctx, key)
+	if err != nil {
+		return nil, err // transient: surface so the caller retries
+	}
 	if !ok {
-		return nil, fmt.Errorf("blob not found: %s", ref)
+		return nil, ErrNotFound // permanent: caller may quarantine
 	}
 	return &s3Reader{s: s, ctx: ctx, key: key, size: size}, nil
 }

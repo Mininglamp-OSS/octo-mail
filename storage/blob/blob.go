@@ -24,6 +24,13 @@ type Ref string
 // escaping the tenant key prefix into a path/key traversal.
 var ErrBadRef = errors.New("blob: invalid content ref")
 
+// ErrNotFound is returned by Open when the referenced blob does not exist — a
+// PERMANENT condition (a bad/missing content ref), distinct from a transient I/O
+// or network error. Callers that must make progress past a poison row (the async
+// projections) quarantine on ErrNotFound/ErrBadRef but retry on other errors, so
+// a transient storage outage never silently drops a message from the fold.
+var ErrNotFound = errors.New("blob: not found")
+
 // Valid reports whether r is a canonical sha256 content ref: exactly 64 chars,
 // all lowercase hex. This is the only ref shape Put ever produces.
 func (r Ref) Valid() bool {
@@ -127,6 +134,9 @@ func (s *fsStore) Open(ctx context.Context, tenantID int64, ref Ref) (Reader, er
 	}
 	f, err := os.Open(s.path(tenantID, ref))
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 	fi, err := f.Stat()

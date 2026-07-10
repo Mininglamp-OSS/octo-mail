@@ -477,7 +477,7 @@ func run() error {
 	// above are safe on every node (FOR UPDATE SKIP LOCKED leases), so they are
 	// not gated.
 	fts := &projection.FTSWorker{Pool: s.Pool, Blob: bs, Batch: 100}
-	threads := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100}
+	threads := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100, Log: log}
 	const projLeaderKey = int64(0x6f63746f6d61696c) // "octomail"
 	projCoord := ha.NewCoordinator(ha.New(s.Pool, projLeaderKey, cfg.nodeID), cfg.projInterval)
 	projCoord.OnElected = func(context.Context) { log.Info("elected projection-drain leader", "node", cfg.nodeID) }
@@ -683,6 +683,12 @@ func drainProjections(ctx context.Context, log *slog.Logger, s *postgres.Store, 
 		}
 		if err := threads.DrainAccount(ctx, a.tenant, a.id); err != nil {
 			log.Warn("thread drain", "account", a.id, "err", err)
+		}
+		// Backfill summary columns for rows that predate them (in-place upgrade):
+		// the forward drain above only folds new rows, so legacy rows need this
+		// one-time-per-row pass or filtered search would omit all historical mail.
+		if err := threads.BackfillSummaries(ctx, a.tenant, a.id); err != nil {
+			log.Warn("summary backfill", "account", a.id, "err", err)
 		}
 	}
 }
