@@ -69,6 +69,14 @@ func checkReporterConfig(cfg config) error {
 			"outbound DMARC reports are addressed as dmarc-reports@<hostname> and sent to third parties; " +
 			"the default 'octo-mail.local' would misattribute them")
 	}
+	// Inbound report ingestion routes RCPT by domain, and the RCPT dispatch checks
+	// the bounce domain BEFORE the report domain. If they collide, all report mail
+	// is swallowed by the bounce handler and silently never ingested — refuse it.
+	if cfg.reportDomain != "" && cfg.bounceDomain != "" && cfg.reportDomain == cfg.bounceDomain {
+		return fmt.Errorf("OCTO_MAIL_REPORT_DOMAIN must differ from OCTO_MAIL_BOUNCE_DOMAIN "+
+			"(both %q): report mail to a shared domain would be routed to the bounce handler and never ingested",
+			cfg.reportDomain)
+	}
 	return nil
 }
 

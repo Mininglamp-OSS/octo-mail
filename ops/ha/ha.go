@@ -247,7 +247,14 @@ func (l *Leader) FenceExec(ctx context.Context, fn func(pgx.Tx) error) error {
 		return err
 	}
 	defer conn.Release()
-	tx, err := conn.Begin(ctx)
+	// RepeatableRead gives fn a SINGLE snapshot for the whole transaction. Fenced
+	// jobs commonly read-then-write the same rows (e.g. SELECT unreported rows,
+	// then UPDATE them reported): under the pgx default READ COMMITTED those two
+	// statements take different snapshots, so a row committed by another session in
+	// between is invisible to the read but matched by the write — silently marked
+	// done without being processed. One snapshot closes that window for every
+	// fenced job.
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return err
 	}

@@ -63,3 +63,22 @@ func (s *Store) EnsureSystemAccount(ctx context.Context) (tenantID, accountID in
 	}
 	return tenantID, accountID, nil
 }
+
+// DomainOwned reports whether this deployment serves the given domain (a row in
+// the domains table, case-insensitive). Used to gate inbound report ingestion:
+// only reports about domains we actually own are stored, so an unauthenticated
+// peer can neither inject fabricated report rows for an arbitrary domain nor
+// pre-seed a victim's (org_name, report_id) to suppress the genuine report. On a
+// query error it fails CLOSED (returns false) — a transient DB blip drops an
+// unverifiable report rather than storing an unowned one.
+func (s *Store) DomainOwned(ctx context.Context, domain string) bool {
+	if domain == "" {
+		return false
+	}
+	var ok bool
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM domains WHERE lower(domain)=lower($1))`, domain).Scan(&ok); err != nil {
+		return false
+	}
+	return ok
+}

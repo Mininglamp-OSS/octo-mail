@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-mail/ops/reportdb"
@@ -56,10 +57,14 @@ func openAggPool(t *testing.T) *pgxpool.Pool {
 }
 
 // allowAllRUA authorizes every rua (the not-a-reflector-target case).
-func allowAllRUA(ctx context.Context, reportedDomain, ruaAddr string) bool { return true }
+func allowAllRUA(ctx context.Context, reportedDomain, ruaAddr string) reportdb.RUAResult {
+	return reportdb.RUAAuthorized
+}
 
 // denyAllRUA rejects every rua (simulates an unauthorized third-party rua).
-func denyAllRUA(ctx context.Context, reportedDomain, ruaAddr string) bool { return false }
+func denyAllRUA(ctx context.Context, reportedDomain, ruaAddr string) reportdb.RUAResult {
+	return reportdb.RUADenied
+}
 
 // TestSendDMARCReportFenced proves the H18 promotion-safe send: while leader
 // (real fence) it enqueues once and marks rows reported; once fenced it neither
@@ -99,7 +104,9 @@ func TestSendDMARCReportFenced(t *testing.T) {
 		t.Fatalf("leader did not enqueue exactly one report to rua: to=%v", sender.to)
 	}
 
-	// Second leader racing the same domain after it was claimed: nothing to send.
+	// Re-run over an already-claimed domain: nothing left to claim, nothing sent.
+	// (This proves row-claim idempotency on re-run; the concurrent-fencing guarantee
+	// itself is covered by ops/ha's own tests, not this sequential realFence stub.)
 	sent, err = s.SendDMARCReportFenced(ctx, realFence(pool), allowAllRUA, sender, 1, 1, "sender.example", "mx.example.com", "postmaster@example.com")
 	if err != nil {
 		t.Fatalf("second send err: %v", err)
@@ -137,6 +144,75 @@ func TestSendDMARCReportRUAReflectionBlocked(t *testing.T) {
 		t.Fatalf("unauthorized-rua rows left unreported (%d) — would loop forever", unreported)
 	}
 	t.Logf("OK: report to an unauthorized third-party rua is blocked (no send), rows still claimed")
+}
+
+// TestSendDMARCReportRUATransient proves a TRANSIENT authorization failure (e.g. a
+// DNS temperror) neither sends nor claims — the rows stay unreported so the next
+// tick retries, rather than permanently dropping a legitimate window (P1-d).
+func TestSendDMARCReportRUATransient(t *testing.T) {
+	ctx := context.Background()
+	pool := openAggPool(t)
+	s := &reportdb.Store{Pool: pool}
+	if err := s.RecordDMARCAgg(ctx, "sender.example", "rua@third-party.example", "203.0.113.5", "pass", "pass", "none"); err != nil {
+		t.Fatal(err)
+	}
+	transient := func(ctx context.Context, reportedDomain, ruaAddr string) reportdb.RUAResult {
+		return reportdb.RUATransient
+	}
+	sender := &stubSender{}
+	sent, err := s.SendDMARCReportFenced(ctx, realFence(pool), transient, sender, 1, 1, "sender.example", "mx.example.com", "postmaster@example.com")
+	if err != nil {
+		t.Fatalf("send err: %v", err)
+	}
+	if sent || len(sender.got) != 0 {
+		t.Fatalf("transient auth failure still sent (sent=%v msgs=%d)", sent, len(sender.got))
+	}
+	var unreported int
+	pool.QueryRow(ctx, `SELECT count(*) FROM dmarc_agg WHERE from_domain='sender.example' AND NOT reported`).Scan(&unreported)
+	if unreported == 0 {
+		t.Fatalf("transient auth failure marked rows reported — window permanently dropped instead of retried")
+	}
+	t.Logf("OK: a transient rua-authorization failure leaves rows unreported for the next tick (no permanent drop)")
+}
+
+// TestIngestMessageBomb proves the decompression budget: a small gzip that expands
+// past the single-stream cap is rejected (not silently truncated and mis-parsed).
+func TestIngestMessageBomb(t *testing.T) {
+	ctx := context.Background()
+	pool := openReportsPool(t)
+	s := &reportdb.Store{Pool: pool}
+
+	// A gzip of ~60 MiB of zeros: well past the 50 MiB single-stream cap, but the
+	// compressed attachment is tiny (high ratio) — the decompression-bomb shape.
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := io.Copy(w, io.LimitReader(zeroReader{}, 60<<20)); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	var b bytes.Buffer
+	b.WriteString("From: r@acme.example\r\nTo: reports@mx.example.com\r\nSubject: Report\r\nMIME-Version: 1.0\r\n")
+	b.WriteString("Content-Type: application/gzip\r\nContent-Transfer-Encoding: base64\r\n")
+	b.WriteString("Content-Disposition: attachment; filename=\"bomb.gz\"\r\n\r\n")
+	b.WriteString(base64.StdEncoding.EncodeToString(buf.Bytes()))
+	b.WriteString("\r\n")
+
+	_, err := s.IngestMessage(ctx, b.Bytes(), nil)
+	if err == nil {
+		t.Fatalf("oversized decompressed payload was not rejected (no error)")
+	}
+	t.Logf("OK: an over-cap decompressed attachment is rejected (%v), not silently truncated", err)
+}
+
+// zeroReader yields an endless stream of zero bytes (compresses to ~nothing).
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }
 
 // TestUnreportedDMARCDomains proves the scheduler work-list: only domains with
@@ -197,17 +273,31 @@ func TestIngestMessageExtraction(t *testing.T) {
 		return b.Bytes()
 	}
 
-	kind, err := s.IngestMessage(ctx, mkMsg("application/gzip", "report.xml.gz", gz(dmarcXML)))
+	// owned allows the report domains used in the fixtures (nil would also work;
+	// this exercises the gate on the accept path).
+	owned := func(ctx context.Context, domain string) bool { return domain == "sender.example" }
+
+	kind, err := s.IngestMessage(ctx, mkMsg("application/gzip", "report.xml.gz", gz(dmarcXML)), owned)
 	if err != nil || kind != "dmarc" {
 		t.Fatalf("dmarc gzip ingest: kind=%q err=%v", kind, err)
 	}
-	kind, err = s.IngestMessage(ctx, mkMsg("application/tlsrpt+gzip", "report.json.gz", gz(tlsJSON)))
+	kind, err = s.IngestMessage(ctx, mkMsg("application/tlsrpt+gzip", "report.json.gz", gz(tlsJSON)), owned)
 	if err != nil || kind != "tlsrpt" {
 		t.Fatalf("tlsrpt gzip ingest: kind=%q err=%v", kind, err)
 	}
 	// A malformed/empty attachment must error, not panic or wedge.
-	if _, err := s.IngestMessage(ctx, mkMsg("application/gzip", "junk.gz", gz([]byte("not a report")))); err == nil {
+	if _, err := s.IngestMessage(ctx, mkMsg("application/gzip", "junk.gz", gz([]byte("not a report"))), owned); err == nil {
 		t.Fatalf("expected error for non-report payload")
+	}
+	// A report for an UNOWNED domain must be rejected and stored nothing.
+	unownedXML := []byte(`<?xml version="1.0"?><feedback><report_metadata><org_name>evil</org_name><email>e@evil.example</email><report_id>rid-unowned</report_id><date_range><begin>1000</begin><end>2000</end></date_range></report_metadata><policy_published><domain>victim.example</domain><p>none</p></policy_published><record><row><source_ip>203.0.113.9</source_ip><count>9</count><policy_evaluated><disposition>none</disposition><dkim>fail</dkim><spf>fail</spf></policy_evaluated></row><identifiers><header_from>victim.example</header_from></identifiers><auth_results></auth_results></record></feedback>`)
+	if _, err := s.IngestMessage(ctx, mkMsg("application/gzip", "unowned.xml.gz", gz(unownedXML)), owned); err == nil {
+		t.Fatalf("expected rejection for a report about an unowned domain")
+	}
+	var nUnowned int
+	pool.QueryRow(ctx, `SELECT count(*) FROM dmarc_reports WHERE report_id='rid-unowned'`).Scan(&nUnowned)
+	if nUnowned != 0 {
+		t.Fatalf("unowned-domain report was stored (%d rows) — ingest ownership gate bypassed", nUnowned)
 	}
 
 	var nd, nt int
@@ -216,7 +306,7 @@ func TestIngestMessageExtraction(t *testing.T) {
 	if nd != 1 || nt != 1 {
 		t.Fatalf("stored dmarc=%d tlsrpt=%d, want 1/1", nd, nt)
 	}
-	t.Logf("OK: gzipped DMARC-XML and TLS-RPT-JSON attachments extracted, sniffed, and ingested; junk payload errors cleanly")
+	t.Logf("OK: gzipped DMARC-XML and TLS-RPT-JSON attachments extracted, sniffed, and ingested; junk + unowned-domain rejected")
 }
 
 func openReportsPool(t *testing.T) *pgxpool.Pool {

@@ -44,6 +44,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/webui"
 	"github.com/mjl-/mox/dmarc"
 	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/smtpclient"
 )
 
@@ -282,7 +283,7 @@ func run() error {
 		if cfg.reporter && cfg.reportDomain != "" {
 			mx.ReportDomain = cfg.reportDomain
 			mx.ReportHandler = func(ctx context.Context, localpart string, raw []byte) {
-				kind, err := reports.IngestMessage(ctx, raw)
+				kind, err := reports.IngestMessage(ctx, raw, s.DomainOwned)
 				if err != nil {
 					log.WarnContext(ctx, "report ingest", "localpart", localpart, "err", err)
 					return
@@ -546,26 +547,30 @@ func run() error {
 		// the SAME domain as the reported domain is implicitly authorized (no lookup);
 		// a third-party rua must publish "<reported>._report._dmarc.<rua-domain>".
 		// Without this, a sender could publish rua=mailto:victim@x and steer us into
-		// mailing reports to an arbitrary address.
-		ruaAuthorized := func(ctx context.Context, reportedDomain, ruaAddr string) bool {
-			at := strings.LastIndexByte(ruaAddr, '@')
-			if at < 0 {
-				return false
+		// mailing reports to an arbitrary address. Distinguishes a permanent denial
+		// (no opt-in record) from a transient DNS failure so a temperror doesn't
+		// permanently drop a legitimate window.
+		ruaAuthorized := func(ctx context.Context, reportedDomain, ruaAddr string) reportdb.RUAResult {
+			addr, err := smtp.ParseAddress(ruaAddr)
+			if err != nil {
+				return reportdb.RUADenied // unparseable rua — never send
 			}
-			ruaDomain := ruaAddr[at+1:]
-			if strings.EqualFold(ruaDomain, reportedDomain) {
-				return true // same-domain rua needs no external authorization
-			}
+			ruaDomain := addr.Domain
 			rd, err := dns.ParseDomain(reportedDomain)
 			if err != nil {
-				return false
+				return reportdb.RUADenied
 			}
-			ed, err := dns.ParseDomain(ruaDomain)
-			if err != nil {
-				return false
+			if ruaDomain.ASCII == rd.ASCII {
+				return reportdb.RUAAuthorized // same-domain rua needs no external authorization
 			}
-			accepts, _, _, _, _, err := dmarc.LookupExternalReportsAccepted(ctx, nil, reportResolver, rd, ed)
-			return err == nil && accepts
+			accepts, status, _, _, _, err := dmarc.LookupExternalReportsAccepted(ctx, nil, reportResolver, rd, ruaDomain)
+			if accepts && err == nil {
+				return reportdb.RUAAuthorized
+			}
+			if status == dmarc.StatusTemperror {
+				return reportdb.RUATransient // retry next tick, don't drop the window
+			}
+			return reportdb.RUADenied
 		}
 		const reportLeaderKey = int64(0x6f6d5f72707274) // "om_rprt"
 		repCoord := ha.NewCoordinator(ha.New(s.Pool, reportLeaderKey, cfg.nodeID), cfg.reportInterval)
