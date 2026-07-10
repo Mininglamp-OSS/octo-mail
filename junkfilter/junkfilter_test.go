@@ -21,6 +21,11 @@ func openJunkPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 		pool.Close()
 		t.Skipf("postgres not available (%v)", err)
 	}
+	// DDL mirrors storage/postgres/schema/09_junkfilter.sql. These tests use a raw
+	// pool (not postgres.Open, which applies the full schema and needs a blob store)
+	// to stay self-contained — same pattern as the ha tests. Keep in sync with the
+	// real schema; a column/index change there must be reflected here or a test
+	// could pass against a table shape production never has.
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS junk_words (account_id bigint NOT NULL, word text NOT NULL, ham bigint NOT NULL DEFAULT 0, spam bigint NOT NULL DEFAULT 0, PRIMARY KEY (account_id, word))`,
 		`CREATE TABLE IF NOT EXISTS junk_totals (account_id bigint NOT NULL PRIMARY KEY, hams bigint NOT NULL DEFAULT 0, spams bigint NOT NULL DEFAULT 0)`,
@@ -144,4 +149,44 @@ func TestJunkSharedAcrossNodes(t *testing.T) {
 		t.Fatalf("nodeB did not classify held-out spam as junk (prob=%.3f) — shared state broken", prob)
 	}
 	t.Logf("OK: node B classified spam as junk (prob=%.3f) from node A's training — junk state shared via Postgres", prob)
+}
+
+// TestTrainNothingOnNoWords proves the #42 review fix: a message that yields no
+// trainable words (empty/wordless body, or a parse failure that tokenize turns
+// into an empty word set) must NOT bump junk_totals. A denominator bumped without
+// any junk_words rows would skew every other word's spam/ham ratio and drift all
+// future classifications for the account. (The bad-Content-Type shortcut folds
+// into the same guard; with the non-strict parser used here the reachable trigger
+// is the empty-word set.)
+func TestTrainNothingOnNoWords(t *testing.T) {
+	ctx := context.Background()
+	pool := openJunkPool(t, ctx)
+	defer pool.Close()
+	mgr := junkfilter.NewManager(pool, junkfilter.DefaultParams, 0.95)
+	defer mgr.Close()
+
+	const acc = int64(7)
+	// A message with no header/body tokens → empty word set (verified via the
+	// tokenizer: headers are tokenized too, so this must carry no address/subject).
+	noWords := []byte("\r\n\r\n")
+	if err := mgr.Train(ctx, acc, false, noWords); err != nil {
+		t.Fatalf("train no-words: %v", err)
+	}
+
+	// No totals row should have been written (train-nothing).
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM junk_totals WHERE account_id=$1`, acc).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("junk_totals bumped for a no-trainable-words train (rows=%d) — denominator skew", n)
+	}
+	var w int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM junk_words WHERE account_id=$1`, acc).Scan(&w); err != nil {
+		t.Fatal(err)
+	}
+	if w != 0 {
+		t.Fatalf("junk_words written for a no-trainable-words train (rows=%d)", w)
+	}
+	t.Logf("OK: a no-trainable-words message trains nothing (no denominator skew)")
 }

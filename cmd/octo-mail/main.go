@@ -116,6 +116,13 @@ func run() error {
 		// fatal). Warn on every VERP-enabling topology, inbound or outbound-only.
 		log.Warn("VERP signing key not set (OCTO_MAIL_VERP_KEY); bounce/complaint attribution is forgeable — dev-only unsigned path enabled via OCTO_MAIL_ALLOW_UNSIGNED_VERP", "bounce_domain", cfg.bounceDomain)
 	}
+	if os.Getenv("OCTO_MAIL_JUNK_DIR") != "" {
+		// Junk-filter state moved from per-node files to shared Postgres
+		// (junk_words/junk_totals). The env is no longer consumed; warn rather than
+		// silently ignore it so an operator who set it knows their old file-based
+		// state is orphaned (there is no automatic migration — accounts retrain).
+		log.Warn("OCTO_MAIL_JUNK_DIR is set but ignored: junk-filter state now lives in Postgres (shared across nodes); any old file-based junk state on disk is orphaned and no longer used")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

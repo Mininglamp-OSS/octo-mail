@@ -158,7 +158,6 @@ type config struct {
 	maxHops     int // inbound Received-header loop limit (0 = smtpd default)
 	greylist    bool
 
-	junkDir       string // deprecated/unused: junk-filter state now lives in Postgres (shared)
 	junkThreshold float64
 
 	// Inbound decision-engine tuning (all optional; zero uses Decider defaults).
@@ -233,7 +232,6 @@ func loadConfig() config {
 		maxHops:     int(envInt64("OCTO_MAIL_MAX_HOPS", 50)),
 		greylist:    os.Getenv("OCTO_MAIL_GREYLIST") == "1",
 
-		junkDir:       envDefault("OCTO_MAIL_JUNK_DIR", "./junk"),
 		junkThreshold: envFloat("OCTO_MAIL_JUNK_THRESHOLD", 0.95),
 
 		greylistDelay:     envDuration("OCTO_MAIL_GREYLIST_DELAY", 0),

@@ -235,11 +235,35 @@ func (m *Manager) probability(words map[string]struct{}, counts map[string]struc
 // message and, in one transaction, bumps the matching per-word counter and the
 // account's ham/spam total. Marking a message \Junk trains spam; moving it out of
 // Junk trains ham.
+//
+// A message that yields no trainable words is NOT trained at all (no totals bump):
+// a bad Content-Type (tokenize's certain-spam shortcut) or a parse failure returns
+// an empty word set, and bumping junk_totals.hams/spams without writing any
+// junk_words rows would inflate the account's denominator with no matching word
+// evidence — shrinking every other word's spam/ham ratio and skewing all future
+// classifications. mox's TrainMessage likewise trains nothing on such messages.
 func (m *Manager) Train(ctx context.Context, accountID int64, ham bool, raw []byte) error {
-	words, _, err := m.tokenize(raw)
+	words, badCT, err := m.tokenize(raw)
 	if err != nil {
 		return err
 	}
+	// No trainable words → train nothing (see the denominator-skew note above).
+	// Covers both the bad-Content-Type shortcut and a swallowed parse failure.
+	if badCT || len(words) == 0 {
+		return nil
+	}
+	// Materialize the word set in a STABLE (sorted) order. Two concurrent Train
+	// transactions on the same account whose messages share ≥2 words would, with a
+	// map's randomized iteration order, take the ON CONFLICT row locks in opposite
+	// orders and deadlock (Postgres 40P01 aborts one); the caller discards the
+	// error, so the aborted retrain would be silently lost. A consistent lock order
+	// removes the deadlock.
+	wl := make([]string, 0, len(words))
+	for w := range words {
+		wl = append(wl, w)
+	}
+	sort.Strings(wl)
+
 	return pgx.BeginFunc(ctx, m.Pool, func(tx pgx.Tx) error {
 		hamDelta, spamDelta := 0, 1
 		if ham {
@@ -251,17 +275,10 @@ func (m *Manager) Train(ctx context.Context, accountID int64, ham bool, raw []by
 			accountID, hamDelta, spamDelta); err != nil {
 			return err
 		}
-		if len(words) == 0 {
-			return nil
-		}
 		// Bulk-upsert every word's counter in ONE round trip via unnest, instead of
 		// an Exec per token (a token-heavy message would otherwise be hundreds of
 		// SQL round trips per train). The per-word delta is uniform for this message
 		// (hamDelta/spamDelta), so it is applied to each unnested word.
-		wl := make([]string, 0, len(words))
-		for w := range words {
-			wl = append(wl, w)
-		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO junk_words (account_id, word, ham, spam)
 			 SELECT $1, w, $3, $4 FROM unnest($2::text[]) AS w
