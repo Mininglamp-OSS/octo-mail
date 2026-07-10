@@ -102,7 +102,7 @@ func TestDeliverReadFlagAndModseq(t *testing.T) {
 	}
 
 	// Read the body back through the blob store (prefix + body).
-	r := acc.MessageReader(got)
+	r := acc.MessageReader(ctx, got)
 	buf := make([]byte, got.Size+16)
 	n, _ := readFull(r, buf)
 	r.Close()

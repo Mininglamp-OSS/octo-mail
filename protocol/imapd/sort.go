@@ -252,7 +252,7 @@ func (c *conn) searchMatchesIn(tag string, mb *store.Mailbox, crit string) ([]ma
 	c.ftsHits = map[string]map[store.UID]bool{}
 	for _, q := range collectTextTerms(node) {
 		hits := map[store.UID]bool{}
-		_ = c.acc.Tx(c.ctx, func(tx store.Tx) error {
+		_ = c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 			ms, e := tx.QueryMessage().FilterMailbox(mb.ID).FilterFTS(q).List()
 			if e != nil {
 				return e
@@ -267,7 +267,7 @@ func (c *conn) searchMatchesIn(tag string, mb *store.Mailbox, crit string) ([]ma
 	defer func() { c.ftsHits = nil }()
 
 	var allMsgs []store.Message
-	err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
+	err := c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 		var e error
 		allMsgs, e = tx.QueryMessage().FilterMailbox(mb.ID).SortUID().List()
 		return e

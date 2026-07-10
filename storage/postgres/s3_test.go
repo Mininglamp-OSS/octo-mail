@@ -72,7 +72,7 @@ func TestS3BackedDeliveryAndFetch(t *testing.T) {
 		if len(msgs) != 1 {
 			t.Fatalf("expected 1 message, got %d", len(msgs))
 		}
-		r := acc.MessageReader(msgs[0])
+		r := acc.MessageReader(ctx, msgs[0])
 		defer r.Close()
 		buf := make([]byte, r.Size())
 		n := 0

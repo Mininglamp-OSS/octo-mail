@@ -438,10 +438,10 @@ type inboundTarget struct {
 }
 
 func (it *inboundTarget) Deliver(ctx context.Context, m *store.Message, body store.BlobReader) ([]store.Change, error) {
-	return it.acc.DeliverMailbox("Inbox", m, body)
+	return it.acc.DeliverMailbox(ctx, "Inbox", m, body)
 }
 func (it *inboundTarget) DeliverTo(ctx context.Context, mailbox string, m *store.Message, body store.BlobReader) ([]store.Change, error) {
-	return it.acc.DeliverMailbox(mailbox, m, body)
+	return it.acc.DeliverMailbox(ctx, mailbox, m, body)
 }
 func (it *inboundTarget) AccountID() int64             { return it.acc.ID() }
 func (it *inboundTarget) Tenant() directory.TenantInfo { return it.tenant }

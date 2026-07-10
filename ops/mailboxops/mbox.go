@@ -39,7 +39,7 @@ func ExportMbox(ctx context.Context, acc store.Account, mailbox string, w io.Wri
 	bw := bufio.NewWriter(w)
 	n := 0
 	for _, m := range msgs {
-		r := acc.MessageReader(m)
+		r := acc.MessageReader(ctx, m)
 		data, err := io.ReadAll(r)
 		r.Close()
 		if err != nil {
@@ -96,7 +96,7 @@ func ImportMbox(ctx context.Context, acc store.Account, mailbox string, r io.Rea
 		if strings.TrimSpace(raw) == "" {
 			return nil
 		}
-		_, err := acc.DeliverMailbox(mailbox, &store.Message{}, memBlob(raw+"\r\n"))
+		_, err := acc.DeliverMailbox(ctx, mailbox, &store.Message{}, memBlob(raw+"\r\n"))
 		if err != nil {
 			return err
 		}

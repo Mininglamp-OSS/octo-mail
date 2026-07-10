@@ -98,23 +98,29 @@ func (a *account) MessageAdd(tx store.Tx, mb *store.Mailbox, m *store.Message, b
 }
 
 // DeliverMailbox is the inbound convenience path: ensure the mailbox, add the
-// message, in one transaction. Used by smtpserver.
-func (a *account) DeliverMailbox(mailbox string, m *store.Message, body store.BlobReader) ([]store.Change, error) {
+// message, in one transaction. Used by smtpserver. Returns the changes emitted
+// by the delivery (mailbox-ensure changes plus the message add).
+func (a *account) DeliverMailbox(ctx context.Context, mailbox string, m *store.Message, body store.BlobReader) ([]store.Change, error) {
 	var changes []store.Change
-	err := a.Tx(context.Background(), func(tx store.Tx) error {
+	err := a.Tx(ctx, func(tx store.Tx) error {
 		mb, err := a.MailboxFind(tx, mailbox)
 		if err != nil {
 			return err
 		}
 		if mb == nil {
-			nmb, _, e := a.MailboxEnsure(tx, mailbox, true, store.SpecialUse{}, nil)
+			nmb, ensured, e := a.MailboxEnsure(tx, mailbox, true, store.SpecialUse{}, nil)
 			if e != nil {
 				return e
 			}
 			mb = &nmb
+			changes = append(changes, ensured...)
 		}
-		_, err = a.MessageAdd(tx, mb, m, body, store.AddOpts{})
-		return err
+		added, err := a.MessageAdd(tx, mb, m, body, store.AddOpts{})
+		if err != nil {
+			return err
+		}
+		changes = append(changes, added...)
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -152,7 +158,7 @@ func (a *account) MessagesByEmailID(tx store.Tx, emailID int64) ([]store.Message
 // content-addressed, so no copy), new mailbox/uid, flags carried over. IMAP sees
 // an ordinary new message; JMAP sees the email's mailboxIds set grow by one.
 func (a *account) AddSibling(tx store.Tx, src store.Message, mb *store.Mailbox) (store.Message, []store.Change, error) {
-	body := a.MessageReader(src)
+	body := a.MessageReader(tx.(*pgTx).ctx, src)
 	nm := &store.Message{Flags: src.Flags, Keywords: src.Keywords, ThreadID: src.ThreadID}
 	changes, err := a.MessageAdd(tx, mb, nm, body, store.AddOpts{EmailID: src.EffectiveEmailID()})
 	if err != nil {
@@ -171,6 +177,7 @@ func (a *account) MessageRemove(tx store.Tx, modseq store.ModSeq, mb *store.Mail
 	var ids []int64
 	var totalSize int64
 	var unseen int
+	var deleted int
 	for _, m := range msgs {
 		uids = append(uids, m.UID)
 		ids = append(ids, m.ID)
@@ -178,12 +185,16 @@ func (a *account) MessageRemove(tx store.Tx, modseq store.ModSeq, mb *store.Mail
 		if !m.Seen {
 			unseen++
 		}
+		if m.Deleted {
+			deleted++
+		}
 		if _, err := pt.tx.Exec(pt.ctx,
 			`UPDATE messages SET expunged=true, modseq=$1 WHERE id=$2`, int64(modseq), m.ID); err != nil {
 			return store.ChangeRemoveUIDs{}, store.ChangeMailboxCounts{}, err
 		}
 	}
-	if err := pt.bumpCounts(mb.ID, -len(msgs), -totalSize, -unseen, 0); err != nil {
+	counts, err := pt.bumpCountsReturning(mb.ID, -len(msgs), -totalSize, -unseen, -deleted)
+	if err != nil {
 		return store.ChangeRemoveUIDs{}, store.ChangeMailboxCounts{}, err
 	}
 	if err := pt.bumpQuota(-len(msgs), -totalSize); err != nil {
@@ -193,12 +204,14 @@ func (a *account) MessageRemove(tx store.Tx, modseq store.ModSeq, mb *store.Mail
 	if err := pt.record(cr); err != nil {
 		return store.ChangeRemoveUIDs{}, store.ChangeMailboxCounts{}, err
 	}
-	return cr, store.ChangeMailboxCounts{MailboxID: mb.ID}, nil
+	return cr, store.ChangeMailboxCounts{MailboxID: mb.ID, MailboxCounts: counts}, nil
 }
 
-// MessageReader streams MsgPrefix followed by the blob body.
-func (a *account) MessageReader(m store.Message) store.BlobReader {
+// MessageReader streams MsgPrefix followed by the blob body. ctx bounds the
+// blob-store opens performed lazily on first Read/ReadAt.
+func (a *account) MessageReader(ctx context.Context, m store.Message) store.BlobReader {
 	return &prefixReader{
+		ctx:    ctx,
 		acc:    a,
 		ref:    blob.Ref(m.BlobRef),
 		prefix: m.MsgPrefix,
@@ -293,6 +306,19 @@ func (pt *pgTx) bumpCounts(mailboxID int64, dTotal int, dSize int64, dUnseen, dD
 	return err
 }
 
+// bumpCountsReturning applies the same deltas as bumpCounts and returns the
+// mailbox's post-update counters, so callers (MessageRemove) can report an
+// accurate ChangeMailboxCounts without a second read.
+func (pt *pgTx) bumpCountsReturning(mailboxID int64, dTotal int, dSize int64, dUnseen, dDeleted int) (store.MailboxCounts, error) {
+	var c store.MailboxCounts
+	err := pt.tx.QueryRow(pt.ctx,
+		`UPDATE mailboxes SET c_total=c_total+$2, c_size=c_size+$3, c_unseen=c_unseen+$4,
+			c_unread=c_unread+$4, c_deleted=c_deleted+$5 WHERE id=$1
+		 RETURNING c_total, c_deleted, c_unread, c_unseen, c_size`,
+		mailboxID, dTotal, dSize, dUnseen, dDeleted).Scan(&c.Total, &c.Deleted, &c.Unread, &c.Unseen, &c.Size)
+	return c, err
+}
+
 func (pt *pgTx) bumpQuota(dCount int, dSize int64) error {
 	// account scope (1) and tenant scope (0).
 	for _, sc := range []struct {
@@ -313,6 +339,7 @@ func (pt *pgTx) bumpQuota(dCount int, dSize int64) error {
 
 // prefixReader concatenates MsgPrefix and the blob body, satisfying BlobReader.
 type prefixReader struct {
+	ctx    context.Context
 	acc    *account
 	ref    blob.Ref
 	prefix []byte
@@ -326,7 +353,7 @@ func (p *prefixReader) ensure() error {
 	if p.r != nil {
 		return nil
 	}
-	br, err := p.acc.s.Blob.Open(context.Background(), p.acc.tenantID, p.ref)
+	br, err := p.acc.s.Blob.Open(p.ctx, p.acc.tenantID, p.ref)
 	if err != nil {
 		return err
 	}
@@ -345,7 +372,7 @@ func (p *prefixReader) Read(b []byte) (int, error) {
 func (p *prefixReader) ReadAt(b []byte, off int64) (int, error) {
 	// Simple implementation: prefix then blob. For P1, IMAP partial fetch is rare;
 	// full correctness (ranged across the prefix boundary) can be optimized later.
-	br, err := p.acc.s.Blob.Open(context.Background(), p.acc.tenantID, p.ref)
+	br, err := p.acc.s.Blob.Open(p.ctx, p.acc.tenantID, p.ref)
 	if err != nil {
 		return 0, err
 	}

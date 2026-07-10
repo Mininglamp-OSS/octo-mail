@@ -111,7 +111,7 @@ func (c *conn) cmdStore(tag, args string, byUID bool) {
 	}
 	// Retrain the junk filter outside the tx (reads the body from the blob).
 	for _, ta := range trains {
-		br := c.acc.MessageReader(ta.m)
+		br := c.acc.MessageReader(c.ctx, ta.m)
 		data, rerr := io.ReadAll(br)
 		br.Close()
 		if rerr == nil {

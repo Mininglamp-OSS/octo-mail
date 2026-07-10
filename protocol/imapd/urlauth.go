@@ -96,7 +96,7 @@ func (c *conn) cmdResetKey(tag, args string) {
 	}
 	mbName := normalizeMailbox(unquote(fields[0]))
 	var mbID int64
-	err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
+	err := c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 		mb, err := c.acc.MailboxFind(tx, mbName)
 		if err != nil {
 			return err
@@ -133,7 +133,7 @@ func urlauthToken(ctx context.Context, acc store.Account, rump string) (string, 
 		return "", err
 	}
 	var mbID int64
-	err = acc.Tx(ctx, func(tx store.Tx) error {
+	err = acc.ReadTx(ctx, func(tx store.Tx) error {
 		mb, e := acc.MailboxFind(tx, mbName)
 		if e != nil {
 			return e

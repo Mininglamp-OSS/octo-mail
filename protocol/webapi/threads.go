@@ -17,7 +17,7 @@ func (s *Server) getThread(ctx context.Context, a authCtx, r *http.Request) (int
 		return 0, nil, errStatus(http.StatusBadRequest, "invalid_id", "invalid thread id")
 	}
 	var out []messageSummary
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		// Push the thread filter into SQL (indexed) instead of scanning the account.
 		msgs, e := tx.QueryMessage().FilterThread(tid).SortUID().List()
 		if e != nil {
@@ -25,7 +25,7 @@ func (s *Server) getThread(ctx context.Context, a authCtx, r *http.Request) (int
 		}
 		mbNames := mailboxNames(tx, a.acc)
 		for _, m := range msgs {
-			out = append(out, summarize(a.acc, m, mbNames))
+			out = append(out, summarize(ctx, a.acc, m, mbNames))
 		}
 		return nil
 	})

@@ -125,21 +125,56 @@ func (s *Store) resyncAll(ctx context.Context) {
 // replaying the log past what each has seen. Same-node writes were already
 // delivered rich in-process (see publish), and their lastSeq is advanced there,
 // so this path is a no-op for them and only serves OTHER nodes' writes.
+//
+// All subscribers here are for one account (s.subs is account-keyed), so the log
+// is replayed ONCE from the minimum cursor across the behind subscribers and the
+// shared result is sliced per subscriber to entries past its own cursor — turning
+// the former per-subscriber N+1 (one ReplayChanges query each) into a single query.
 func (s *Store) onRemoteChange(ctx context.Context, accID int64, seq store.ModSeq) {
 	s.mu.Lock()
 	subs := append([]*subscriber(nil), s.subs[accID]...)
 	s.mu.Unlock()
 
+	// Only subscribers strictly behind this notification need anything; find the
+	// minimum cursor among them so one replay covers them all.
+	var behind []*subscriber
+	var minCursor store.ModSeq
 	for _, sub := range subs {
 		if sub.seen() >= seq {
 			continue
 		}
-		changes, head, err := s.ReplayChanges(ctx, accID, sub.seen())
-		if err != nil || len(changes) == 0 {
+		if len(behind) == 0 || sub.seen() < minCursor {
+			minCursor = sub.seen()
+		}
+		behind = append(behind, sub)
+	}
+	if len(behind) == 0 {
+		return
+	}
+
+	seqs, changes, head, err := s.replayWithSeqs(ctx, accID, minCursor)
+	if err != nil || len(changes) == 0 {
+		return
+	}
+
+	for _, sub := range behind {
+		cur := sub.seen()
+		// Slice the shared replay to entries strictly past THIS subscriber's cursor
+		// (seqs is ascending). A subscriber at a higher cursor gets only its tail; one
+		// already at/above head gets nothing.
+		start := 0
+		for start < len(seqs) && seqs[start] <= cur {
+			start++
+		}
+		if start >= len(changes) {
 			continue
 		}
+		slice := changes[start:]
+		// Non-blocking send + advance per subscriber: a slow consumer that can't keep
+		// up is dropped here (it resyncs from the log by offset later) without blocking
+		// or advancing the others. The shared slice is read-only across subscribers.
 		select {
-		case sub.comm.Changes <- changes:
+		case sub.comm.Changes <- slice:
 			sub.advance(head)
 		default:
 		}

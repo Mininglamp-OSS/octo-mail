@@ -42,7 +42,7 @@ func (c *conn) cmdESearch(tag, args string) {
 		rest = strings.TrimSpace(after[end+1:])
 
 		var all []store.Mailbox
-		if err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
+		if err := c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 			var e error
 			all, e = tx.QueryMailbox().List()
 			return e

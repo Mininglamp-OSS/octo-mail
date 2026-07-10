@@ -58,7 +58,7 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 
 	var out []messageSummary
 	var total int
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		// Build the filtered, email-deduped query once; Count gives the true total,
 		// then the same filter is sorted + paged in SQL. No whole-account load, no
 		// per-row body parse (summarize reads the projection columns).
@@ -92,7 +92,7 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 		}
 		mbNames := mailboxNames(tx, a.acc)
 		for _, m := range msgs {
-			out = append(out, summarize(a.acc, m, mbNames))
+			out = append(out, summarize(ctx, a.acc, m, mbNames))
 		}
 		return nil
 	})
@@ -109,16 +109,16 @@ func (s *Server) listMessages(ctx context.Context, a authCtx, r *http.Request) (
 func (s *Server) getMessage(ctx context.Context, a authCtx, r *http.Request) (int, any, error) {
 	id := r.PathValue("id")
 	var detail messageDetail
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
 		if e != nil {
 			return e
 		}
 		m := msgs[0]
 		mbNames := mailboxNames(tx, a.acc)
-		detail.messageSummary = summarize(a.acc, m, mbNames)
+		detail.messageSummary = summarize(ctx, a.acc, m, mbNames)
 		// Parse bodies + cc from the raw message.
-		br := a.acc.MessageReader(m)
+		br := a.acc.MessageReader(ctx, m)
 		data, _ := io.ReadAll(br)
 		br.Close()
 		text, html, cc := parseBodies(data)
@@ -135,12 +135,12 @@ func (s *Server) getMessage(ctx context.Context, a authCtx, r *http.Request) (in
 func (s *Server) rawMessage(ctx context.Context, a authCtx, r *http.Request) (store.BlobReader, error) {
 	id := r.PathValue("id")
 	var br store.BlobReader
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
 		if e != nil {
 			return e
 		}
-		br = a.acc.MessageReader(msgs[0])
+		br = a.acc.MessageReader(ctx, msgs[0])
 		return nil
 	})
 	if err != nil {
@@ -216,12 +216,12 @@ func (s *Server) reply(ctx context.Context, a authCtx, r *http.Request, all bool
 		inReplyTo  string
 		references []string
 	)
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
 		if e != nil {
 			return e
 		}
-		br := a.acc.MessageReader(msgs[0])
+		br := a.acc.MessageReader(ctx, msgs[0])
 		data, _ := io.ReadAll(br)
 		br.Close()
 		env := parseEnvelope(data)
@@ -272,12 +272,12 @@ func (s *Server) forwardMessage(ctx context.Context, a authCtx, r *http.Request)
 		return 0, nil, errStatus(http.StatusBadRequest, "invalid_body", "at least one recipient in 'to' is required")
 	}
 	var subject, quoted string
-	err := a.acc.Tx(ctx, func(tx store.Tx) error {
+	err := a.acc.ReadTx(ctx, func(tx store.Tx) error {
 		msgs, e := loadGroup(tx, a.acc, id)
 		if e != nil {
 			return e
 		}
-		br := a.acc.MessageReader(msgs[0])
+		br := a.acc.MessageReader(ctx, msgs[0])
 		data, _ := io.ReadAll(br)
 		br.Close()
 		env := parseEnvelope(data)
@@ -378,13 +378,13 @@ func (s *Server) deleteMessage(ctx context.Context, a authCtx, r *http.Request) 
 
 // --- message helpers ---
 
-func summarize(acc store.Account, m store.Message, mbNames map[int64]string) messageSummary {
+func summarize(ctx context.Context, acc store.Account, m store.Message, mbNames map[int64]string) messageSummary {
 	// Prefer the denormalized summary columns (H13); fall back to an on-the-fly
 	// body parse only for rows the projection hasn't folded yet (recently
 	// delivered), so the common case does no blob read/MIME parse.
 	subject, from, to, preview := m.Subject, m.FromAddr, splitAddrs(m.ToAddrs), m.Preview
 	if !m.SummaryFolded {
-		br := acc.MessageReader(m)
+		br := acc.MessageReader(ctx, m)
 		data, _ := io.ReadAll(br)
 		br.Close()
 		env := parseEnvelope(data)

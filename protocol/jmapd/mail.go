@@ -77,7 +77,7 @@ func mailboxState(ctx context.Context, acc store.Account) string {
 // Mailbox/get: list the account's mailboxes as JMAP Mailbox objects.
 func (s *Server) mailboxGet(ctx context.Context, acc store.Account, inv invocation) (string, any) {
 	var list []map[string]any
-	err := acc.Tx(ctx, func(tx store.Tx) error {
+	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		mbs, e := tx.QueryMailbox().List()
 		if e != nil {
 			return e
@@ -218,7 +218,7 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 	}
 	var ids []string
 	var total int
-	err := acc.Tx(ctx, func(tx store.Tx) error {
+	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		// Live matches: the small set of not-yet-folded rows evaluated per row.
 		// Collected first so they can be folded into both the total and the page.
 		var live []qrow
@@ -242,7 +242,7 @@ func (s *Server) emailQuery(ctx context.Context, acc store.Account, inv invocati
 				return e
 			}
 			for _, m := range umsgs {
-				if !matchesLiveFilter(acc, m, filt) {
+				if !matchesLiveFilter(ctx, acc, m, filt) {
 					continue
 				}
 				gid := m.EffectiveEmailID()
@@ -409,7 +409,7 @@ func parseEmailFilter(raw json.RawMessage) emailFilter {
 // rows in Email/query, so a filtered search doesn't miss just-delivered mail (the
 // column-backed filters can't match a row whose summary columns aren't populated
 // yet). Size/date/mailbox/fts are already applied in SQL by the caller.
-func matchesLiveFilter(acc store.Account, m store.Message, f emailFilter) bool {
+func matchesLiveFilter(ctx context.Context, acc store.Account, m store.Message, f emailFilter) bool {
 	if f.hasKeyword != "" && !hasKeyword(m, f.hasKeyword) {
 		return false
 	}
@@ -419,7 +419,7 @@ func matchesLiveFilter(acc store.Account, m store.Message, f emailFilter) bool {
 	if f.from == "" && f.to == "" && f.subject == "" {
 		return true
 	}
-	br := acc.MessageReader(m)
+	br := acc.MessageReader(ctx, m)
 	data, _ := io.ReadAll(br)
 	br.Close()
 	part, _ := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
@@ -511,7 +511,7 @@ func (s *Server) emailGet(ctx context.Context, acc store.Account, inv invocation
 
 	var list []map[string]any
 	var notFound []string
-	err := acc.Tx(ctx, func(tx store.Tx) error {
+	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		for _, id := range ids {
 			group, ok := s.emailGroup(tx, acc, id)
 			if !ok {
@@ -535,7 +535,7 @@ func (s *Server) emailGet(ctx context.Context, acc store.Account, inv invocation
 				obj["receivedAt"] = m.Received.UTC().Format("2006-01-02T15:04:05Z")
 			}
 			// Parse the message for rich properties: envelope headers + body.
-			br := acc.MessageReader(m)
+			br := acc.MessageReader(ctx, m)
 			data, _ := io.ReadAll(br)
 			br.Close()
 			obj["preview"] = preview(data)
@@ -564,7 +564,7 @@ func (s *Server) emailChanges(ctx context.Context, acc store.Account, inv invoca
 	since, _ := strconv.ParseInt(sinceState, 10, 64)
 
 	var created, updated []string
-	err := acc.Tx(ctx, func(tx store.Tx) error {
+	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		// Messages whose changelog offset (modseq) is greater than sinceState.
 		msgs, e := tx.QueryMessage().FilterModSeqGreater(store.ModSeq(since)).SortUID().List()
 		if e != nil {
@@ -866,7 +866,7 @@ func (s *Server) emailCreate(ctx context.Context, acc store.Account, obj map[str
 	if json.Unmarshal(obj["keywords"], &kw) == nil {
 		applyJMAPKeywords(m, kw)
 	}
-	if _, err := acc.DeliverMailbox(mailbox, m, memBlob(data)); err != nil {
+	if _, err := acc.DeliverMailbox(ctx, mailbox, m, memBlob(data)); err != nil {
 		return nil, false
 	}
 	return map[string]any{
@@ -879,7 +879,7 @@ func (s *Server) emailCreate(ctx context.Context, acc store.Account, obj map[str
 func (s *Server) mailboxNameByID(ctx context.Context, acc store.Account, id int64) (string, bool) {
 	var name string
 	found := false
-	_ = acc.Tx(ctx, func(tx store.Tx) error {
+	_ = acc.ReadTx(ctx, func(tx store.Tx) error {
 		mb, e := findMailboxByID(tx, acc, id)
 		if e == nil && mb != nil {
 			name = mb.Name
@@ -959,7 +959,7 @@ func (s *Server) threadGet(ctx context.Context, acc store.Account, inv invocatio
 
 	var list []map[string]any
 	var notFound []string
-	err := acc.Tx(ctx, func(tx store.Tx) error {
+	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		for _, id := range ids {
 			tid, ok := parseThreadID(id)
 			if !ok {
@@ -1420,7 +1420,7 @@ func (s *Server) emailSubmissionSet(ctx context.Context, acc store.Account, scop
 			if !ok {
 				return errNotFoundJMAP
 			}
-			br := acc.MessageReader(group[0])
+			br := acc.MessageReader(ctx, group[0])
 			defer br.Close()
 			var e error
 			raw, e = io.ReadAll(br)
@@ -1595,7 +1595,7 @@ func (s *Server) emailCopy(ctx context.Context, acc store.Account, inv invocatio
 			if !ok {
 				return errNotFoundJMAP
 			}
-			br := acc.MessageReader(group[0])
+			br := acc.MessageReader(ctx, group[0])
 			defer br.Close()
 			var e error
 			raw, e = io.ReadAll(br)
@@ -1611,7 +1611,7 @@ func (s *Server) emailCopy(ctx context.Context, acc store.Account, inv invocatio
 		if json.Unmarshal(obj["keywords"], &kw) == nil {
 			applyJMAPKeywords(m, kw)
 		}
-		if _, err := acc.DeliverMailbox(target, m, memBlob(raw)); err != nil {
+		if _, err := acc.DeliverMailbox(ctx, target, m, memBlob(raw)); err != nil {
 			if err == store.ErrOverQuota {
 				notCreated[cid] = map[string]any{"type": "overQuota"}
 			} else {
@@ -1656,14 +1656,14 @@ func (s *Server) searchSnippetGet(ctx context.Context, acc store.Account, inv in
 
 	var list []map[string]any
 	var notFound []string
-	err := acc.Tx(ctx, func(tx store.Tx) error {
+	err := acc.ReadTx(ctx, func(tx store.Tx) error {
 		for _, id := range ids {
 			group, ok := s.emailGroup(tx, acc, id)
 			if !ok {
 				notFound = append(notFound, id)
 				continue
 			}
-			br := acc.MessageReader(group[0])
+			br := acc.MessageReader(ctx, group[0])
 			data, e := io.ReadAll(br)
 			br.Close()
 			if e != nil {

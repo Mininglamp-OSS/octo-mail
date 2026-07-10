@@ -57,6 +57,12 @@ type Account interface {
 	// lock is taken inside write transactions.
 	Tx(ctx context.Context, fn func(Tx) error) error
 
+	// ReadTx runs fn in a read-only transaction: no advisory lock (concurrent
+	// reads don't serialize), a single MVCC snapshot, and no changelog flush or
+	// publish. fn must not mutate — the backend opens it read-only. Use for pure
+	// reads (IMAP FETCH/SEARCH/STATUS/SORT, read-only JMAP/webapi GETs).
+	ReadTx(ctx context.Context, fn func(Tx) error) error
+
 	// NextModSeq returns the next account log offset (= changelog_seq + 1).
 	NextModSeq(tx Tx) (ModSeq, error)
 	NextUIDValidity(tx Tx) (uint32, error)
@@ -114,7 +120,7 @@ type Account interface {
 	// ChangeAddUID entry, updates projections — all in tx.
 	MessageAdd(tx Tx, mb *Mailbox, m *Message, body BlobReader, opts AddOpts) ([]Change, error)
 	// DeliverMailbox is the inbound convenience path used by smtpserver.
-	DeliverMailbox(mailbox string, m *Message, body BlobReader) ([]Change, error)
+	DeliverMailbox(ctx context.Context, mailbox string, m *Message, body BlobReader) ([]Change, error)
 	MessageRemove(tx Tx, modseq ModSeq, mb *Mailbox, opts RemoveOpts, msgs ...Message) (ChangeRemoveUIDs, ChangeMailboxCounts, error)
 
 	// MessagesByEmailID returns all live rows sharing an effective email identity
@@ -131,7 +137,8 @@ type Account interface {
 	AddSibling(tx Tx, src Message, mb *Mailbox) (Message, []Change, error)
 
 	// MessageReader streams a message body (MsgPrefix + blob) from the blob store.
-	MessageReader(m Message) BlobReader
+	// ctx bounds the underlying blob reads (cancellation/deadline).
+	MessageReader(ctx context.Context, m Message) BlobReader
 
 	// CanAddMessageSize checks per-account and per-tenant quota.
 	CanAddMessageSize(tx Tx, size int64) (ok bool, maxSize int64, err error)

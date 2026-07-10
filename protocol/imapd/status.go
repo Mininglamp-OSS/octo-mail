@@ -58,18 +58,13 @@ func (c *conn) cmdStatus(tag, args string) {
 
 	var mb *store.Mailbox
 	var totalSize int64
-	var deleted int
 	needSize := false
-	needDeleted := false
 	for _, it := range items {
 		if it == "SIZE" {
 			needSize = true
 		}
-		if it == "DELETED" {
-			needDeleted = true
-		}
 	}
-	err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
+	err := c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 		m, err := c.acc.MailboxFind(tx, name)
 		if err != nil {
 			return err
@@ -78,16 +73,15 @@ func (c *conn) cmdStatus(tag, args string) {
 			return errNo("mailbox does not exist")
 		}
 		mb = m
-		if needSize || needDeleted {
+		// DELETED comes from the maintained c_deleted counter (mb.Deleted); only
+		// SIZE still needs a scan (no per-mailbox byte counter is summed per STATUS).
+		if needSize {
 			msgs, err := tx.QueryMessage().FilterMailbox(m.ID).List()
 			if err != nil {
 				return err
 			}
 			for _, msg := range msgs {
 				totalSize += msg.Size
-				if msg.Deleted {
-					deleted++
-				}
 			}
 		}
 		return nil
@@ -113,7 +107,7 @@ func (c *conn) cmdStatus(tag, args string) {
 		case "SIZE":
 			parts = append(parts, fmt.Sprintf("SIZE %d", totalSize))
 		case "DELETED":
-			parts = append(parts, fmt.Sprintf("DELETED %d", deleted))
+			parts = append(parts, fmt.Sprintf("DELETED %d", mb.Deleted))
 		case "MAILBOXID":
 			parts = append(parts, fmt.Sprintf("MAILBOXID (%s)", mailboxObjectID(mb.ID)))
 		case "RECENT":

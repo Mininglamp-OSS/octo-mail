@@ -102,7 +102,7 @@ func (c *conn) cmdList(tag, args string) {
 	}
 
 	var mbs []store.Mailbox
-	err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
+	err := c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 		var e error
 		mbs, e = tx.QueryMailbox().List()
 		return e
@@ -184,7 +184,7 @@ func (c *conn) cmdLsub(tag, args string) {
 	pattern := ref + unquote(strings.TrimSpace(patTok))
 
 	var mbs []store.Mailbox
-	err := c.acc.Tx(c.ctx, func(tx store.Tx) error {
+	err := c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 		var e error
 		mbs, e = tx.QueryMailbox().List()
 		return e
@@ -342,7 +342,7 @@ func (c *conn) emitStatus(name string, items []string) {
 	var mb *store.Mailbox
 	var totalSize int64
 	var deleted int
-	_ = c.acc.Tx(c.ctx, func(tx store.Tx) error {
+	_ = c.acc.ReadTx(c.ctx, func(tx store.Tx) error {
 		m, err := c.acc.MailboxFind(tx, name)
 		if err != nil || m == nil {
 			return err

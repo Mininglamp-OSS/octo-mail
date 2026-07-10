@@ -402,7 +402,7 @@ func (s sSeqSet) match(_ *conn, _ store.Message, seq, total uint32) bool {
 // --- helpers ---
 
 func (c *conn) messageBytes(m store.Message) string {
-	r := c.acc.MessageReader(m)
+	r := c.acc.MessageReader(c.ctx, m)
 	data, _ := io.ReadAll(r)
 	r.Close()
 	return string(data)
