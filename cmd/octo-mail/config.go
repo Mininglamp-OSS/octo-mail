@@ -111,6 +111,22 @@ func validate(cfg config, log *slog.Logger) error {
 			"or bind OCTO_MAIL_ADMIN_ADDR to loopback (e.g. 127.0.0.1:8081)", "admin_addr", cfg.adminAddr)
 	}
 
+	// ACME needs a listener that answers tls-alpn-01, which the CA performs on port
+	// 443 only — the JMAP/webmail HTTPS listener (it carries the acme-tls/1
+	// responder). If ACME is enabled but that listener is absent or not on :443, the
+	// leader orders but validation never completes and TLS silently stays down
+	// cluster-wide — warn loudly at startup.
+	if cfg.acmeDirectory != "" && cfg.acmeContact != "" {
+		if cfg.jmapAddr == "" {
+			log.Warn("ACME is enabled but the JMAP/webmail HTTPS listener (OCTO_MAIL_JMAP_ADDR) is disabled: " +
+				"nothing will answer tls-alpn-01 on :443 and certificate issuance cannot complete")
+		} else if _, port, err := net.SplitHostPort(cfg.jmapAddr); err != nil || port != "443" {
+			log.Warn("ACME is enabled but OCTO_MAIL_JMAP_ADDR is not on port 443: tls-alpn-01 validation "+
+				"lands on :443, so the ACME-serving HTTPS listener must be reachable there (directly or via an "+
+				"L4/SNI-passthrough proxy), else issuance will not complete", "jmap_addr", cfg.jmapAddr)
+		}
+	}
+
 	// Warn: env values that were set but didn't parse, so an operator sees the typo
 	// instead of silently getting the default. The load helpers fold a parse error
 	// to the default (no behavior change); this re-checks the raw strings.

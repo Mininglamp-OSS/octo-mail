@@ -31,10 +31,14 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	xacme "golang.org/x/crypto/acme"
 
@@ -43,6 +47,9 @@ import (
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/mlog"
 )
+
+// timeNow is overridable in tests; defaults to time.Now.
+var timeNow = time.Now
 
 // Config is the ACME configuration (from cmd/octo-mail env vars).
 type Config struct {
@@ -70,6 +77,12 @@ type Manager struct {
 	// no-op and this node always issues.
 	clustered bool
 	isLeader  atomic.Bool
+	// cache is the shared autocert.Cache (nil in single-node mode). A follower reads
+	// certs DIRECTLY from it (serveCachedCert) rather than via autocert's
+	// GetCertificate — because autocert's cert() arms a background renewal timer on
+	// every cache-hit, which would later order a renewal ON THE FOLLOWER, defeating
+	// leader-gating. Direct serving never touches autocert's renewer.
+	cache autocert.Cache
 }
 
 // New constructs the ACME manager and registers the allowed hostnames.
@@ -120,6 +133,7 @@ func New(cfg Config) (*Manager, error) {
 		m.Manager.Cache = cfg.Cache
 		m.Manager.Client.Key = nil
 		mgr.clustered = true
+		mgr.cache = cfg.Cache
 	}
 	return mgr, nil
 }
@@ -147,16 +161,17 @@ func (m *Manager) servingConfig(withHTTP2 bool) *tls.Config {
 		if len(hello.SupportedProtos) == 1 && hello.SupportedProtos[0] == xacme.ALPNProto {
 			return inner(hello)
 		}
-		// Follower (clustered, not leader): serve-only. Probe the cache; if there is
-		// no usable cert, return (nil, nil) — a TLS unrecognized_name alert — instead
-		// of letting autocert order (which would race the leader / duplicate accounts).
+		// Follower (clustered, not leader): serve-only, DIRECTLY from the shared
+		// cache. We must NOT delegate to autocert's GetCertificate even on a cache
+		// hit: autocert.cert() arms a background renewal timer on every hit, which
+		// would later order a renewal on this follower (off-leader), reintroducing
+		// the H17 multi-node ordering race for the steady-state renewal case. Direct
+		// serving returns the cached cert without touching autocert's renewer; a miss
+		// returns (nil, nil) → TLS unrecognized_name (no order).
 		if m.clustered && !m.isLeader.Load() {
-			host := dns.Domain{ASCII: strings.TrimSuffix(hello.ServerName, ".")}
-			if ok, err := m.m.CertAvailable(hello.Context(), m.log, host); err != nil || !ok {
-				return nil, nil
-			}
+			return m.serveCachedCert(hello)
 		}
-		return inner(hello) // leader may order on a cache miss; follower cache-hit serves
+		return inner(hello) // leader may order on a cache miss; single-node always issues
 	}
 	protos := []string{xacme.ALPNProto}
 	if withHTTP2 {
@@ -182,13 +197,107 @@ func (m *Manager) MailTLSConfig() *tls.Config { return m.servingConfig(false) }
 // config (no h2), now including the acme-tls/1 responder proto.
 func (m *Manager) TLSConfig() *tls.Config { return m.servingConfig(false) }
 
+// serveCachedCert returns the cached certificate for hello's SNI, read DIRECTLY
+// from the shared cache (no autocert state, no renewal timer). It picks the ECDSA
+// or RSA variant by client capability (mirroring autocert's selection), so a
+// modern client gets the ECDSA cert and a legacy client the RSA one. A cache miss
+// or unusable/expired cert returns (nil, nil) — a TLS unrecognized_name alert.
+// Used only on a follower; the leader/single-node path goes through autocert.
+func (m *Manager) serveCachedCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if m.cache == nil {
+		return nil, nil
+	}
+	name := strings.TrimSuffix(hello.ServerName, ".")
+	if name == "" {
+		name = m.fallback.ASCII // SNI-less client → fallback host (matches TLSConfig fallbackNoSNI)
+	}
+	if name == "" {
+		return nil, nil
+	}
+	// Prefer ECDSA; fall back to the "+rsa" variant for legacy clients. Try the
+	// client-preferred type first, then the other, so we serve whatever is cached.
+	keys := []string{name, name + "+rsa"}
+	if !supportsECDSA(hello) {
+		keys = []string{name + "+rsa", name}
+	}
+	ctx := hello.Context()
+	for _, k := range keys {
+		data, err := m.cache.Get(ctx, k)
+		if err != nil {
+			continue // ErrCacheMiss or transient — try the other variant
+		}
+		cert, ok := parseCachedKeycert(data)
+		if !ok {
+			continue
+		}
+		// Serve only a currently-valid cert (the leader renews before expiry).
+		if now := timeNow(); cert.Leaf != nil && (now.Before(cert.Leaf.NotBefore) || now.After(cert.Leaf.NotAfter)) {
+			continue
+		}
+		return cert, nil
+	}
+	return nil, nil
+}
+
+// parseCachedKeycert decodes autocert's cached keycert blob (PEM private key
+// followed by one or more PEM certificates) into a usable *tls.Certificate with a
+// parsed Leaf. Returns ok=false on any malformation.
+func parseCachedKeycert(data []byte) (*tls.Certificate, bool) {
+	priv, rest := pem.Decode(data)
+	if priv == nil || !strings.Contains(priv.Type, "PRIVATE") {
+		return nil, false
+	}
+	key, err := parsePrivateKey(priv.Bytes)
+	if err != nil {
+		return nil, false
+	}
+	var chain [][]byte
+	for len(rest) > 0 {
+		var b *pem.Block
+		b, rest = pem.Decode(rest)
+		if b == nil {
+			break
+		}
+		if b.Type == "CERTIFICATE" {
+			chain = append(chain, b.Bytes)
+		}
+	}
+	if len(chain) == 0 {
+		return nil, false
+	}
+	leaf, err := x509.ParseCertificate(chain[0])
+	if err != nil {
+		return nil, false
+	}
+	return &tls.Certificate{Certificate: chain, PrivateKey: key, Leaf: leaf}, true
+}
+
 // EnsureCert proactively obtains (or renews) the certificate for host, so the
 // leader issues ahead of client traffic and re-establishes autocert's in-memory
-// renew timers after a restart. Uses the RAW autocert GetCertificate — NOT the
-// autotls logging wrapper, which dereferences hello.Conn and would panic on this
-// synthetic ClientHelloInfo. Call only on the leader (the coordinator's Tick).
+// renew timers after a restart. It warms BOTH the ECDSA and RSA variants: a
+// synthetic hello with no cipher/curve info makes autocert pick RSA, but real
+// clients overwhelmingly negotiate ECDSA — and the follower serve path looks up the
+// ECDSA key first — so warming only RSA would leave the cert clients actually use
+// unissued. Uses the RAW autocert GetCertificate — NOT the autotls logging wrapper,
+// which dereferences hello.Conn and would panic on a synthetic ClientHelloInfo.
+// Call only on the leader (the coordinator's Tick).
 func (m *Manager) EnsureCert(host dns.Domain) error {
-	_, err := m.m.Manager.GetCertificate(&tls.ClientHelloInfo{ServerName: host.ASCII})
+	// ECDSA variant: advertise ECDSA capability so supportsECDSA() is true.
+	ecdsaHello := &tls.ClientHelloInfo{
+		ServerName:       host.ASCII,
+		SignatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
+		SupportedCurves:  []tls.CurveID{tls.CurveP256},
+		CipherSuites:     []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+	}
+	if _, err := m.m.Manager.GetCertificate(ecdsaHello); err != nil {
+		return err
+	}
+	// RSA variant: no ECDSA capability → autocert picks RSA (for legacy clients).
+	rsaHello := &tls.ClientHelloInfo{
+		ServerName:   host.ASCII,
+		CipherSuites: []uint16{tls.TLS_RSA_WITH_AES_128_GCM_SHA256},
+	}
+	_, err := m.m.Manager.GetCertificate(rsaHello)
 	return err
 }
 
@@ -198,6 +307,75 @@ func (m *Manager) EnsureCert(host dns.Domain) error {
 // is only needed for a dedicated challenge-only listener.)
 func (m *Manager) ACMEChallengeTLSConfig() *tls.Config {
 	return m.m.ACMETLSConfig
+}
+
+// supportsECDSA reports whether the client can use an ECDSA certificate — a
+// verbatim port of autocert's unexported helper (we need the same decision on the
+// direct follower serve path to pick the ECDSA vs RSA cached variant).
+func supportsECDSA(hello *tls.ClientHelloInfo) bool {
+	if hello.SignatureSchemes != nil {
+		ecdsaOK := false
+	schemeLoop:
+		for _, scheme := range hello.SignatureSchemes {
+			const tlsECDSAWithSHA1 tls.SignatureScheme = 0x0203
+			switch scheme {
+			case tlsECDSAWithSHA1, tls.ECDSAWithP256AndSHA256,
+				tls.ECDSAWithP384AndSHA384, tls.ECDSAWithP521AndSHA512:
+				ecdsaOK = true
+				break schemeLoop
+			}
+		}
+		if !ecdsaOK {
+			return false
+		}
+	}
+	if hello.SupportedCurves != nil {
+		ecdsaOK := false
+		for _, curve := range hello.SupportedCurves {
+			if curve == tls.CurveP256 {
+				ecdsaOK = true
+				break
+			}
+		}
+		if !ecdsaOK {
+			return false
+		}
+	}
+	for _, suite := range hello.CipherSuites {
+		switch suite {
+		case tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305:
+			return true
+		}
+	}
+	return false
+}
+
+// parsePrivateKey parses a DER private key (PKCS#1, PKCS#8, or SEC1 EC) — a
+// verbatim port of autocert's unexported helper, for the direct follower serve.
+func parsePrivateKey(der []byte) (crypto.Signer, error) {
+	if key, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		return key, nil
+	}
+	if key, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+		switch key := key.(type) {
+		case *rsa.PrivateKey:
+			return key, nil
+		case *ecdsa.PrivateKey:
+			return key, nil
+		default:
+			return nil, errors.New("acme: unknown PKCS#8 private key type")
+		}
+	}
+	if key, err := x509.ParseECPrivateKey(der); err == nil {
+		return key, nil
+	}
+	return nil, errors.New("acme: failed to parse private key")
 }
 
 // SetACMEHTTPClient overrides the HTTP client the ACME account uses to reach the

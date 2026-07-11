@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -77,6 +78,33 @@ func seedKeycertKey(t *testing.T, c *memCache, cacheKey, host string) {
 		t.Fatal(err)
 	}
 	pem.Encode(&buf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := c.Put(context.Background(), cacheKey, buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedRSAKeycert is like seedKeycertKey but with an RSA key, for exercising the
+// follower's "+rsa" variant selection with a legacy (RSA-kx) client.
+func seedRSAKeycert(t *testing.T, c *memCache, cacheKey, host string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(4),
+		Subject:      pkix.Name{CommonName: host},
+		DNSNames:     []string{host},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(90 * 24 * time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	pem.Encode(&buf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der})
 	if err := c.Put(context.Background(), cacheKey, buf.Bytes()); err != nil {
 		t.Fatal(err)
@@ -211,4 +239,85 @@ func contains(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// TestFollowerServesRSAVariantForLegacyClient proves the direct follower serve
+// path selects the "+rsa" cached variant for a client without ECDSA capability —
+// so warming/serving isn't limited to the ECDSA cert (the review's #32-R2 concern).
+// A client offering only an RSA cipher suite must get the cert cached under
+// "<host>+rsa"; the ECDSA "<host>" entry is deliberately left absent so a wrong
+// selection would fail the handshake.
+func TestFollowerServesRSAVariantForLegacyClient(t *testing.T) {
+	cache := newMemCache()
+	const host = "legacy.example"
+	seedRSAKeycert(t, cache, host+"+rsa", host) // only the RSA variant is cached
+
+	m := newClusteredManager(t, cache, host) // follower
+	cfg := m.HTTPSTLSConfig()
+
+	// RSA-only client (no ECDSA sig schemes / curves / suites) → serveCachedCert
+	// must look up "<host>+rsa" and serve it.
+	cconn, sconn := net.Pipe()
+	defer cconn.Close()
+	defer sconn.Close()
+	_ = cconn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = sconn.SetDeadline(time.Now().Add(5 * time.Second))
+	go func() { _ = tls.Server(sconn, cfg).HandshakeContext(context.Background()) }()
+	client := tls.Client(cconn, &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true,
+		// An ECDHE_RSA suite: RSA server cert, no ECDSA capability → supportsECDSA is
+		// false → serveCachedCert selects the "+rsa" variant. (Avoids the TLS-1.2
+		// RSA-key-exchange suites Go disables by default.)
+		CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+		MaxVersion:   tls.VersionTLS12, // TLS1.3 ignores CipherSuites; pin 1.2 to force the RSA-cert path
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err := client.HandshakeContext(context.Background()); err != nil {
+		t.Fatalf("legacy RSA client handshake failed — follower did not serve the +rsa variant: %v", err)
+	}
+	t.Logf("OK: follower serves the +rsa cached variant to a legacy (non-ECDSA) client")
+}
+
+// TestFollowerRejectsExpiredCachedCert proves the direct serve path does NOT serve
+// an expired cached cert (it returns no-cert → unrecognized_name), so a stale entry
+// can't be served past its validity.
+func TestFollowerRejectsExpiredCachedCert(t *testing.T) {
+	cache := newMemCache()
+	const host = "expired.example"
+	seedExpiredKeycert(t, cache, host)
+
+	m := newClusteredManager(t, cache, host) // follower
+	err, _ := handshake(t, m.HTTPSTLSConfig(), host, []string{"http/1.1"})
+	if err == nil {
+		t.Fatal("follower served an expired cached cert — expected no-cert (unrecognized_name)")
+	}
+	t.Logf("OK: follower does not serve an expired cached cert: %v", err)
+}
+
+// seedExpiredKeycert seeds a cert whose validity is entirely in the past.
+func seedExpiredKeycert(t *testing.T, c *memCache, host string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: host},
+		DNSNames:     []string{host},
+		NotBefore:    time.Now().Add(-48 * time.Hour),
+		NotAfter:     time.Now().Add(-24 * time.Hour), // expired
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	pem.Encode(&buf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := c.Put(context.Background(), host, buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
 }
