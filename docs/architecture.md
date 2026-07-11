@@ -32,7 +32,7 @@ mailflow/       【邮件流】邮件进出的流水线
 
 security/       【横切安全】
   auth/           argon2id + SCRAM-SHA-256
-  acme/           ACME/autotls (autotls 包装)
+  acme/           ACME/autotls (autotls 包装; 共享 PG 缓存 + leader 签发, 见 #32)
   privsep/        特权端口 bind-then-drop 降权
 
 ops/            【运维】

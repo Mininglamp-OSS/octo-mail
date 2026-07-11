@@ -44,6 +44,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-mail/security/privsep"
 	"github.com/Mininglamp-OSS/octo-mail/storage/postgres"
 	"github.com/Mininglamp-OSS/octo-mail/webui"
+	"github.com/mjl-/autocert"
 	"github.com/mjl-/mox/dmarc"
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/ratelimit"
@@ -193,6 +194,12 @@ func run() error {
 			"smtp-submission": cfg.submissionAddr,
 			"imap":            cfg.imapAddr,
 		}
+		// The JMAP/webmail HTTPS listener carries the ACME tls-alpn-01 responder and
+		// is typically on the privileged :443, so prebind it too (before dropping
+		// root) when ACME is enabled — otherwise the CA's challenge can't reach it.
+		if cfg.jmapAddr != "" && cfg.acmeDirectory != "" && cfg.acmeContact != "" {
+			addrs["jmap"] = cfg.jmapAddr
+		}
 		prebound, err = privsep.Sequence(addrs, ids, privsep.DropPrivileges)
 		if err != nil {
 			return fmt.Errorf("privsep: %w", err)
@@ -200,11 +207,17 @@ func run() error {
 		log.Info("privilege separation: bound privileged ports, dropped to unprivileged user", "uid", ids.UID, "gid", ids.GID)
 	}
 
-	// Optional ACME/autotls: when configured, listeners can use automatic certs.
-	// Real issuance needs a reachable ACME directory + challenge reachability
-	// (deployment-layer); here we construct the manager and expose its TLS config.
-	var acmeTLS *tls.Config
+	// Optional ACME/autotls: when configured, listeners use automatic certs.
+	// In shared mode (default when ACME is enabled) the account key + certs + the
+	// tls-alpn-01 challenge tokens live in a shared Postgres cache and issuance is
+	// leader-gated, so the stateless cluster runs built-in ACME safely (issue #32).
+	// Set OCTO_MAIL_ACME_SHARED=0 for the legacy node-local single-node behavior.
+	var acmeMail, acmeHTTPS *tls.Config
 	if cfg.acmeDirectory != "" && cfg.acmeContact != "" {
+		var acmeCache autocert.Cache
+		if cfg.acmeShared {
+			acmeCache = postgres.AcmeCache{Pool: s.Pool}
+		}
 		am, err := acme.New(acme.Config{
 			CacheDir:     cfg.acmeCacheDir,
 			ContactEmail: cfg.acmeContact,
@@ -212,19 +225,49 @@ func run() error {
 			Hostnames:    cfg.acmeHosts,
 			Fallback:     dns.Domain{ASCII: cfg.hostname},
 			Shutdown:     ctx.Done(),
+			Cache:        acmeCache,
 		})
 		if err != nil {
 			return fmt.Errorf("acme: %w", err)
 		}
-		acmeTLS = am.TLSConfig()
-		log.Info("ACME/autotls enabled", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts)
-		// H17: the ACME cache (account key + certs) is node-local, so built-in ACME
-		// is single-node only. Running it on multiple nodes makes each register its
-		// own account and race to order the same certs (Let's Encrypt rate limits),
-		// and tls-alpn-01 challenges can land on a node that didn't create the order.
-		// Multi-node deployments must terminate TLS at a shared front proxy or supply
-		// certs externally. Leader-gated cluster issuance is tracked as a follow-up.
-		log.Warn("built-in ACME is single-node only (node-local cert cache); for multi-node, terminate TLS at a shared proxy or provision certs externally")
+		acmeMail = am.MailTLSConfig()
+		acmeHTTPS = am.HTTPSTLSConfig()
+		if cfg.acmeShared {
+			log.Info("ACME/autotls enabled (shared cache, leader-gated issuance)", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts)
+			// Leader-gated issuance: only the leader orders certs (into the shared
+			// cache); followers serve certs — and answer tls-alpn-01 challenges — from
+			// the cache and never order. The leader Tick pre-warms/renews each host so
+			// issuance happens ahead of client traffic and autocert's renew timers are
+			// re-established after a restart. tls-alpn-01 validation lands on :443, so
+			// the HTTPS listener must be reachable there (see the JMAP wiring below).
+			const acmeLeaderKey = int64(5) // advisory-lock objid within lockClassLeader; must fit int32
+			acmeCoord := ha.NewCoordinator(ha.New(s.Pool, acmeLeaderKey, cfg.nodeID), 5*time.Minute)
+			acmeCoord.OnElected = func(context.Context) {
+				am.SetLeader(true)
+				log.Info("elected ACME issuance leader", "node", cfg.nodeID)
+			}
+			acmeCoord.OnLost = func() {
+				am.SetLeader(false)
+				log.Info("lost ACME issuance leadership", "node", cfg.nodeID)
+			}
+			acmeCoord.Tick = func(ctx context.Context) {
+				for _, h := range cfg.acmeHosts {
+					if err := am.EnsureCert(h); err != nil {
+						log.WarnContext(ctx, "ACME pre-warm/renew", "host", h.ASCII, "err", err)
+					}
+				}
+			}
+			go acmeCoord.Run(ctx)
+		} else {
+			log.Info("ACME/autotls enabled", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts)
+			// Legacy node-local mode (OCTO_MAIL_ACME_SHARED=0): the cache (account key
+			// + certs) is a node-local directory, so built-in ACME is single-node only.
+			// Running it on multiple nodes makes each register its own account and race
+			// to order the same certs, and a tls-alpn-01 challenge can land on a node
+			// that didn't create the order. Multi-node deployments must either enable
+			// the shared cache (the default) or terminate TLS at a shared proxy.
+			log.Warn("built-in ACME is in node-local (single-node) mode; enable the shared cache (unset OCTO_MAIL_ACME_SHARED=0) or terminate TLS at a shared proxy for multi-node")
+		}
 	}
 
 	// Inbound authenticator (SPF/DKIM/DMARC/iprev/DNSBL) for the MX listener.
@@ -313,7 +356,7 @@ func run() error {
 	}
 	// SMTP submission (:587).
 	if cfg.submissionAddr != "" {
-		sub := &smtpd.Server{Dir: dir, Hostname: cfg.hostname, MaxSize: cfg.maxSize, Submission: submitter}
+		sub := &smtpd.Server{Dir: dir, Hostname: cfg.hostname, MaxSize: cfg.maxSize, Submission: submitter, TLSConfig: acmeMail}
 		// BURL (RFC 4468): resolve an authorized IMAP URL to message bytes within
 		// the submitting account, reusing the IMAP URLAUTH validator.
 		sub.BURLResolver = func(ctx context.Context, accountID int64, authURL string) ([]byte, bool) {
@@ -335,7 +378,7 @@ func run() error {
 
 	// IMAP (:143).
 	if cfg.imapAddr != "" {
-		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeTLS, MaxSize: cfg.maxSize, LoginLimiter: loginLimiter}
+		imap := &imapd.Server{Dir: dir, Junk: junkMgr, TLSConfig: acmeMail, MaxSize: cfg.maxSize, LoginLimiter: loginLimiter}
 		go serveTCPListener(ctx, log, "imap", cfg.imapAddr, prebound["imap"], errc, cfg.maxConns, drain, func(nc net.Conn) { _ = imap.Serve(ctx, nc) })
 	}
 	// JMAP (HTTP) + webmail SPA (same origin, so the SPA's /jmap/* fetches work).
@@ -347,8 +390,10 @@ func run() error {
 		mux.Handle("/webapi/", wa.Handler())
 		mux.Handle("/webmail", webui.Handler())
 		mux.Handle("/webmail/", webui.Handler())
-		srv := &http.Server{Addr: cfg.jmapAddr, Handler: mux}
-		go serveHTTP(log, "jmap+webmail", srv, cfg.maxConns, drain, errc)
+		// With ACME enabled the HTTPS config carries the tls-alpn-01 responder, so
+		// this listener (on :443) both serves web traffic and answers ACME challenges.
+		srv := &http.Server{Addr: cfg.jmapAddr, Handler: mux, TLSConfig: acmeHTTPS}
+		go serveHTTP(log, "jmap+webmail", srv, cfg.maxConns, drain, prebound["jmap"], errc)
 	}
 	// Admin/account API + healthz (HTTP).
 	if cfg.adminAddr != "" {
@@ -358,7 +403,7 @@ func run() error {
 		as := &webadmin.Server{Pool: s.Pool, Dir: dir, Reputation: repo, AdminToken: cfg.adminToken, Log: log,
 			QueueFailDSN: failDSN.Generate}
 		srv := &http.Server{Addr: cfg.adminAddr, Handler: as.Handler()}
-		go serveHTTP(log, "admin", srv, cfg.maxConns, drain, errc)
+		go serveHTTP(log, "admin", srv, cfg.maxConns, drain, nil, errc)
 	}
 
 	// --- Background workers ---
@@ -788,7 +833,12 @@ func serveTCPListener(ctx context.Context, log *slog.Logger, name, addr string, 
 // admin HTTP listeners would otherwise be the only entry doors without a
 // connection cap, and MaxBytesReader/body caps don't fire until a request fully
 // arrives — so a trickle of headers could hold goroutines/FDs indefinitely.
-func serveHTTP(log *slog.Logger, name string, srv *http.Server, maxConns int, drain *drainSet, errc chan<- error) {
+//
+// preboundLn, when non-nil, is a listener bound before privilege drop (privsep) —
+// used for the ACME HTTPS listener on the privileged :443. When srv.TLSConfig is
+// set, the listener is wrapped in TLS (so the same door serves HTTPS and, via the
+// config's acme-tls/1 NextProto, answers tls-alpn-01 challenges).
+func serveHTTP(log *slog.Logger, name string, srv *http.Server, maxConns int, drain *drainSet, preboundLn net.Listener, errc chan<- error) {
 	// Timeouts bound how long a slow client can hold a connection before its
 	// request completes (headers, whole request, and idle keep-alive).
 	if srv.ReadHeaderTimeout == 0 {
@@ -802,13 +852,22 @@ func serveHTTP(log *slog.Logger, name string, srv *http.Server, maxConns int, dr
 	}
 	// Register for graceful Shutdown at drain time (replaces an abrupt Close).
 	drain.addServer(srv)
-	ln, err := net.Listen("tcp", srv.Addr)
-	if err != nil {
-		errc <- fmt.Errorf("%s listen %s: %w", name, srv.Addr, err)
-		return
+	ln := preboundLn
+	if ln == nil {
+		var err error
+		ln, err = net.Listen("tcp", srv.Addr)
+		if err != nil {
+			errc <- fmt.Errorf("%s listen %s: %w", name, srv.Addr, err)
+			return
+		}
 	}
 	if maxConns > 0 {
 		ln = &limitListener{Listener: ln, sem: make(chan struct{}, maxConns)}
+	}
+	// TLS wrap AFTER the conn cap so the cap still applies to TLS connections. The
+	// serving config's GetCertificate obtains/serves certs (and answers tls-alpn-01).
+	if srv.TLSConfig != nil {
+		ln = tls.NewListener(ln, srv.TLSConfig)
 	}
 	log.Info("listening", "service", name, "addr", ln.Addr().String())
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {

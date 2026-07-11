@@ -138,7 +138,7 @@ func TestServeHTTPConnCapAndTimeouts(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 	srv.Addr = addr
-	go serveHTTP(log, "test-http", srv, 2, &drainSet{}, errc)
+	go serveHTTP(log, "test-http", srv, 2, &drainSet{}, nil, errc)
 	defer srv.Close()
 
 	// Timeouts must be set by serveHTTP.

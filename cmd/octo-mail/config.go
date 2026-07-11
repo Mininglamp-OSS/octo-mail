@@ -275,14 +275,18 @@ type config struct {
 	sendRateMax    int64
 	sendRateWindow time.Duration
 
-	// ACME/autotls: when acmeDir URL is set, listeners use automatic certificates.
-	// NOTE: the ACME cache is node-local, so this is single-node only — multi-node
-	// deployments must terminate TLS at a shared proxy or provision certs
-	// externally (see H17; leader-gated cluster issuance is a tracked follow-up).
+	// ACME/autotls: when acmeDirectory URL + acmeContact are set, listeners use
+	// automatic certificates. acmeShared (default true) backs the ACME account key +
+	// certs with a shared Postgres cache and gates issuance on leader election, so
+	// built-in ACME is safe cluster-wide (issue #32): the leader orders, followers
+	// serve from the cache and answer tls-alpn-01 challenges (which requires the
+	// HTTPS listener to be reachable on :443). Set OCTO_MAIL_ACME_SHARED=0 for the
+	// legacy node-local single-node behavior.
 	acmeDirectory string
 	acmeContact   string
 	acmeCacheDir  string
 	acmeHosts     []dns.Domain
+	acmeShared    bool
 }
 
 func loadConfig() config {
@@ -351,6 +355,7 @@ func loadConfig() config {
 		acmeContact:   os.Getenv("OCTO_MAIL_ACME_CONTACT"),
 		acmeCacheDir:  envDefault("OCTO_MAIL_ACME_CACHE", "./acme"),
 		acmeHosts:     parseDomainList(os.Getenv("OCTO_MAIL_ACME_HOSTS")),
+		acmeShared:    os.Getenv("OCTO_MAIL_ACME_SHARED") != "0", // default on; "0" = legacy node-local
 	}
 }
 

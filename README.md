@@ -142,6 +142,12 @@ Anti-abuse, queue, ACME, and deliverability knobs (`OCTO_MAIL_REJECT_DMARC`,
 `OCTO_MAIL_GREYLIST`, `OCTO_MAIL_QUEUE_BACKOFF`, `OCTO_MAIL_ACME_HOSTS`, …) are
 documented alongside their defaults in `config.go`.
 
+Built-in ACME is **cluster-safe by default**: the account key, issued certs, and
+tls-alpn-01 challenge tokens live in a shared Postgres cache and issuance is
+leader-gated (one node orders, all serve). The ACME-serving HTTPS listener must be
+reachable on `:443` for tls-alpn-01 validation. Set `OCTO_MAIL_ACME_SHARED=0` for
+the legacy node-local single-node mode.
+
 The `octo-mail` binary also exposes operational subcommands:
 `serve`, `passwd`, `apikey`, `gendkim`, `export`, `import`.
 
