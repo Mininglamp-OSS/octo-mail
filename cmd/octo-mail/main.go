@@ -986,6 +986,19 @@ func (d *projectionDrainer) tick(ctx context.Context) {
 // at pref 0) when there are no MX records. Each candidate dials the host on port 25.
 func resolveMX(ctx context.Context, domain string) ([]submit.MXHost, error) {
 	mxs, err := net.DefaultResolver.LookupMX(ctx, domain)
+	if err != nil {
+		// Distinguish a definitive "no MX records" (NXDOMAIN / no such host) from a
+		// TEMPORARY DNS failure. On tempfail, return the error so the queue defers and
+		// retries rather than silently falling back to the domain's A/AAAA — which
+		// could deliver to the wrong host (or bypass a legitimate MX) during a DNS
+		// blip. Only a definitive no-records answer falls through to the implicit MX.
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && dnsErr.IsTemporary {
+			return nil, fmt.Errorf("mx lookup for %s (temporary): %w", domain, err)
+		}
+		// Definitive negative (or a non-DNSError we can't classify as temporary):
+		// treat as no MX and fall back to the implicit MX below.
+	}
 	if err != nil || len(mxs) == 0 {
 		// No usable MX: fall back to the domain itself (implicit MX).
 		return []submit.MXHost{{Host: dns.Domain{ASCII: domain}, Addr: net.JoinHostPort(domain, "25")}}, nil
