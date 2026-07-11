@@ -34,8 +34,8 @@ func TestSourceIPDialer(t *testing.T) {
 
 	const source = "127.0.0.1"
 	dialer := submit.SourceIPDialer(
-		func(ctx context.Context, domain string) (dns.Domain, string, error) {
-			return dns.Domain{ASCII: "mx.test"}, ln.Addr().String(), nil
+		func(ctx context.Context, domain string) ([]submit.MXHost, error) {
+			return []submit.MXHost{{Host: dns.Domain{ASCII: "mx.test"}, Addr: ln.Addr().String()}}, nil
 		},
 		func(ctx context.Context, domain string, mx dns.Domain) (net.IP, error) {
 			return net.ParseIP(source), nil
@@ -66,4 +66,91 @@ func TestSourceIPDialer(t *testing.T) {
 	}
 
 	t.Logf("OK: SourceIPDialer bound source %s; peer observed the same IP (multi-egress selection reaches the socket)", source)
+}
+
+// TestSourceIPDialerFailover proves #25-4: when the first MX candidate refuses
+// the TCP connection, the dialer advances to the next candidate rather than
+// failing the whole delivery attempt. The first host points at a closed port; the
+// second at a live listener. The dialer must return the live host.
+func TestSourceIPDialerFailover(t *testing.T) {
+	// A live listener for the SECOND candidate.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan struct{}, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- struct{}{}
+		c.Close()
+	}()
+
+	// A dead address for the FIRST candidate: bind then immediately close so the
+	// port is (almost certainly) refused.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.Addr().String()
+	dead.Close()
+
+	// pickSource must be called EXACTLY ONCE per delivery, even across failover:
+	// the source-IP lease has a side effect (it charges the IP's warmup/daily
+	// counter), so calling it per MX tried would over-count on every failover.
+	var pickCalls int
+	dialer := submit.SourceIPDialer(
+		func(ctx context.Context, domain string) ([]submit.MXHost, error) {
+			return []submit.MXHost{
+				{Host: dns.Domain{ASCII: "mx1.dead"}, Addr: deadAddr},
+				{Host: dns.Domain{ASCII: "mx2.live"}, Addr: ln.Addr().String()},
+			}, nil
+		},
+		func(ctx context.Context, domain string, mx dns.Domain) (net.IP, error) {
+			pickCalls++
+			return nil, nil // OS default source; we only count invocations
+		},
+	)
+
+	conn, host, err := dialer(context.Background(), "recipient.example")
+	if err != nil {
+		t.Fatalf("dial with failover: %v", err)
+	}
+	defer conn.Close()
+	if host.ASCII != "mx2.live" {
+		t.Fatalf("failover host = %s, want mx2.live (should have skipped the dead primary)", host.ASCII)
+	}
+	if pickCalls != 1 {
+		t.Fatalf("pickSource called %d times across failover, want exactly 1 (per-delivery lease, not per-host)", pickCalls)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("live MX did not accept the failover connection")
+	}
+	t.Logf("OK: dialer failed over from a refused primary MX to the live secondary; source leased once")
+}
+
+// TestSourceIPDialerAllDown proves the dialer returns an error (not a nil conn)
+// when every MX candidate is unreachable.
+func TestSourceIPDialerAllDown(t *testing.T) {
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.Addr().String()
+	dead.Close()
+
+	dialer := submit.SourceIPDialer(
+		func(ctx context.Context, domain string) ([]submit.MXHost, error) {
+			return []submit.MXHost{{Host: dns.Domain{ASCII: "mx.dead"}, Addr: deadAddr}}, nil
+		},
+		nil,
+	)
+	if _, _, err := dialer(context.Background(), "recipient.example"); err == nil {
+		t.Fatal("expected an error when all MX candidates are down, got nil")
+	}
 }

@@ -1,8 +1,8 @@
 // Package projections holds async, rebuildable folds of the change-log that do
 // not need read-your-write consistency — full-text search first. A projection
-// worker tails the log (here: messages by createseq, which equals the changelog
-// seq at insertion) behind a per-account high-water cursor, so delivery latency
-// is never coupled to indexing. Adding a projection means inserting a cursor at
+// worker folds the messages table by createseq (which equals the changelog seq
+// at insertion) behind a per-account high-water cursor, so delivery latency is
+// never coupled to indexing. Adding a projection means inserting a cursor at
 // 0 and letting the worker fold the whole history up to the live head, then stay
 // live — no lock, no downtime. Dropping and rebuilding is the same code path
 // from seq 0.

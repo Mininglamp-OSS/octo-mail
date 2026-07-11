@@ -163,6 +163,23 @@ CREATE TABLE IF NOT EXISTS tlsrpt_reports (
 );
 CREATE INDEX IF NOT EXISTS tlsrpt_reports_domain_idx ON tlsrpt_reports (domain);
 
+-- Per-tenant outbound send-rate limiter: a fixed-window counter (one row per
+-- tenant per window start) enforced on EVERY send regardless of the egress-IP
+-- pool. Warmup/per-IP daily caps only exist when the egress pool is enabled; this
+-- gives a baseline platform-wide throttle so a single tenant burst can't dominate
+-- outbound capacity (or a shared IP's reputation) even in the no-egress-pool
+-- default. The limiter increments count on each send attempt and blocks (defers)
+-- once count exceeds the configured cap for the current window. Elapsed-window
+-- rows are pruned by Service.PruneSendRate, run on the reputation-unpause cluster
+-- singleton's tick (which runs regardless of the egress pool), so the table stays
+-- bounded to roughly one row per active tenant.
+CREATE TABLE IF NOT EXISTS tenant_send_rate (
+    tenant_id    bigint NOT NULL REFERENCES tenants(id),
+    window_start timestamptz NOT NULL,               -- start of the fixed window (UTC)
+    count        bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, window_start)
+);
+
 -- Marker for once-per-day cluster-singleton maintenance (IP warmup advance +
 -- daily-counter reset). A single row; the leader's periodic tick only acts when
 -- the stored date is behind today's UTC date, so it runs exactly once per day

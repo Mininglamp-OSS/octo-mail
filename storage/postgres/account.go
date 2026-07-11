@@ -54,6 +54,11 @@ func (a *account) Tx(ctx context.Context, fn func(store.Tx) error) error {
 	var published []store.Change
 	var publishedHead store.ModSeq
 	err := pgx.BeginFunc(ctx, a.s.Pool, func(tx pgx.Tx) error {
+		// Per-account write serialization uses the ONE-key (64-bit) advisory-lock
+		// space, keyed by the full account id (never truncated). PostgreSQL keeps the
+		// one-key and two-key spaces disjoint, so this can never collide with the
+		// leader-election or schema-bootstrap locks (which use the two-key space with
+		// dedicated classids — see ops/ha.lockClassLeader and storage/postgres.Open).
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, a.id); err != nil {
 			return fmt.Errorf("advisory lock: %w", err)
 		}

@@ -57,6 +57,11 @@ type Msg struct {
 	Ret    string
 	EnvID  string
 	ORcpt  string
+	// Body8BitMIME / SMTPUTF8 carry the RFC 6152 / RFC 6531 extension requests from
+	// submission so delivery re-negotiates them with the next hop (req8bitmime /
+	// reqSMTPUTF8) instead of silently downgrading to 7bit/ASCII.
+	Body8BitMIME bool
+	SMTPUTF8     bool
 	// CreatedAt is when the message was first enqueued. Used to bound the total
 	// retry lifetime (give up once the message is older than MaxLifetime),
 	// independent of the attempt count. Zero if not loaded.
@@ -187,10 +192,10 @@ func EnqueueTx(ctx context.Context, tx pgx.Tx, m Msg) (int64, error) {
 	}
 	var id int64
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO queue (tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, next_attempt, hold, require_tls, dsn_notify, dsn_ret, dsn_envid, dsn_orcpt)
-		 VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,now()),$8,$9,$10,$11,$12,$13) RETURNING id`,
+		`INSERT INTO queue (tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, next_attempt, hold, require_tls, dsn_notify, dsn_ret, dsn_envid, dsn_orcpt, body_8bitmime, smtputf8)
+		 VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,now()),$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
 		m.TenantID, m.AccountID, m.MailFrom, m.RcptTo, m.BlobRef, m.Size, notBefore, hold, m.RequireTLS,
-		m.Notify, m.Ret, m.EnvID, m.ORcpt).Scan(&id); err != nil {
+		m.Notify, m.Ret, m.EnvID, m.ORcpt, m.Body8BitMIME, m.SMTPUTF8).Scan(&id); err != nil {
 		return 0, err
 	}
 	// Append the enqueued fact to the source-of-truth log (same tx as the
@@ -437,7 +442,8 @@ func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 		     LIMIT $3
 		 )
 		 RETURNING id, tenant_id, account_id, mail_from, rcpt_to, blob_ref, size, attempts, max_attempts, require_tls,
-		           COALESCE(dsn_notify,''), COALESCE(dsn_ret,''), COALESCE(dsn_envid,''), COALESCE(dsn_orcpt,''), created_at`,
+		           COALESCE(dsn_notify,''), COALESCE(dsn_ret,''), COALESCE(dsn_envid,''), COALESCE(dsn_orcpt,''),
+		           COALESCE(body_8bitmime,false), COALESCE(smtputf8,false), created_at`,
 		w.NodeID, w.lease().Seconds(), w.batch())
 	if err != nil {
 		return nil, err
@@ -447,7 +453,7 @@ func (w *Worker) claim(ctx context.Context) ([]Msg, error) {
 	for rows.Next() {
 		var m Msg
 		if err := rows.Scan(&m.ID, &m.TenantID, &m.AccountID, &m.MailFrom, &m.RcptTo, &m.BlobRef, &m.Size, &m.Attempts, &m.MaxAttempts, &m.RequireTLS,
-			&m.Notify, &m.Ret, &m.EnvID, &m.ORcpt, &m.CreatedAt); err != nil {
+			&m.Notify, &m.Ret, &m.EnvID, &m.ORcpt, &m.Body8BitMIME, &m.SMTPUTF8, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

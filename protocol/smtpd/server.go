@@ -229,6 +229,12 @@ type conn struct {
 	subNotify []string
 	subORcpt  []string
 
+	// Extension flags requested on MAIL FROM (RFC 6152 BODY=8BITMIME, RFC 6531
+	// SMTPUTF8), carried through to the outbound delivery so they are re-negotiated
+	// with the next hop rather than silently downgraded to 7bit/ASCII.
+	mailBody8bitmime bool
+	mailSMTPUTF8     bool
+
 	// holdUntil is the FUTURERELEASE (RFC 4865) release time from MAIL FROM
 	// HOLDFOR/HOLDUNTIL; zero means deliver immediately.
 	holdUntil time.Time
@@ -410,6 +416,8 @@ func (c *conn) reset() {
 	c.subORcpt = nil
 	c.dsnRet = ""
 	c.dsnEnvID = ""
+	c.mailBody8bitmime = false
+	c.mailSMTPUTF8 = false
 	c.holdUntil = time.Time{}
 	c.bdatBuf = nil
 	c.inBDAT = false
@@ -688,6 +696,10 @@ func (c *conn) cmdMail(rest string) {
 	// Capture DSN request parameters (RFC 3461): RET=FULL|HDRS, ENVID=<id>.
 	c.dsnRet = mailParamStr(rest, "RET")
 	c.dsnEnvID = mailParamStr(rest, "ENVID")
+	// Capture the body-type / UTF8 extension requests so delivery re-negotiates
+	// them (RFC 6152 BODY=8BITMIME, RFC 6531 SMTPUTF8 — a bare flag, no value).
+	c.mailBody8bitmime = strings.EqualFold(mailParamStr(rest, "BODY"), "8BITMIME")
+	c.mailSMTPUTF8 = mailParamFlag(rest, "SMTPUTF8")
 	// FUTURERELEASE (RFC 4865): HOLDFOR=<seconds> or HOLDUNTIL=<date-time> defers
 	// delivery. Only in submission mode; the two are mutually exclusive and bound
 	// to maxFutureRelease.
@@ -736,6 +748,58 @@ func mailParamStr(rest, key string) string {
 		}
 	}
 	return ""
+}
+
+// mailParamFlag reports whether a valueless ESMTP parameter (e.g. SMTPUTF8) is
+// present as a whitespace-separated token, case-insensitively.
+func mailParamFlag(rest, key string) bool {
+	up := strings.ToUpper(key)
+	for _, tok := range strings.Fields(rest) {
+		if strings.ToUpper(tok) == up {
+			return true
+		}
+	}
+	return false
+}
+
+// contains8bit reports whether the message contains any octet with the high bit
+// set — i.e. it is not 7-bit clean and genuinely needs 8BITMIME to reach the next
+// hop intact. Used to avoid requesting 8BITMIME (and risking a bounce from a
+// legacy peer) for a 7-bit message a client merely tagged as 8-bit.
+func contains8bit(data []byte) bool {
+	for _, b := range data {
+		if b >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
+// needsSMTPUTF8 reports whether SMTPUTF8 is genuinely required: the envelope
+// (MAIL FROM or any RCPT TO) or the message itself carries a non-ASCII byte.
+// SMTPUTF8 governs UTF-8 in the ENVELOPE/headers, not the body transfer, so an
+// ASCII-body message with a UTF-8 localpart still needs it — gating on the body
+// alone (contains8bit) would wrongly downgrade that valid case.
+func needsSMTPUTF8(mailFrom string, rcpts []string, data []byte) bool {
+	if !isASCII(mailFrom) {
+		return true
+	}
+	for _, r := range rcpts {
+		if !isASCII(r) {
+			return true
+		}
+	}
+	return contains8bit(data)
+}
+
+// isASCII reports whether s is pure 7-bit ASCII.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // hasDSNPerRcpt reports whether any per-recipient DSN param slot is non-empty, so
@@ -996,6 +1060,24 @@ func (c *conn) processData(data []byte) error {
 		// Enqueue to the shared outbound queue; the queue worker delivers. Carry
 		// the RFC 3461 DSN params (RET/ENVID per-message, NOTIFY/ORCPT per-rcpt).
 		dsnp := submit.DSNParams{Ret: c.dsnRet, EnvID: c.dsnEnvID}
+		// Only propagate the 8BITMIME/SMTPUTF8 requests when the message ACTUALLY
+		// needs them. Many MUAs tag every submission even for 7-bit/ASCII mail;
+		// forwarding that to a next hop lacking the extension makes mox return a
+		// permanent (8BITMIME) or deferred (SMTPUTF8) error and bounce mail that would
+		// otherwise deliver. The two needs differ:
+		//   - 8BITMIME is about the BODY transfer: needed iff the DATA has 8-bit octets.
+		//   - SMTPUTF8 is about UTF-8 in the ENVELOPE or headers: needed iff a MAIL
+		//     FROM / RCPT TO localpart (or the message itself) carries non-ASCII. An
+		//     ASCII body with a UTF-8 localpart still requires SMTPUTF8 (mox's client
+		//     enforces this), so it must NOT be gated on the body alone.
+		// c.mail* records what the client asked; the content checks record what is
+		// actually required — forward only the intersection.
+		if c.mailBody8bitmime && contains8bit(data) {
+			dsnp.Body8BitMIME = true
+		}
+		if c.mailSMTPUTF8 && needsSMTPUTF8(c.mailFrom, c.subRcpts, data) {
+			dsnp.SMTPUTF8 = true
+		}
 		if hasDSNPerRcpt(c.subNotify) || hasDSNPerRcpt(c.subORcpt) {
 			dsnp.Notify = make(map[string]string, len(c.subRcpts))
 			dsnp.ORcpt = make(map[string]string, len(c.subRcpts))

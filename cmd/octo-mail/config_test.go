@@ -48,7 +48,88 @@ func TestCheckVERPConfig(t *testing.T) {
 	}
 }
 
-// TestOpenBlobStoreSelectsBackend proves the H15 fix: openBlobStore picks the fs
+// TestValidateS3CredsFailFast proves #25-5: an S3 endpoint requires BOTH access
+// and secret (the hand-rolled SigV4 signer has no ambient-IAM path and the session
+// token only augments them), so an endpoint with missing/incomplete static creds
+// is a fatal misconfiguration caught at startup rather than at first request.
+func TestValidateS3CredsFailFast(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cases := []struct {
+		name    string
+		cfg     config
+		wantErr bool
+	}{
+		{"no s3 at all", config{}, false},
+		{"endpoint + static creds", config{s3Endpoint: "http://s3", s3Access: "a", s3Secret: "s"}, false},
+		{"endpoint + access+secret+token", config{s3Endpoint: "http://s3", s3Access: "a", s3Secret: "s", s3SessionToken: "t"}, false},
+		{"endpoint + session token only → refuse (signer needs secret)", config{s3Endpoint: "http://s3", s3SessionToken: "t"}, true},
+		{"endpoint + access but no secret → refuse", config{s3Endpoint: "http://s3", s3Access: "a"}, true},
+		{"endpoint + no creds → refuse", config{s3Endpoint: "http://s3"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validate(tc.cfg, log)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateAdminWarnsWhenExposed proves the admin-exposure warning: a
+// non-loopback admin listener with no token emits a warning (not a hard error),
+// while a loopback bind or a token present is silent.
+func TestValidateAdminWarnsWhenExposed(t *testing.T) {
+	cases := []struct {
+		name     string
+		cfg      config
+		wantWarn bool
+	}{
+		{"default :8081 (all ifaces) no token", config{adminAddr: ":8081"}, true},
+		{"0.0.0.0 no token", config{adminAddr: "0.0.0.0:8081"}, true},
+		{"loopback no token", config{adminAddr: "127.0.0.1:8081"}, false},
+		{"ipv6 loopback no token", config{adminAddr: "[::1]:8081"}, false},
+		{"localhost no token", config{adminAddr: "localhost:8081"}, false},
+		{"all ifaces WITH token", config{adminAddr: ":8081", adminToken: "secret"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf strings.Builder
+			log := slog.New(slog.NewTextHandler(&buf, nil))
+			if err := validate(tc.cfg, log); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			warned := strings.Contains(buf.String(), "admin API listens on a non-loopback")
+			if warned != tc.wantWarn {
+				t.Fatalf("admin warning = %v, want %v (log: %q)", warned, tc.wantWarn, buf.String())
+			}
+		})
+	}
+}
+
+// TestIsLoopbackAddr covers the listen-address loopback classifier directly.
+func TestIsLoopbackAddr(t *testing.T) {
+	cases := map[string]bool{
+		":8081":            false, // all interfaces
+		"0.0.0.0:8081":     false,
+		"[::]:8081":        false,
+		"127.0.0.1:8081":   true,
+		"[::1]:8081":       true,
+		"[::1]":            true,
+		"localhost:8081":   true,
+		"10.0.0.5:8081":    false,
+		"example.com:8081": false,
+	}
+	for addr, want := range cases {
+		if got := isLoopbackAddr(addr); got != want {
+			t.Errorf("isLoopbackAddr(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
 // backend when no S3 endpoint is configured (the shared helper the ops
 // subcommands now use, so export/import agree with the serve process instead of
 // hardcoding fs). The fs path is exercised directly; the S3 branch is covered by

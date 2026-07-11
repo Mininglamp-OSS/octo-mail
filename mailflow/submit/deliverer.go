@@ -239,7 +239,7 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, m queue.Msg) error {
 			envFrom = v
 		}
 	}
-	if err := cl.Deliver(ctx, envFrom, m.RcptTo, bodySize, bodyReader, false, false, false); err != nil {
+	if err := cl.Deliver(ctx, envFrom, m.RcptTo, bodySize, bodyReader, m.Body8BitMIME, m.SMTPUTF8, false); err != nil {
 		if d.OnSendError != nil {
 			d.OnSendError(ctx, m, err)
 		}

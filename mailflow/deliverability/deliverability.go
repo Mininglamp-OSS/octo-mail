@@ -88,6 +88,76 @@ type rowQuerier interface {
 // Service records reputation and gates sending.
 type Service struct {
 	Pool *pgxpool.Pool
+
+	// MaxPerWindow / RateWindow configure the per-tenant outbound send-rate limiter
+	// (see AllowSend). MaxPerWindow is the max sends allowed per tenant per window;
+	// zero disables the limiter entirely (unlimited — the historical behavior).
+	// RateWindow is the fixed window length; zero defaults to one minute when the
+	// limiter is enabled.
+	MaxPerWindow int64
+	RateWindow   time.Duration
+}
+
+// DefaultRateWindow is the fixed-window length used by AllowSend when RateWindow
+// is unset but the limiter is enabled (MaxPerWindow > 0).
+const DefaultRateWindow = time.Minute
+
+// AllowSend enforces the per-tenant outbound rate limit for one send attempt. It
+// atomically increments the current fixed-window counter for the tenant and
+// reports whether the tenant is still within its cap. It is a REAL limiter (the
+// attempt is counted), scoped per tenant so one tenant's burst never throttles
+// another. When MaxPerWindow is 0 the limiter is disabled and every send is
+// allowed (no DB write). Enforced for every tenant regardless of the egress-IP
+// pool, unlike warmup/per-IP caps which only apply when the pool is enabled.
+func (s *Service) AllowSend(ctx context.Context, tenantID int64) (bool, error) {
+	if s.MaxPerWindow <= 0 {
+		return true, nil // limiter disabled
+	}
+	window := s.RateWindow
+	if window <= 0 {
+		window = DefaultRateWindow
+	}
+	// Truncate now to the window start (UTC). One row per (tenant, window); the
+	// upsert-increment is atomic so concurrent sends on multiple nodes can't lose a
+	// count (no read-modify-write race).
+	var count int64
+	err := s.Pool.QueryRow(ctx,
+		`INSERT INTO tenant_send_rate (tenant_id, window_start, count)
+		 VALUES ($1, to_timestamp(floor(extract(epoch from now()) / $2) * $2), 1)
+		 ON CONFLICT (tenant_id, window_start)
+		 DO UPDATE SET count = tenant_send_rate.count + 1
+		 RETURNING count`,
+		tenantID, window.Seconds()).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count <= s.MaxPerWindow, nil
+}
+
+// PruneSendRate deletes tenant_send_rate rows for windows that have fully elapsed,
+// keeping only the current (and, defensively, the immediately previous) window.
+// The limiter only ever reads/writes the current window, so older rows are dead
+// weight; without this the table grows one row per tenant per window forever. Safe
+// to run from any cluster singleton on a periodic tick. A zero RateWindow (limiter
+// disabled) prunes nothing. Returns the number of rows removed.
+func (s *Service) PruneSendRate(ctx context.Context) (int64, error) {
+	window := s.RateWindow
+	if window <= 0 {
+		if s.MaxPerWindow <= 0 {
+			return 0, nil // limiter disabled; nothing writes the table
+		}
+		window = DefaultRateWindow
+	}
+	// Keep the current window and one prior (guards a tick landing just after a
+	// window boundary from deleting a row still being counted against).
+	ct, err := s.Pool.Exec(ctx,
+		`DELETE FROM tenant_send_rate
+		 WHERE window_start < to_timestamp(floor(extract(epoch from now()) / $1) * $1) - make_interval(secs => $1)`,
+		window.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
 }
 
 // GateResult is the send-gate decision for one (tenant, remote domain).

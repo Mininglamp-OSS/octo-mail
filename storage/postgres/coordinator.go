@@ -27,6 +27,11 @@ const notifyChannel = "octo_mail_changelog"
 // connection. Call once per node after Open. Runs until ctx is cancelled,
 // reconnecting (with backoff) across transient connection loss / PG restart /
 // failover so cross-node push is not permanently lost after a blip.
+//
+// This connection is held for the node's whole lifetime (never returned to the
+// pool while running), a permanent one-connection cost per node on top of any held
+// leaderships — see the pool-sizing note on ops/ha.Leader and the DSN
+// `pool_max_conns` knob in Open.
 func (s *Store) StartCoordinator(ctx context.Context) error {
 	conn, err := s.Pool.Acquire(ctx)
 	if err != nil {

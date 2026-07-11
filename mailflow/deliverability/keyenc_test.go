@@ -53,7 +53,7 @@ func TestDKIMKeyEncryptionAtRest(t *testing.T) {
 	if len(stored) == 64 {
 		t.Fatalf("private key stored as raw 64-byte plaintext — encryption not applied")
 	}
-	if !bytes.HasPrefix(stored, []byte("MENC1")) {
+	if !bytes.HasPrefix(stored, []byte("MENC2")) {
 		t.Fatalf("stored key lacks encryption magic prefix: %x", stored[:min(8, len(stored))])
 	}
 
@@ -89,5 +89,57 @@ func TestDKIMKeyEncryptionAtRest(t *testing.T) {
 		t.Fatalf("sign succeeded with NO cipher against encrypted key")
 	}
 
-	t.Logf("OK: DKIM key encrypted at rest (MENC1); correct secret signs+verifies; wrong/absent secret cannot sign")
+	t.Logf("OK: DKIM key encrypted at rest (MENC2); correct secret signs+verifies; wrong/absent secret cannot sign")
+}
+
+// TestDKIMKeyAADBinding proves the #25-3 AAD binding: a key encrypted for one
+// (tenant, domain, selector) row cannot be decrypted with any OTHER tuple, so a
+// ciphertext lifted from one row into another (a DB tamper) fails to decrypt
+// rather than silently signing under the wrong identity. Exercised through the
+// public Generate/Sign path: a stored ciphertext whose row identity is altered
+// no longer decrypts.
+func TestDKIMKeyAADBinding(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dkimDSN)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS dkim_keys (id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY, tenant_id bigint NOT NULL, domain text NOT NULL, selector text NOT NULL, algo text NOT NULL DEFAULT 'ed25519', private_key bytea NOT NULL, active boolean NOT NULL DEFAULT true, UNIQUE (tenant_id, domain, selector))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `TRUNCATE dkim_keys RESTART IDENTITY`); err != nil {
+		t.Fatal(err)
+	}
+
+	cipher, err := deliverability.NewKeyCipher([]byte("master-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// dkim_keys FKs tenant_id → tenants(id) in the real schema; seed a tenant.
+	var tenant int64
+	if err := pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('aad-t') RETURNING id`).Scan(&tenant); err != nil {
+		t.Skipf("cannot seed tenant (%v)", err)
+	}
+	const domain = "aad.example"
+	const selector = "s1"
+	if _, err := deliverability.GenerateTenantKeyEnc(ctx, pool, cipher, tenant, domain, selector); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tamper: change the row's selector so the AAD reconstructed at Sign time no
+	// longer matches what encrypt bound. The ciphertext is intact but the tag must
+	// now fail — proving the key is bound to its identity.
+	if _, err := pool.Exec(ctx, `UPDATE dkim_keys SET selector='s2' WHERE tenant_id=$1`, tenant); err != nil {
+		t.Fatal(err)
+	}
+	msg := "From: a@aad.example\r\nSubject: x\r\n\r\nbody\r\n"
+	signer := &deliverability.DKIMSigner{Pool: pool, Cipher: cipher}
+	if _, err := signer.Sign(ctx, tenant, domain, []byte(msg)); err == nil {
+		t.Fatalf("Sign succeeded after the row's selector was altered — AAD not binding identity (a lifted ciphertext would sign)")
+	}
+	t.Logf("OK: a DKIM ciphertext is bound to its (tenant,domain,selector) via GCM AAD; altering the row's identity breaks decryption")
 }
