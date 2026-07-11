@@ -94,8 +94,8 @@ func TestEgressDistinctSourceIPs(t *testing.T) {
 	// IPRouter leases the tenant's source IP, which SourceIPDialer binds.
 	ipr := &deliverability.IPRouter{Pool: pool}
 	dialer := submit.SourceIPDialer(
-		func(ctx context.Context, domain string) (dns.Domain, string, error) {
-			return dns.Domain{ASCII: "mx.test"}, ln.Addr().String(), nil
+		func(ctx context.Context, domain string) ([]submit.MXHost, error) {
+			return []submit.MXHost{{Host: dns.Domain{ASCII: "mx.test"}, Addr: ln.Addr().String()}}, nil
 		},
 		func(ctx context.Context, domain string, mx dns.Domain) (net.IP, error) {
 			leased, err := ipr.LeaseSourceIP(ctx, submit.TenantFrom(ctx))

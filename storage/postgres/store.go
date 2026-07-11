@@ -101,6 +101,13 @@ func Open(ctx context.Context, dsn string, bs blob.Store) (*Store, error) {
 	cfg.ConnConfig.RuntimeParams["tcp_keepalives_interval"] = "5"
 	cfg.ConnConfig.RuntimeParams["tcp_keepalives_count"] = "3"
 	cfg.HealthCheckPeriod = 15 * time.Second
+	// Pool sizing is left to pgx's default MaxConns (max(4, GOMAXPROCS)) unless the
+	// operator raises it via the DSN `pool_max_conns` parameter. Note the permanent
+	// per-node connection floor: the LISTEN doorbell (StartCoordinator) holds one
+	// connection for the node's lifetime, and each held leadership (ops/ha.Leader)
+	// holds one more for its tenure — so `pool_max_conns` must exceed
+	// (concurrent leaderships on this node) + 1 (LISTEN) + query headroom, or query
+	// traffic can starve. See the pool-sizing note on ops/ha.Leader.
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to postgres: %w", err)
@@ -116,18 +123,23 @@ func Open(ctx context.Context, dsn string, bs blob.Store) (*Store, error) {
 	}
 	// Serialize bootstrap across nodes with a session advisory lock so concurrent
 	// startups can't race the same CREATE INDEX/TABLE (which is not internally
-	// serialized and can deadlock or error under contention). The key is a fixed
-	// namespace distinct from the per-account (account id) and leader-election keys.
-	// Held on one dedicated connection for the DDL Exec, then released; the schema
-	// DDL itself is idempotent (IF NOT EXISTS), so the lock only prevents the
-	// concurrent-DDL race, not re-application.
-	const schemaBootstrapKey = int64(0x6f6d5f7363686d) // "om_schm"
+	// serialized and can deadlock or error under contention). It uses the TWO-key
+	// advisory-lock space with a dedicated CLASSID (lockClassSchema), structurally
+	// distinct from the leader-election class (ops/ha) and from the per-account
+	// ONE-key write-lock space — PostgreSQL keeps those spaces disjoint, so no
+	// hand-picked magic constant is needed to avoid collision. Held on one dedicated
+	// connection for the DDL Exec, then released; the schema DDL itself is idempotent
+	// (IF NOT EXISTS), so the lock only prevents the concurrent-DDL race.
+	const (
+		lockClassSchema      int32 = 2 // advisory-lock class for schema bootstrap (distinct from ha's leader class)
+		schemaBootstrapObjID int32 = 1
+	)
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("acquiring bootstrap conn: %w", err)
 	}
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaBootstrapKey); err != nil {
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, $2)`, lockClassSchema, schemaBootstrapObjID); err != nil {
 		conn.Release()
 		pool.Close()
 		return nil, fmt.Errorf("bootstrap advisory lock: %w", err)
@@ -138,7 +150,7 @@ func Open(ctx context.Context, dsn string, bs blob.Store) (*Store, error) {
 	// cancelled/timed out, the unlock must still reach Postgres rather than fail
 	// alongside it. (pool.Close() on the error paths would also drop the session
 	// and auto-release the lock, but releasing explicitly is not left to teardown.)
-	_, unlockErr := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, schemaBootstrapKey)
+	_, unlockErr := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1, $2)`, lockClassSchema, schemaBootstrapObjID)
 	conn.Release()
 	if ddlErr != nil {
 		pool.Close()

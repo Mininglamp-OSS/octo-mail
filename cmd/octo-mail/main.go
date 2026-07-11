@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -111,6 +113,9 @@ func run() error {
 	if err := checkReporterConfig(cfg); err != nil {
 		return err
 	}
+	if err := validate(cfg, log); err != nil {
+		return err
+	}
 	if cfg.bounceDomain != "" && len(cfg.verpKey) == 0 {
 		// Reached only with the explicit dev escape hatch (else checkVERPConfig is
 		// fatal). Warn on every VERP-enabling topology, inbound or outbound-only.
@@ -146,7 +151,7 @@ func run() error {
 
 	dir := s.NewDirectory()
 	submitter := &submit.Submitter{Pool: s.Pool, Blob: bs}
-	repo := &deliverability.Service{Pool: s.Pool}
+	repo := &deliverability.Service{Pool: s.Pool, MaxPerWindow: cfg.sendRateMax, RateWindow: cfg.sendRateWindow}
 	signer := &deliverability.DKIMSigner{Pool: s.Pool}
 	// Optional DKIM key encryption at rest.
 	if secret := os.Getenv("OCTO_MAIL_KEY_SECRET"); secret != "" {
@@ -396,6 +401,16 @@ func run() error {
 			if !r.Allowed {
 				return fmt.Errorf("tenant paused for %s: %s", dom, r.Reason)
 			}
+			// Per-tenant outbound rate limit (independent of the egress pool). Over
+			// the cap returns an error so the queue defers and retries later — not a
+			// hard bounce; the tenant is sending, just too fast for this window.
+			ok, e := repo.AllowSend(ctx, tid)
+			if e != nil {
+				return e
+			}
+			if !ok {
+				return fmt.Errorf("tenant %d over send-rate limit; deferring", tid)
+			}
 			return nil
 		},
 		Sign:       signer.Sign,
@@ -534,7 +549,17 @@ func run() error {
 	// not gated.
 	fts := &projection.FTSWorker{Pool: s.Pool, Blob: bs, Batch: 100}
 	threads := &projection.ThreadWorker{Pool: s.Pool, Blob: bs, Batch: 100, Log: log}
-	const projLeaderKey = int64(0x6f63746f6d61696c) // "octomail"
+	// Leader-election objids. Each cluster-singleton subsystem campaigns on a
+	// distinct objid within the ha leader lock CLASS (see ops/ha.lockClassLeader);
+	// small explicit integers, self-evidently non-colliding. They also serve as the
+	// leader_lease.key. The account write-lock keyspace is a SEPARATE (one-arg)
+	// advisory-lock space, so these can never alias an account id.
+	const (
+		projLeaderKey   = int64(1) // projection drain
+		warmupLeaderKey = int64(2) // IP warmup daily maintenance
+		reputLeaderKey  = int64(3) // reputation auto-unpause
+		reportLeaderKey = int64(4) // DMARC/TLS-RPT report scheduler
+	)
 	projCoord := ha.NewCoordinator(ha.New(s.Pool, projLeaderKey, cfg.nodeID), cfg.projInterval)
 	projCoord.OnElected = func(context.Context) { log.Info("elected projection-drain leader", "node", cfg.nodeID) }
 	projCoord.OnLost = func() { log.Info("lost projection-drain leadership", "node", cfg.nodeID) }
@@ -549,7 +574,6 @@ func run() error {
 	// deferring then bouncing all egress-pool deliveries within a day or two.
 	if cfg.egressPool {
 		ipr := &deliverability.IPRouter{Pool: s.Pool}
-		const warmupLeaderKey = int64(0x6f6d5f77726d70) // "om_wrmp"
 		warmCoord := ha.NewCoordinator(ha.New(s.Pool, warmupLeaderKey, cfg.nodeID), time.Hour)
 		warmCoord.OnElected = func(context.Context) { log.Info("elected warmup-maintenance leader", "node", cfg.nodeID) }
 		warmCoord.OnLost = func() { log.Info("lost warmup-maintenance leadership", "node", cfg.nodeID) }
@@ -571,7 +595,6 @@ func run() error {
 	// rates have recovered. Leader-gated because it is a shared-state sweep; without
 	// it an auto-paused domain stays paused until a manual DB edit (issue #33).
 	{
-		const reputLeaderKey = int64(0x6f6d5f7265707574) // "om_reput"
 		repuCoord := ha.NewCoordinator(ha.New(s.Pool, reputLeaderKey, cfg.nodeID), 15*time.Minute)
 		repuCoord.OnElected = func(context.Context) { log.Info("elected reputation-unpause leader", "node", cfg.nodeID) }
 		repuCoord.OnLost = func() { log.Info("lost reputation-unpause leadership", "node", cfg.nodeID) }
@@ -629,7 +652,6 @@ func run() error {
 			}
 			return reportdb.RUADenied
 		}
-		const reportLeaderKey = int64(0x6f6d5f72707274) // "om_rprt"
 		repCoord := ha.NewCoordinator(ha.New(s.Pool, reportLeaderKey, cfg.nodeID), cfg.reportInterval)
 		repCoord.OnElected = func(context.Context) { log.Info("elected dmarc-report leader", "node", cfg.nodeID) }
 		repCoord.OnLost = func() { log.Info("lost dmarc-report leadership", "node", cfg.nodeID) }
@@ -949,14 +971,46 @@ func (d *projectionDrainer) tick(ctx context.Context) {
 	}
 }
 
-// resolveMX performs minimal MX resolution: try MX records, fall back to the
-// domain A record; the connect address is the chosen host on port 25.
-func resolveMX(ctx context.Context, domain string) (dns.Domain, string, error) {
-	host := domain
-	if mxs, err := net.DefaultResolver.LookupMX(ctx, domain); err == nil && len(mxs) > 0 {
-		host = strings.TrimSuffix(mxs[0].Host, ".")
+// resolveMX resolves a recipient domain to the ordered list of MX candidates to
+// try, for connection failover: MX records sorted by ascending preference, with
+// equal-preference hosts shuffled (RFC 5321 §5.1, to spread load and avoid always
+// hammering the same host). Falls back to the domain's own A/AAAA (an implicit MX
+// at pref 0) when there are no MX records. Each candidate dials the host on port 25.
+func resolveMX(ctx context.Context, domain string) ([]submit.MXHost, error) {
+	mxs, err := net.DefaultResolver.LookupMX(ctx, domain)
+	if err != nil || len(mxs) == 0 {
+		// No usable MX: fall back to the domain itself (implicit MX).
+		return []submit.MXHost{{Host: dns.Domain{ASCII: domain}, Addr: net.JoinHostPort(domain, "25")}}, nil
 	}
-	return dns.Domain{ASCII: host}, net.JoinHostPort(host, "25"), nil
+	// LookupMX returns records sorted by Pref; shuffle within each equal-preference
+	// run so we don't always pick the same host among equals, then keep the runs in
+	// ascending-preference order.
+	sorted := make([]*net.MX, len(mxs))
+	copy(sorted, mxs)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Pref < sorted[j].Pref })
+	for i := 0; i < len(sorted); {
+		j := i + 1
+		for j < len(sorted) && sorted[j].Pref == sorted[i].Pref {
+			j++
+		}
+		if j-i > 1 {
+			run := sorted[i:j]
+			rand.Shuffle(len(run), func(a, b int) { run[a], run[b] = run[b], run[a] })
+		}
+		i = j
+	}
+	out := make([]submit.MXHost, 0, len(sorted))
+	for _, mx := range sorted {
+		host := strings.TrimSuffix(mx.Host, ".")
+		if host == "" {
+			continue
+		}
+		out = append(out, submit.MXHost{Host: dns.Domain{ASCII: host}, Addr: net.JoinHostPort(host, "25")})
+	}
+	if len(out) == 0 {
+		out = append(out, submit.MXHost{Host: dns.Domain{ASCII: domain}, Addr: net.JoinHostPort(domain, "25")})
+	}
+	return out, nil
 }
 
 func redactDSN(dsn string) string {

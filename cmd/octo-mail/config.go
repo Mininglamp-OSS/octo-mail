@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -80,6 +81,89 @@ func checkReporterConfig(cfg config) error {
 			cfg.reportDomain)
 	}
 	return nil
+}
+
+// validate performs 12-factor-style startup checks that the per-role check
+// functions above don't cover: it FAILS FAST on a misconfiguration that would
+// otherwise surface only at first use, and WARNS on settings that are silently
+// lenient today (unparseable env values folded to defaults; an unauthenticated
+// admin listener on a non-loopback address). Called once in run() after the other
+// check* functions. Warnings need the logger; errors abort startup.
+func validate(cfg config, log *slog.Logger) error {
+	// Fail fast: an S3 endpoint with NO credential path at all. Empty static creds
+	// ARE legitimate when a session token is set (STS) or an ambient IAM role is
+	// expected — but endpoint set with access+secret+token all empty is almost
+	// certainly a misconfiguration that would fail only on the first S3 request.
+	if cfg.s3Endpoint != "" && cfg.s3Access == "" && cfg.s3Secret == "" && cfg.s3SessionToken == "" {
+		return fmt.Errorf("OCTO_MAIL_S3_ENDPOINT is set (%q) but no credentials are configured: "+
+			"set OCTO_MAIL_S3_ACCESS + OCTO_MAIL_S3_SECRET, or OCTO_MAIL_S3_SESSION_TOKEN for STS/IAM-role auth",
+			cfg.s3Endpoint)
+	}
+
+	// Warn: the admin API on a non-loopback address without a token. The default
+	// ":8081" binds all interfaces; with no token that exposes admin operations to
+	// anything that can reach the node.
+	if cfg.adminToken == "" && !isLoopbackAddr(cfg.adminAddr) {
+		log.Warn("admin API listens on a non-loopback address with no OCTO_MAIL_ADMIN_TOKEN: "+
+			"admin operations are unauthenticated and reachable off-host. Set OCTO_MAIL_ADMIN_TOKEN, "+
+			"or bind OCTO_MAIL_ADMIN_ADDR to loopback (e.g. 127.0.0.1:8081)", "admin_addr", cfg.adminAddr)
+	}
+
+	// Warn: env values that were set but didn't parse, so an operator sees the typo
+	// instead of silently getting the default. The load helpers fold a parse error
+	// to the default (no behavior change); this re-checks the raw strings.
+	for _, k := range []string{
+		"OCTO_MAIL_MAX_SIZE", "OCTO_MAIL_MAX_CONNS", "OCTO_MAIL_QUEUE_DELAY_DSN", "OCTO_MAIL_MAX_HOPS",
+		"OCTO_MAIL_TRUSTED_HAM_COUNT", "OCTO_MAIL_SEND_RATE_MAX",
+	} {
+		if v := os.Getenv(k); v != "" {
+			if _, err := strconv.ParseInt(v, 10, 64); err != nil {
+				log.Warn("ignoring unparseable integer env value; using default", "env", k, "value", v)
+			}
+		}
+	}
+	for _, k := range []string{
+		"OCTO_MAIL_DRAIN_TIMEOUT", "OCTO_MAIL_REPORT_INTERVAL", "OCTO_MAIL_QUEUE_INTERVAL",
+		"OCTO_MAIL_PROJECTION_INTERVAL", "OCTO_MAIL_QUEUE_BACKOFF", "OCTO_MAIL_QUEUE_MAX_BACKOFF",
+		"OCTO_MAIL_QUEUE_MAX_LIFETIME", "OCTO_MAIL_QUEUE_RETIRED_KEEP", "OCTO_MAIL_GREYLIST_DELAY",
+		"OCTO_MAIL_SUBJECTPASS_PERIOD", "OCTO_MAIL_SEND_RATE_WINDOW",
+	} {
+		if v := os.Getenv(k); v != "" {
+			if _, err := time.ParseDuration(v); err != nil {
+				log.Warn("ignoring unparseable duration env value; using default", "env", k, "value", v)
+			}
+		}
+	}
+	for _, k := range []string{"OCTO_MAIL_JUNK_THRESHOLD", "OCTO_MAIL_REJECT_THRESHOLD"} {
+		if v := os.Getenv(k); v != "" {
+			if _, err := strconv.ParseFloat(v, 64); err != nil {
+				log.Warn("ignoring unparseable float env value; using default", "env", k, "value", v)
+			}
+		}
+	}
+	return nil
+}
+
+// isLoopbackAddr reports whether a "host:port" listen address binds only the
+// loopback interface. An empty host (":8081") or 0.0.0.0/:: binds ALL interfaces
+// (not loopback). A named "localhost" is treated as loopback. Used to decide
+// whether an unauthenticated admin listener is exposed off-host.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr // no port; treat the whole thing as the host
+	}
+	if host == "" {
+		return false // ":8081" binds all interfaces
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	// A non-IP, non-localhost hostname: can't prove it's loopback → treat as exposed.
+	return false
 }
 
 // config is the node's runtime configuration, loaded from the environment.
@@ -179,6 +263,13 @@ type config struct {
 	// leased from the IPRouter (multi-egress warmup/reputation isolation).
 	egressPool bool
 
+	// sendRateMax / sendRateWindow configure the per-tenant outbound send-rate
+	// limiter (deliverability.Service.AllowSend), enforced on every send regardless
+	// of egressPool. sendRateMax is the max sends per tenant per window; 0 disables
+	// the limiter (default). sendRateWindow is the fixed window (default 1m).
+	sendRateMax    int64
+	sendRateWindow time.Duration
+
 	// ACME/autotls: when acmeDir URL is set, listeners use automatic certificates.
 	// NOTE: the ACME cache is node-local, so this is single-node only — multi-node
 	// deployments must terminate TLS at a shared proxy or provision certs
@@ -247,6 +338,9 @@ func loadConfig() config {
 		adminToken: os.Getenv("OCTO_MAIL_ADMIN_TOKEN"),
 
 		egressPool: os.Getenv("OCTO_MAIL_EGRESS_POOL") == "1",
+
+		sendRateMax:    envInt64("OCTO_MAIL_SEND_RATE_MAX", 0),
+		sendRateWindow: envDuration("OCTO_MAIL_SEND_RATE_WINDOW", time.Minute),
 
 		acmeDirectory: os.Getenv("OCTO_MAIL_ACME_DIRECTORY"),
 		acmeContact:   os.Getenv("OCTO_MAIL_ACME_CONTACT"),

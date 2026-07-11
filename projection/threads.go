@@ -1,6 +1,6 @@
 // Threading is a second async projection over the change-log: it groups messages
 // into conversations by RFC 5322 Message-ID / In-Reply-To / References, the same
-// identity IMAP THREAD and JMAP threadId share. Like FTS it tails messages by
+// identity IMAP THREAD and JMAP threadId share. Like FTS it folds messages by
 // createseq behind a per-account cursor, so it never couples to delivery
 // latency, and it is a pure, rebuildable fold: dropping thread_id + resetting
 // the cursor re-derives identical threads from the log.

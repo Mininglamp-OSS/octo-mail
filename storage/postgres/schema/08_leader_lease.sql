@@ -3,7 +3,10 @@
 -- ---------------------------------------------------------------------------
 
 -- The ha.Leader election uses a session-level pg_advisory_lock for fast
--- same-primary mutual exclusion. But an advisory lock is primary-LOCAL and NOT
+-- same-primary mutual exclusion (the two-key form pg_advisory_lock(classid,
+-- objid) under a dedicated leader classid, so leader keys can never alias the
+-- one-key per-account write locks or the schema-bootstrap lock — see
+-- ops/ha.lockClassLeader). But an advisory lock is primary-LOCAL and NOT
 -- replicated: after a PostgreSQL failover the old primary and the promoted
 -- replica have independent lock namespaces, so the lock alone cannot tell a
 -- demoted old primary from the new one. This lease row is ordinary table data —

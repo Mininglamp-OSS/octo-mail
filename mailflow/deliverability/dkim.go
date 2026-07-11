@@ -91,7 +91,7 @@ func generateKey(ctx context.Context, pool *pgxpool.Pool, cipher *KeyCipher, ten
 		return "", fmt.Errorf("unsupported dkim algo %q", algo)
 	}
 
-	stored, err := cipher.encrypt(der)
+	stored, err := cipher.encrypt(der, dkimAAD(tenantID, domain, selector))
 	if err != nil {
 		return "", err
 	}
@@ -162,7 +162,7 @@ func (d *DKIMSigner) Sign(ctx context.Context, tenantID int64, fromDomain string
 
 	var selectors []dkim.Selector
 	for _, kr := range krs {
-		privBytes, err := d.Cipher.decrypt(kr.priv)
+		privBytes, err := d.Cipher.decrypt(kr.priv, dkimAAD(tenantID, fromDomain, kr.selector))
 		if err != nil {
 			return "", fmt.Errorf("decrypt dkim key: %w", err)
 		}

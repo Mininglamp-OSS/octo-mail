@@ -2,44 +2,75 @@ package submit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 
 	"github.com/mjl-/mox/dns"
 )
 
+// MXHost is one resolved MX candidate: the hostname (for TLS/DANE identity) and
+// the "host:port" address to dial. resolveMX returns them in connection-attempt
+// order (by MX preference, equal-preference hosts shuffled per RFC 5321 §5.1).
+type MXHost struct {
+	Host dns.Domain
+	Addr string
+}
+
 // SourceIPDialer builds a Dialer that binds a chosen local (source) IP on the
 // outbound TCP connection, so a multi-egress host sends from the IP selected by
 // the reputation/warmup router (deliverability.IPRouter). resolveMX turns a
-// recipient domain into an MX host + address to connect to; pickSource selects
+// recipient domain into the ordered list of MX hosts to try; pickSource selects
 // the source IP to bind (empty → OS default).
 //
 // This is the socket-level half of IP-pool warmup: the router decides which IP,
 // this binds it as the TCP local address so the peer (and its reputation systems)
-// see that exact source.
+// see that exact source. It also provides MX FAILOVER: the hosts are tried in
+// order and the first that accepts a TCP connection wins, so a dead primary MX
+// no longer fails the whole delivery attempt.
 func SourceIPDialer(
-	resolveMX func(ctx context.Context, domain string) (host dns.Domain, addr string, err error),
+	resolveMX func(ctx context.Context, domain string) ([]MXHost, error),
 	pickSource func(ctx context.Context, domain string, mx dns.Domain) (net.IP, error),
 ) Dialer {
 	return func(ctx context.Context, domain string) (net.Conn, dns.Domain, error) {
-		host, addr, err := resolveMX(ctx, domain)
+		hosts, err := resolveMX(ctx, domain)
 		if err != nil {
 			return nil, dns.Domain{}, err
 		}
-		d := net.Dialer{}
-		if pickSource != nil {
-			ip, err := pickSource(ctx, domain, host)
+		if len(hosts) == 0 {
+			return nil, dns.Domain{}, fmt.Errorf("no MX hosts for %s", domain)
+		}
+		// Try each MX in order; the first TCP connect that succeeds wins. A connect
+		// failure advances to the next host (failover); the last error is returned if
+		// all fail. pickSource is inside the loop because the source-IP choice depends
+		// on the MX host being dialed.
+		var lastErr error
+		for _, h := range hosts {
+			d := net.Dialer{}
+			if pickSource != nil {
+				ip, err := pickSource(ctx, domain, h.Host)
+				if err != nil {
+					// A source-IP error is not per-host (it's a routing/warmup decision):
+					// don't burn the other MXs on it — surface it immediately.
+					return nil, dns.Domain{}, err
+				}
+				if ip != nil {
+					d.LocalAddr = &net.TCPAddr{IP: ip}
+				}
+			}
+			conn, err := d.DialContext(ctx, "tcp", h.Addr)
 			if err != nil {
-				return nil, dns.Domain{}, err
+				lastErr = fmt.Errorf("dial %s (%s): %w", domain, h.Addr, err)
+				if ctx.Err() != nil {
+					return nil, dns.Domain{}, lastErr // shutting down / deadline — stop trying
+				}
+				continue
 			}
-			if ip != nil {
-				d.LocalAddr = &net.TCPAddr{IP: ip}
-			}
+			return conn, h.Host, nil
 		}
-		conn, err := d.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			return nil, dns.Domain{}, fmt.Errorf("dial %s (%s): %w", domain, addr, err)
+		if lastErr == nil {
+			lastErr = errors.New("no MX host reachable")
 		}
-		return conn, host, nil
+		return nil, dns.Domain{}, lastErr
 	}
 }

@@ -95,3 +95,80 @@ func TestDSNParamsPersisted(t *testing.T) {
 	}
 	t.Logf("OK: RET/ENVID/NOTIFY/ORCPT parsed on submission and persisted to the queue row")
 }
+
+// TestExtensionParamsPersisted proves #25-8: BODY=8BITMIME and SMTPUTF8 requested
+// on MAIL FROM are parsed on submission and persisted onto the enqueued queue row,
+// so delivery can re-negotiate them with the next hop. Driven raw over SMTP.
+func TestExtensionParamsPersisted(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, "postgres://octo_mail:octo_mail@localhost:55432/octo_mail", bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, queue, queue_log RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tenantID, accID, dom int64
+	scan(t, s, ctx, `INSERT INTO tenants (name) VALUES ('t') RETURNING id`, &tenantID)
+	scan(t, s, ctx, `INSERT INTO accounts (tenant_id, name) VALUES ($1,'sender') RETURNING id`, &accID, tenantID)
+	scan(t, s, ctx, `INSERT INTO domains (tenant_id, domain) VALUES ($1,'sender.example') RETURNING id`, &dom, tenantID)
+	s.Pool.Exec(ctx, `INSERT INTO addresses (tenant_id, domain_id, account_id, localpart) VALUES ($1,$2,$3,'me')`, tenantID, dom, accID)
+	s.Pool.Exec(ctx, `INSERT INTO principals (tenant_id, login) VALUES ($1,'me@sender.example')`, tenantID)
+	dir := s.NewDirectory()
+	if err := dir.SetPassword(ctx, "me@sender.example", "pw"); err != nil {
+		t.Fatal(err)
+	}
+
+	sub := &smtpd.Server{Dir: dir, Hostname: "mail.sender.example", Submission: &submit.Submitter{Pool: s.Pool, Blob: bs}}
+	cc, sc := net.Pipe()
+	go func() { _ = sub.Serve(ctx, sc) }()
+	defer cc.Close()
+	_ = cc.SetDeadline(time.Now().Add(15 * time.Second))
+	br := newLineReader(cc)
+	_ = br.line() // greeting
+
+	cc.Write([]byte("EHLO client.example\r\n"))
+	for {
+		l := br.line()
+		if len(l) < 4 || l[3] == ' ' {
+			break
+		}
+	}
+	tok := base64.StdEncoding.EncodeToString([]byte("\x00me@sender.example\x00pw"))
+	cc.Write([]byte("AUTH PLAIN " + tok + "\r\n"))
+	if r := br.line(); !strings.HasPrefix(r, "235") {
+		t.Fatalf("AUTH: %q", r)
+	}
+
+	// MAIL requesting both extensions (BODY=8BITMIME has a value; SMTPUTF8 is a bare flag).
+	cc.Write([]byte("MAIL FROM:<me@sender.example> BODY=8BITMIME SMTPUTF8\r\n"))
+	if r := br.line(); !strings.HasPrefix(r, "250") {
+		t.Fatalf("MAIL: %q", r)
+	}
+	cc.Write([]byte("RCPT TO:<you@remote.example>\r\n"))
+	if r := br.line(); !strings.HasPrefix(r, "250") {
+		t.Fatalf("RCPT: %q", r)
+	}
+	cc.Write([]byte("DATA\r\n"))
+	if r := br.line(); !strings.HasPrefix(r, "354") {
+		t.Fatalf("DATA: %q", r)
+	}
+	cc.Write([]byte("From: me@sender.example\r\nTo: you@remote.example\r\nSubject: 8bit\r\n\r\nbody\r\n.\r\n"))
+	if r := br.line(); !strings.HasPrefix(r, "250") {
+		t.Fatalf("end-of-data: %q", r)
+	}
+	cc.Write([]byte("QUIT\r\n"))
+
+	var body8, utf8 bool
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT COALESCE(body_8bitmime,false), COALESCE(smtputf8,false) FROM queue LIMIT 1`).
+		Scan(&body8, &utf8); err != nil {
+		t.Fatalf("query queue: %v", err)
+	}
+	if !body8 || !utf8 {
+		t.Fatalf("extension flags not persisted: body_8bitmime=%v smtputf8=%v, want both true", body8, utf8)
+	}
+	t.Logf("OK: BODY=8BITMIME + SMTPUTF8 parsed on submission and persisted to the queue row")
+}

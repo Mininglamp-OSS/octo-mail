@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS queue (
     dsn_ret      text,                              -- RFC 3461 RET: FULL | HDRS ('' = default, headers only)
     dsn_envid    text,                              -- RFC 3461 ENVID: envelope id echoed in the DSN
     dsn_orcpt    text,                              -- RFC 3461 ORCPT: original recipient echoed in the DSN
+    body_8bitmime boolean NOT NULL DEFAULT false,   -- RFC 6152 BODY=8BITMIME requested: re-negotiate on delivery
+    smtputf8      boolean NOT NULL DEFAULT false,    -- RFC 6531 SMTPUTF8 requested: re-negotiate on delivery
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 -- Idempotent column adds for existing databases (dev has no migration baggage,
@@ -52,6 +54,8 @@ ALTER TABLE queue ADD COLUMN IF NOT EXISTS dsn_notify   text;
 ALTER TABLE queue ADD COLUMN IF NOT EXISTS dsn_ret      text;
 ALTER TABLE queue ADD COLUMN IF NOT EXISTS dsn_envid    text;
 ALTER TABLE queue ADD COLUMN IF NOT EXISTS dsn_orcpt    text;
+ALTER TABLE queue ADD COLUMN IF NOT EXISTS body_8bitmime boolean NOT NULL DEFAULT false;
+ALTER TABLE queue ADD COLUMN IF NOT EXISTS smtputf8      boolean NOT NULL DEFAULT false;
 -- Due-message scan: unleased, not on hold, attempt time reached.
 CREATE INDEX IF NOT EXISTS queue_due_idx ON queue (next_attempt)
     WHERE leased_by IS NULL AND hold = false;

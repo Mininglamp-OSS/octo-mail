@@ -229,6 +229,12 @@ type conn struct {
 	subNotify []string
 	subORcpt  []string
 
+	// Extension flags requested on MAIL FROM (RFC 6152 BODY=8BITMIME, RFC 6531
+	// SMTPUTF8), carried through to the outbound delivery so they are re-negotiated
+	// with the next hop rather than silently downgraded to 7bit/ASCII.
+	mailBody8bitmime bool
+	mailSMTPUTF8     bool
+
 	// holdUntil is the FUTURERELEASE (RFC 4865) release time from MAIL FROM
 	// HOLDFOR/HOLDUNTIL; zero means deliver immediately.
 	holdUntil time.Time
@@ -410,6 +416,8 @@ func (c *conn) reset() {
 	c.subORcpt = nil
 	c.dsnRet = ""
 	c.dsnEnvID = ""
+	c.mailBody8bitmime = false
+	c.mailSMTPUTF8 = false
 	c.holdUntil = time.Time{}
 	c.bdatBuf = nil
 	c.inBDAT = false
@@ -688,6 +696,10 @@ func (c *conn) cmdMail(rest string) {
 	// Capture DSN request parameters (RFC 3461): RET=FULL|HDRS, ENVID=<id>.
 	c.dsnRet = mailParamStr(rest, "RET")
 	c.dsnEnvID = mailParamStr(rest, "ENVID")
+	// Capture the body-type / UTF8 extension requests so delivery re-negotiates
+	// them (RFC 6152 BODY=8BITMIME, RFC 6531 SMTPUTF8 — a bare flag, no value).
+	c.mailBody8bitmime = strings.EqualFold(mailParamStr(rest, "BODY"), "8BITMIME")
+	c.mailSMTPUTF8 = mailParamFlag(rest, "SMTPUTF8")
 	// FUTURERELEASE (RFC 4865): HOLDFOR=<seconds> or HOLDUNTIL=<date-time> defers
 	// delivery. Only in submission mode; the two are mutually exclusive and bound
 	// to maxFutureRelease.
@@ -736,6 +748,18 @@ func mailParamStr(rest, key string) string {
 		}
 	}
 	return ""
+}
+
+// mailParamFlag reports whether a valueless ESMTP parameter (e.g. SMTPUTF8) is
+// present as a whitespace-separated token, case-insensitively.
+func mailParamFlag(rest, key string) bool {
+	up := strings.ToUpper(key)
+	for _, tok := range strings.Fields(rest) {
+		if strings.ToUpper(tok) == up {
+			return true
+		}
+	}
+	return false
 }
 
 // hasDSNPerRcpt reports whether any per-recipient DSN param slot is non-empty, so
@@ -995,7 +1019,7 @@ func (c *conn) processData(data []byte) error {
 	if submission {
 		// Enqueue to the shared outbound queue; the queue worker delivers. Carry
 		// the RFC 3461 DSN params (RET/ENVID per-message, NOTIFY/ORCPT per-rcpt).
-		dsnp := submit.DSNParams{Ret: c.dsnRet, EnvID: c.dsnEnvID}
+		dsnp := submit.DSNParams{Ret: c.dsnRet, EnvID: c.dsnEnvID, Body8BitMIME: c.mailBody8bitmime, SMTPUTF8: c.mailSMTPUTF8}
 		if hasDSNPerRcpt(c.subNotify) || hasDSNPerRcpt(c.subORcpt) {
 			dsnp.Notify = make(map[string]string, len(c.subRcpts))
 			dsnp.ORcpt = make(map[string]string, len(c.subRcpts))

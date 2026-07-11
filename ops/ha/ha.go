@@ -54,6 +54,18 @@ import (
 // epoch — i.e. this node has been fenced out and must not perform the write.
 var ErrFenced = errors.New("ha: leadership fenced (lease lost or epoch superseded)")
 
+// lockClassLeader is the PostgreSQL advisory-lock CLASSID for leader election.
+// octo-mail partitions the advisory-lock keyspace by class so distinct subsystems
+// can never alias each other: the TWO-key space (pg_advisory_lock(classid, objid))
+// is split by classid — this class for leader election, a separate class for
+// schema bootstrap (storage/postgres) — while the ONE-key space is reserved for
+// per-account write locks (storage/postgres account.Tx). PostgreSQL keeps the
+// one-key and two-key spaces disjoint, so a per-account key (full 64-bit, never
+// truncated) can never collide with a leader key even if their integers coincide.
+// Before this split all three shared the single 64-bit space and relied on
+// hand-picked non-overlapping magic constants — structurally fragile.
+const lockClassLeader int32 = 1
+
 // Leader campaigns for and holds leadership on a lock key. It keeps a dedicated
 // connection for the duration of leadership; releasing it (or losing it on
 // crash) frees the advisory lock so another node can take over. While leader it
@@ -67,6 +79,17 @@ var ErrFenced = errors.New("ha: leadership fenced (lease lost or epoch supersede
 // deliberately does NOT touch `conn` (it borrows a fresh pooled connection) — a
 // pgx connection is not safe for concurrent use, and sharing the leadership
 // connection with a work goroutine would corrupt its protocol stream.
+//
+// Pool-sizing note: a held leadership permanently checks out ONE pooled connection
+// for its whole tenure (this `conn`), and the LISTEN/NOTIFY doorbell
+// (storage/postgres.StartCoordinator) permanently holds one more per node. Neither
+// is returned to the pool until resign/shutdown. So a node's steady-state pool
+// floor is: (number of coordinators it is currently leading) + 1 (LISTEN) + enough
+// headroom for concurrent query traffic (FenceExec briefly borrows one more). Size
+// the pool accordingly: octo-mail sets no explicit MaxConns (see
+// storage/postgres.Open), so the effective cap is pgx's default (max(4, GOMAXPROCS))
+// unless raised via the DSN `pool_max_conns` parameter — a small node running
+// several coordinators with the default cap can starve query traffic.
 type Leader struct {
 	pool   *pgxpool.Pool
 	key    int64
@@ -115,7 +138,7 @@ func (l *Leader) TryAcquire(ctx context.Context) (bool, error) {
 	// mutual-exclusion gate: at most one live session per primary holds the key,
 	// so the lease claim below only ever runs for the winner.
 	var ok bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, l.key).Scan(&ok); err != nil {
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, lockClassLeader, int32(l.key)).Scan(&ok); err != nil {
 		conn.Release()
 		return false, err
 	}
@@ -143,7 +166,7 @@ func (l *Leader) TryAcquire(ctx context.Context) (bool, error) {
 	if err != nil {
 		// Lease claim failed (e.g. read-only backend on a demoted primary). Release
 		// the advisory lock so we don't strand it while not-leader.
-		_, _ = conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, l.key)
+		_, _ = conn.Exec(ctx, `SELECT pg_advisory_unlock($1, $2)`, lockClassLeader, int32(l.key))
 		conn.Release()
 		return false, err
 	}
@@ -334,7 +357,7 @@ func (l *Leader) Resign(ctx context.Context) error {
 // clear to BackendPID/Epoch/FenceExec readers.
 func (l *Leader) release(ctx context.Context) {
 	if l.conn != nil {
-		_, _ = l.conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, l.key)
+		_, _ = l.conn.Exec(ctx, `SELECT pg_advisory_unlock($1, $2)`, lockClassLeader, int32(l.key))
 		l.conn.Release()
 		l.conn = nil
 	}

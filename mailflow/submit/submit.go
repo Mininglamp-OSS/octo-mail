@@ -40,12 +40,16 @@ func (s *Submitter) SubmitAt(ctx context.Context, tenantID, accountID int64, mai
 // DSNParams carries RFC 3461 DSN request parameters from an SMTP submission into
 // the queue so the DSN generator can honor them. Ret (FULL/HDRS) and EnvID are
 // per-message; Notify and ORcpt are per-recipient, keyed by recipient address
-// (a missing entry means the SMTP default).
+// (a missing entry means the SMTP default). Body8BitMIME and SMTPUTF8 carry the
+// RFC 6152 / RFC 6531 extension requests so delivery re-negotiates them with the
+// next hop instead of silently downgrading to 7bit/ASCII.
 type DSNParams struct {
-	Ret    string            // FULL | HDRS ("" = default)
-	EnvID  string            // envelope id echoed in the DSN
-	Notify map[string]string // rcpt address → comma list of NEVER/SUCCESS/FAILURE/DELAY
-	ORcpt  map[string]string // rcpt address → original recipient (ORCPT)
+	Ret          string            // FULL | HDRS ("" = default)
+	EnvID        string            // envelope id echoed in the DSN
+	Notify       map[string]string // rcpt address → comma list of NEVER/SUCCESS/FAILURE/DELAY
+	ORcpt        map[string]string // rcpt address → original recipient (ORCPT)
+	Body8BitMIME bool              // BODY=8BITMIME requested on MAIL FROM
+	SMTPUTF8     bool              // SMTPUTF8 requested on MAIL FROM
 }
 
 // SubmitDSN is SubmitAt plus per-recipient RFC 3461 DSN parameters.
@@ -78,17 +82,19 @@ func (s *Submitter) SubmitDSN(ctx context.Context, tenantID, accountID int64, ma
 		ids = ids[:0]
 		for _, r := range rcptTo {
 			id, e := queue.EnqueueTx(ctx, tx, queue.Msg{
-				TenantID:  tenantID,
-				AccountID: accountID,
-				MailFrom:  mailFrom,
-				RcptTo:    r,
-				BlobRef:   string(ref),
-				Size:      size,
-				NotBefore: notBefore,
-				Ret:       dsnp.Ret,
-				EnvID:     dsnp.EnvID,
-				Notify:    dsnp.Notify[r],
-				ORcpt:     dsnp.ORcpt[r],
+				TenantID:     tenantID,
+				AccountID:    accountID,
+				MailFrom:     mailFrom,
+				RcptTo:       r,
+				BlobRef:      string(ref),
+				Size:         size,
+				NotBefore:    notBefore,
+				Ret:          dsnp.Ret,
+				EnvID:        dsnp.EnvID,
+				Notify:       dsnp.Notify[r],
+				ORcpt:        dsnp.ORcpt[r],
+				Body8BitMIME: dsnp.Body8BitMIME,
+				SMTPUTF8:     dsnp.SMTPUTF8,
 			})
 			if e != nil {
 				return fmt.Errorf("enqueue for %s: %w", r, e)
