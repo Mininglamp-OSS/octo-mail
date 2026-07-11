@@ -28,7 +28,7 @@ func TestJunkRoutingOnDelivery(t *testing.T) {
 		t.Skipf("postgres not available (%v)", err)
 	}
 	defer s.Close()
-	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, junk_words, junk_totals RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	var tenantID, accID, domID int64
@@ -39,7 +39,7 @@ func TestJunkRoutingOnDelivery(t *testing.T) {
 	dir := s.NewDirectory()
 
 	// Train the account's junk filter (>=50 ham to be significant).
-	mgr := junkfilter.NewManager(t.TempDir(), junkfilter.DefaultParams, 0.95)
+	mgr := junkfilter.NewManager(s.Pool, junkfilter.DefaultParams, 0.95)
 	defer mgr.Close()
 	for i := 0; i < 60; i++ {
 		spam := []byte(fmt.Sprintf("Subject: WIN cheap viagra pills\r\n\r\nfree prize cheap meds cheap loans act now winner %d\r\n", i))

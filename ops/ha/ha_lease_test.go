@@ -126,6 +126,43 @@ func TestLeaseEpochMonotonic(t *testing.T) {
 	t.Logf("OK: epoch monotonic across crash takeover (A held %d, B took over at %d)", ePreCrash, bEpoch)
 }
 
+// TestTransientErrorDoesNotFlap proves the #24-4 anti-flap fix: a transient error
+// on a still-live connection (here: an already-cancelled per-call context) must
+// NOT cause the leader to step down. Only a definitive loss (lock gone / lease
+// superseded) or a dead connection releases leadership. Before the fix, any error
+// folded into a release, so a momentary DB hiccup dropped a healthy leader.
+func TestTransientErrorDoesNotFlap(t *testing.T) {
+	ctx := context.Background()
+	pool := openHAPool(t)
+
+	a := ha.New(pool, leaseKey, "node-A")
+	ok, err := a.TryAcquire(ctx)
+	if err != nil || !ok {
+		t.Fatalf("A acquire: ok=%v err=%v", ok, err)
+	}
+	defer a.Resign(ctx)
+
+	// A cancelled context makes the probe/heartbeat query error, but the underlying
+	// connection is still alive — a transient condition, not a lost lock.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	if !a.IsLeader(cancelled) {
+		t.Fatalf("IsLeader stepped down on a transient (cancelled-ctx) error — flap")
+	}
+	if !a.Heartbeat(cancelled) {
+		t.Fatalf("Heartbeat stepped down on a transient (cancelled-ctx) error — flap")
+	}
+	// And with a healthy context it is still leader (never released).
+	if !a.IsLeader(ctx) {
+		t.Fatalf("A lost leadership after a transient blip — should have retained it")
+	}
+	if !a.Heartbeat(ctx) {
+		t.Fatalf("A heartbeat failed after a transient blip — should still hold the lease")
+	}
+	t.Logf("OK: a transient error on a live connection does not drop leadership (no flap)")
+}
+
 // TestHeartbeatFencedWhenLeaseSuperseded proves the promotion fence: if the lease
 // row is taken over by another holder/epoch while our advisory-lock connection is
 // still alive (the demoted-old-primary scenario), the next Heartbeat returns

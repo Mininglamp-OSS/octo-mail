@@ -27,7 +27,7 @@ func TestJunkRetrainOnFlag(t *testing.T) {
 		t.Skipf("postgres not available (%v)", err)
 	}
 	defer s.Close()
-	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE messages, mailboxes, changelog, addresses, accounts, domains, principals, tenants, quota_counters, blobs, junk_words, junk_totals RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	var tenantID, accID, domID int64
@@ -41,7 +41,7 @@ func TestJunkRetrainOnFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mgr := junkfilter.NewManager(t.TempDir(), junkfilter.DefaultParams, 0.95)
+	mgr := junkfilter.NewManager(s.Pool, junkfilter.DefaultParams, 0.95)
 	defer mgr.Close()
 	// Pre-train enough ham so the filter is significant, plus some spam baseline.
 	for i := 0; i < 60; i++ {

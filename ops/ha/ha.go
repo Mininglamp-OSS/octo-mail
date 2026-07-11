@@ -194,7 +194,24 @@ func (l *Leader) IsLeader(ctx context.Context) bool {
 	err := l.conn.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid())`,
 	).Scan(&held)
-	if err != nil || !held {
+	if err != nil {
+		// Distinguish a DEAD connection from a TRANSIENT error. If the backend died
+		// (e.g. pg_terminate_backend, network reset) pgx marks the conn closed and the
+		// advisory lock is genuinely gone — step down so a standby can take over and
+		// we don't sit in a split-brain window. If the conn is still live, this was a
+		// transient error (query timeout, momentary blip): do NOT step down — a healthy
+		// leader must not flap on a hiccup. Report last-known state (still leader);
+		// FenceExec re-checks lease+epoch on a fresh conn for any non-idempotent work,
+		// and the heartbeat/lease bounds a genuinely stuck leader.
+		if l.conn.Conn().IsClosed() {
+			l.release(ctx)
+			return false
+		}
+		return true
+	}
+	if !held {
+		// DEFINITIVE loss: the query succeeded and our backend no longer holds the
+		// lock — we really are not leader. Release and step down.
 		l.release(ctx)
 		return false
 	}
@@ -204,9 +221,10 @@ func (l *Leader) IsLeader(ctx context.Context) bool {
 // Heartbeat renews the lease row so standbys keep deferring to us. It returns
 // true while we remain leader and false once we have been FENCED — i.e. another
 // node has taken the lease (its holder/epoch no longer match ours), which can
-// happen after a promotion left us as a stale old primary. On a fence it drops
-// leadership (releases the advisory lock + connection) so the caller stops its
-// singleton work. Called each coordinator tick.
+// happen after a promotion left us as a stale old primary. A fence (the UPDATE
+// matched zero rows) drops leadership (releases the advisory lock + connection)
+// so the caller stops its singleton work. A TRANSIENT error, by contrast, does
+// NOT step down — see IsLeader. Called each coordinator tick.
 func (l *Leader) Heartbeat(ctx context.Context) bool {
 	if l.conn == nil {
 		return false
@@ -214,8 +232,17 @@ func (l *Leader) Heartbeat(ctx context.Context) bool {
 	ct, err := l.conn.Exec(ctx,
 		`UPDATE leader_lease SET heartbeat_at=now() WHERE key=$1 AND holder=$2 AND epoch=$3`,
 		l.key, l.nodeID, l.epoch)
-	if err != nil || ct.RowsAffected() == 0 {
-		// Either the connection is broken or the lease is no longer ours: fenced.
+	if err != nil {
+		// Dead connection → truly fenced/gone: step down. Transient error on a live
+		// connection → a blip; stay leader (see IsLeader) rather than flap.
+		if l.conn.Conn().IsClosed() {
+			l.release(ctx)
+			return false
+		}
+		return true
+	}
+	if ct.RowsAffected() == 0 {
+		// Definitively fenced: the lease is no longer ours (holder/epoch changed).
 		l.release(ctx)
 		return false
 	}

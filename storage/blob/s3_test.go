@@ -3,6 +3,7 @@ package blob_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -97,12 +98,23 @@ func TestS3BlobRoundTrip(t *testing.T) {
 		t.Fatalf("ranged read = %q, want %q", string(buf[:m]), "quick brown")
 	}
 
-	// Delete removes it; a subsequent Open fails.
+	// A zero-length ReadAt must be a no-op (0, nil) — never build an invalid
+	// "bytes=off-(off-1)" Range that the server would reject.
+	if zn, zerr := r2.ReadAt(nil, int64(idx)); zn != 0 || zerr != nil {
+		t.Fatalf("zero-length ReadAt = (%d, %v), want (0, nil)", zn, zerr)
+	}
+
+	// Delete removes it; a subsequent read fails with not-found. (Open is lazy — it
+	// defers existence to the first read to avoid a pre-Open HEAD — so not-found may
+	// surface at Open OR at the first Read; check the read path.)
 	if err := s.Delete(ctx, tenant, ref); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if _, err := s.Open(ctx, tenant, ref); err == nil {
-		t.Fatalf("open after delete succeeded; want not-found")
+	if rd, err := s.Open(ctx, tenant, ref); err == nil {
+		if _, rerr := io.ReadAll(rd); !errors.Is(rerr, blob.ErrNotFound) {
+			t.Fatalf("read after delete = %v; want blob.ErrNotFound", rerr)
+		}
+		rd.Close()
 	}
 
 	// Cross-tenant isolation: the same bytes under a different tenant is a
@@ -111,8 +123,11 @@ func TestS3BlobRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put other tenant: %v", err)
 	}
-	if _, err := s.Open(ctx, tenant, otherRef); err == nil {
-		t.Fatalf("tenant 42 could open tenant 99's blob — cross-tenant leak")
+	if rd, err := s.Open(ctx, tenant, otherRef); err == nil {
+		if _, rerr := io.ReadAll(rd); !errors.Is(rerr, blob.ErrNotFound) {
+			t.Fatalf("tenant 42 could read tenant 99's blob — cross-tenant leak (%v)", rerr)
+		}
+		rd.Close()
 	}
 	_ = s.Delete(ctx, int64(99), otherRef)
 

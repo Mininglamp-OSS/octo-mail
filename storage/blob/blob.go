@@ -24,11 +24,16 @@ type Ref string
 // escaping the tenant key prefix into a path/key traversal.
 var ErrBadRef = errors.New("blob: invalid content ref")
 
-// ErrNotFound is returned by Open when the referenced blob does not exist — a
-// PERMANENT condition (a bad/missing content ref), distinct from a transient I/O
-// or network error. Callers that must make progress past a poison row (the async
-// projections) quarantine on ErrNotFound/ErrBadRef but retry on other errors, so
-// a transient storage outage never silently drops a message from the fold.
+// ErrNotFound signals that the referenced blob does not exist — a PERMANENT
+// condition (a bad/missing content ref), distinct from a transient I/O or network
+// error. WHERE it surfaces depends on the backend: the fsStore returns it eagerly
+// from Open, but the S3 store opens lazily (no eager HEAD) and surfaces it from
+// the first Read/ReadAt/Size instead. Callers MUST therefore treat a nil Open as
+// "not yet known to exist" and be ready for ErrNotFound on the read path — do not
+// rely on Open alone as an existence check. Callers that must make progress past a
+// poison row (the async projections) quarantine on ErrNotFound/ErrBadRef but retry
+// on other errors, so a transient storage outage never silently drops a message
+// from the fold.
 var ErrNotFound = errors.New("blob: not found")
 
 // Valid reports whether r is a canonical sha256 content ref: exactly 64 chars,
@@ -51,7 +56,9 @@ type Store interface {
 	// Put stores data and returns its content-hash ref. Idempotent: storing the
 	// same bytes twice yields the same ref and no duplicate storage.
 	Put(ctx context.Context, tenantID int64, r io.Reader) (Ref, int64, error)
-	// Open returns a reader for a blob.
+	// Open returns a reader for a blob. A nil error does NOT guarantee the blob
+	// exists: the S3 backend opens lazily and reports ErrNotFound from the first
+	// Read/ReadAt/Size, not from Open. See ErrNotFound.
 	Open(ctx context.Context, tenantID int64, ref Ref) (Reader, error)
 	// Delete removes a blob (called by GC at refcount 0).
 	Delete(ctx context.Context, tenantID int64, ref Ref) error

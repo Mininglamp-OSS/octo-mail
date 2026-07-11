@@ -2,6 +2,7 @@ package ha
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -20,6 +21,13 @@ type Coordinator struct {
 	// wasLeader is the campaign loop's cached leadership view. Written only by the
 	// Run goroutine; read by IsLeader from other goroutines (hence atomic).
 	wasLeader atomic.Bool
+
+	// tickRunning single-flights the async Tick: the campaign loop launches Tick in
+	// a background goroutine (so a long Tick never blocks lease heartbeat / leader
+	// re-probe), and skips launching a new one while the previous is still running.
+	tickRunning atomic.Bool
+	// tickWG tracks in-flight Tick goroutines so Run can await them on shutdown.
+	tickWG sync.WaitGroup
 
 	// OnElected is invoked once each time this node transitions to leader. Use it
 	// to (re)start singleton work. It must return promptly; long work belongs in
@@ -47,6 +55,9 @@ func (c *Coordinator) Run(ctx context.Context) {
 	t := time.NewTicker(c.interval)
 	defer t.Stop()
 	defer func() {
+		// Wait for any in-flight async Tick to finish before resigning, so a
+		// singleton job isn't torn down mid-write on shutdown.
+		c.tickWG.Wait()
 		if c.wasLeader.Swap(false) && c.OnLost != nil {
 			c.OnLost()
 		}
@@ -98,7 +109,7 @@ func (c *Coordinator) Run(ctx context.Context) {
 			}
 		}
 		if now && c.Tick != nil {
-			c.Tick(ctx)
+			c.launchTick(ctx)
 		}
 	}
 
@@ -111,6 +122,30 @@ func (c *Coordinator) Run(ctx context.Context) {
 			campaign()
 		}
 	}
+}
+
+// launchTick runs Tick in a background goroutine so a long-running singleton job
+// never blocks the campaign loop (which must keep renewing the lease and
+// re-probing leadership on schedule — a Tick that ran inline could defer the
+// heartbeat past the lease horizon and self-induce a fence). It single-flights:
+// if the previous Tick is still running, this campaign skips launching a new one
+// (ticks coalesce rather than pile up). The goroutine re-checks cached leadership
+// before running, so a Tick launched just as leadership is lost is a no-op.
+func (c *Coordinator) launchTick(ctx context.Context) {
+	if !c.tickRunning.CompareAndSwap(false, true) {
+		return // previous Tick still in flight; skip this interval
+	}
+	c.tickWG.Add(1)
+	go func() {
+		defer c.tickWG.Done()
+		defer c.tickRunning.Store(false)
+		// Guard against a race where leadership was lost between the campaign
+		// decision and this goroutine starting; the cached view is authoritative.
+		if !c.wasLeader.Load() || ctx.Err() != nil {
+			return
+		}
+		c.Tick(ctx)
+	}()
 }
 
 // IsLeader reports whether this coordinator currently holds leadership. It reads
