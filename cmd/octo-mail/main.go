@@ -604,6 +604,14 @@ func run() error {
 			} else if n > 0 {
 				log.Info("reputation auto-unpause", "unpaused", n)
 			}
+			// Prune elapsed per-tenant rate-limit windows here (not in the warmup
+			// maintenance leader, which only runs when the egress pool is on) so the
+			// table is bounded even in the rate-limiter-without-egress-pool config.
+			if n, err := repo.PruneSendRate(ctx); err != nil {
+				log.Warn("send-rate prune", "err", err)
+			} else if n > 0 {
+				log.Info("send-rate prune", "rows", n)
+			}
 		}
 		go repuCoord.Run(ctx)
 	}

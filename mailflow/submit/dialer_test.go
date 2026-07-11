@@ -98,6 +98,10 @@ func TestSourceIPDialerFailover(t *testing.T) {
 	deadAddr := dead.Addr().String()
 	dead.Close()
 
+	// pickSource must be called EXACTLY ONCE per delivery, even across failover:
+	// the source-IP lease has a side effect (it charges the IP's warmup/daily
+	// counter), so calling it per MX tried would over-count on every failover.
+	var pickCalls int
 	dialer := submit.SourceIPDialer(
 		func(ctx context.Context, domain string) ([]submit.MXHost, error) {
 			return []submit.MXHost{
@@ -105,7 +109,10 @@ func TestSourceIPDialerFailover(t *testing.T) {
 				{Host: dns.Domain{ASCII: "mx2.live"}, Addr: ln.Addr().String()},
 			}, nil
 		},
-		nil, // no source-IP selection
+		func(ctx context.Context, domain string, mx dns.Domain) (net.IP, error) {
+			pickCalls++
+			return nil, nil // OS default source; we only count invocations
+		},
 	)
 
 	conn, host, err := dialer(context.Background(), "recipient.example")
@@ -116,12 +123,15 @@ func TestSourceIPDialerFailover(t *testing.T) {
 	if host.ASCII != "mx2.live" {
 		t.Fatalf("failover host = %s, want mx2.live (should have skipped the dead primary)", host.ASCII)
 	}
+	if pickCalls != 1 {
+		t.Fatalf("pickSource called %d times across failover, want exactly 1 (per-delivery lease, not per-host)", pickCalls)
+	}
 	select {
 	case <-accepted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("live MX did not accept the failover connection")
 	}
-	t.Logf("OK: dialer failed over from a refused primary MX to the live secondary")
+	t.Logf("OK: dialer failed over from a refused primary MX to the live secondary; source leased once")
 }
 
 // TestSourceIPDialerAllDown proves the dialer returns an error (not a nil conn)

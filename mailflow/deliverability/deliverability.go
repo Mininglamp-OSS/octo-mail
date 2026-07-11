@@ -134,6 +134,32 @@ func (s *Service) AllowSend(ctx context.Context, tenantID int64) (bool, error) {
 	return count <= s.MaxPerWindow, nil
 }
 
+// PruneSendRate deletes tenant_send_rate rows for windows that have fully elapsed,
+// keeping only the current (and, defensively, the immediately previous) window.
+// The limiter only ever reads/writes the current window, so older rows are dead
+// weight; without this the table grows one row per tenant per window forever. Safe
+// to run from any cluster singleton on a periodic tick. A zero RateWindow (limiter
+// disabled) prunes nothing. Returns the number of rows removed.
+func (s *Service) PruneSendRate(ctx context.Context) (int64, error) {
+	window := s.RateWindow
+	if window <= 0 {
+		if s.MaxPerWindow <= 0 {
+			return 0, nil // limiter disabled; nothing writes the table
+		}
+		window = DefaultRateWindow
+	}
+	// Keep the current window and one prior (guards a tick landing just after a
+	// window boundary from deleting a row still being counted against).
+	ct, err := s.Pool.Exec(ctx,
+		`DELETE FROM tenant_send_rate
+		 WHERE window_start < to_timestamp(floor(extract(epoch from now()) / $1) * $1) - make_interval(secs => $1)`,
+		window.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
 // GateResult is the send-gate decision for one (tenant, remote domain).
 type GateResult struct {
 	Allowed bool

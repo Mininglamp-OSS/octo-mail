@@ -90,13 +90,15 @@ func checkReporterConfig(cfg config) error {
 // admin listener on a non-loopback address). Called once in run() after the other
 // check* functions. Warnings need the logger; errors abort startup.
 func validate(cfg config, log *slog.Logger) error {
-	// Fail fast: an S3 endpoint with NO credential path at all. Empty static creds
-	// ARE legitimate when a session token is set (STS) or an ambient IAM role is
-	// expected — but endpoint set with access+secret+token all empty is almost
-	// certainly a misconfiguration that would fail only on the first S3 request.
-	if cfg.s3Endpoint != "" && cfg.s3Access == "" && cfg.s3Secret == "" && cfg.s3SessionToken == "" {
-		return fmt.Errorf("OCTO_MAIL_S3_ENDPOINT is set (%q) but no credentials are configured: "+
-			"set OCTO_MAIL_S3_ACCESS + OCTO_MAIL_S3_SECRET, or OCTO_MAIL_S3_SESSION_TOKEN for STS/IAM-role auth",
+	// Fail fast: an S3 endpoint needs a usable credential. This store uses a
+	// hand-rolled SigV4 signer keyed by the ACCESS+SECRET pair (see
+	// storage/blob/s3.go); it has no ambient-credential/IMDS chain, and the optional
+	// session token only augments a signature — it cannot sign on its own. So an
+	// endpoint set without BOTH access and secret would fail on the first request.
+	// Catch it at startup instead.
+	if cfg.s3Endpoint != "" && (cfg.s3Access == "" || cfg.s3Secret == "") {
+		return fmt.Errorf("OCTO_MAIL_S3_ENDPOINT is set (%q) but OCTO_MAIL_S3_ACCESS/OCTO_MAIL_S3_SECRET are incomplete: "+
+			"both are required (the S3 signer has no ambient-IAM path; OCTO_MAIL_S3_SESSION_TOKEN only augments them)",
 			cfg.s3Endpoint)
 	}
 
@@ -153,6 +155,9 @@ func isLoopbackAddr(addr string) bool {
 	if err != nil {
 		host = addr // no port; treat the whole thing as the host
 	}
+	// Strip IPv6 brackets for a no-port form like "[::1]" (SplitHostPort errors on
+	// it, leaving the brackets that net.ParseIP won't accept).
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
 	if host == "" {
 		return false // ":8081" binds all interfaces
 	}

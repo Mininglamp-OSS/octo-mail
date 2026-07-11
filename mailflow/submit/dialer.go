@@ -40,24 +40,30 @@ func SourceIPDialer(
 		if len(hosts) == 0 {
 			return nil, dns.Domain{}, fmt.Errorf("no MX hosts for %s", domain)
 		}
+		// Choose the source IP ONCE per delivery, before the failover loop. The
+		// lease is per-tenant, not per-host, and (for the IPRouter) has a side effect
+		// — it charges the IP's daily/warmup send counter. Calling it once per MX
+		// tried would multiply that charge on every failover, prematurely exhausting
+		// warmup caps and even falsely advancing a warmup stage on connect failures.
+		// So it is bound once and reused for every candidate. The mx argument is the
+		// preferred (first) MX for routing/observability; the source choice does not
+		// depend on which candidate ultimately answers.
+		var localAddr *net.TCPAddr
+		if pickSource != nil {
+			ip, err := pickSource(ctx, domain, hosts[0].Host)
+			if err != nil {
+				return nil, dns.Domain{}, err
+			}
+			if ip != nil {
+				localAddr = &net.TCPAddr{IP: ip}
+			}
+		}
 		// Try each MX in order; the first TCP connect that succeeds wins. A connect
 		// failure advances to the next host (failover); the last error is returned if
-		// all fail. pickSource is inside the loop because the source-IP choice depends
-		// on the MX host being dialed.
+		// all fail.
 		var lastErr error
 		for _, h := range hosts {
-			d := net.Dialer{}
-			if pickSource != nil {
-				ip, err := pickSource(ctx, domain, h.Host)
-				if err != nil {
-					// A source-IP error is not per-host (it's a routing/warmup decision):
-					// don't burn the other MXs on it — surface it immediately.
-					return nil, dns.Domain{}, err
-				}
-				if ip != nil {
-					d.LocalAddr = &net.TCPAddr{IP: ip}
-				}
-			}
+			d := net.Dialer{LocalAddr: localAddr}
 			conn, err := d.DialContext(ctx, "tcp", h.Addr)
 			if err != nil {
 				lastErr = fmt.Errorf("dial %s (%s): %w", domain, h.Addr, err)

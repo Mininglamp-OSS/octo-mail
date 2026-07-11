@@ -762,6 +762,19 @@ func mailParamFlag(rest, key string) bool {
 	return false
 }
 
+// contains8bit reports whether the message contains any octet with the high bit
+// set — i.e. it is not 7-bit clean and genuinely needs 8BITMIME/SMTPUTF8 to reach
+// the next hop intact. Used to avoid requesting those extensions (and risking a
+// bounce from a legacy peer) for a 7-bit message a client merely tagged as 8-bit.
+func contains8bit(data []byte) bool {
+	for _, b := range data {
+		if b >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
 // hasDSNPerRcpt reports whether any per-recipient DSN param slot is non-empty, so
 // the maps are only built when a client actually sent NOTIFY/ORCPT.
 func hasDSNPerRcpt(vals []string) bool {
@@ -1019,7 +1032,20 @@ func (c *conn) processData(data []byte) error {
 	if submission {
 		// Enqueue to the shared outbound queue; the queue worker delivers. Carry
 		// the RFC 3461 DSN params (RET/ENVID per-message, NOTIFY/ORCPT per-rcpt).
-		dsnp := submit.DSNParams{Ret: c.dsnRet, EnvID: c.dsnEnvID, Body8BitMIME: c.mailBody8bitmime, SMTPUTF8: c.mailSMTPUTF8}
+		dsnp := submit.DSNParams{Ret: c.dsnRet, EnvID: c.dsnEnvID}
+		// Only propagate the 8BITMIME/SMTPUTF8 requests when the message ACTUALLY
+		// contains 8-bit content. Many MUAs tag every submission BODY=8BITMIME even
+		// for 7-bit-clean mail; forwarding that to a next hop that lacks the extension
+		// makes mox return a permanent (8BITMIME) or deferred (SMTPUTF8) error and
+		// bounce mail that would otherwise deliver. Gating on real content means a
+		// 7-bit message never requests either (so it can't bounce for lack of them),
+		// while genuine 8-bit mail still negotiates — a bounce there is honest (we do
+		// not down-convert). c.mailBody8bitmime/mailSMTPUTF8 record what the client
+		// asked; contains8bit(data) records what the body needs.
+		if has8bit := contains8bit(data); has8bit {
+			dsnp.Body8BitMIME = c.mailBody8bitmime
+			dsnp.SMTPUTF8 = c.mailSMTPUTF8
+		}
 		if hasDSNPerRcpt(c.subNotify) || hasDSNPerRcpt(c.subORcpt) {
 			dsnp.Notify = make(map[string]string, len(c.subRcpts))
 			dsnp.ORcpt = make(map[string]string, len(c.subRcpts))

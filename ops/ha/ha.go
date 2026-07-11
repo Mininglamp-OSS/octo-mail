@@ -103,6 +103,13 @@ type Leader struct {
 // New creates a Leader for the given advisory-lock key (any process using the
 // same key contends for the same leadership). nodeID identifies this node in the
 // lease row; it should be stable per process (e.g. cfg.nodeID).
+//
+// key must fit in an int32: the session advisory lock uses the two-key form
+// pg_advisory_lock(lockClassLeader, int32(key)), so only the low 32 bits are
+// significant for mutual exclusion. Two keys sharing their low 32 bits would alias
+// on the lock (while still distinct in the lease row). Callers use small distinct
+// constants (see cmd/octo-mail), so this is not a live concern — but keep keys
+// within int32.
 func New(pool *pgxpool.Pool, key int64, nodeID string) *Leader {
 	return &Leader{pool: pool, key: key, nodeID: nodeID}
 }

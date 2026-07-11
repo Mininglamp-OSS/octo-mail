@@ -61,7 +61,9 @@ func TestValidateS3CredsFailFast(t *testing.T) {
 	}{
 		{"no s3 at all", config{}, false},
 		{"endpoint + static creds", config{s3Endpoint: "http://s3", s3Access: "a", s3Secret: "s"}, false},
-		{"endpoint + session token only", config{s3Endpoint: "http://s3", s3SessionToken: "t"}, false},
+		{"endpoint + access+secret+token", config{s3Endpoint: "http://s3", s3Access: "a", s3Secret: "s", s3SessionToken: "t"}, false},
+		{"endpoint + session token only → refuse (signer needs secret)", config{s3Endpoint: "http://s3", s3SessionToken: "t"}, true},
+		{"endpoint + access but no secret → refuse", config{s3Endpoint: "http://s3", s3Access: "a"}, true},
 		{"endpoint + no creds → refuse", config{s3Endpoint: "http://s3"}, true},
 	}
 	for _, tc := range cases {
@@ -116,6 +118,7 @@ func TestIsLoopbackAddr(t *testing.T) {
 		"[::]:8081":        false,
 		"127.0.0.1:8081":   true,
 		"[::1]:8081":       true,
+		"[::1]":            true,
 		"localhost:8081":   true,
 		"10.0.0.5:8081":    false,
 		"example.com:8081": false,

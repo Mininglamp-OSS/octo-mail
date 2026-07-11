@@ -65,3 +65,47 @@ func TestSendRateLimiter(t *testing.T) {
 	}
 	t.Logf("OK: per-tenant fixed-window rate limit blocks over-cap sends, isolates tenants, and is unlimited when disabled")
 }
+
+// TestSendRatePrune proves PruneSendRate removes elapsed-window rows while keeping
+// the current window, so the counter table stays bounded.
+func TestSendRatePrune(t *testing.T) {
+	ctx := context.Background()
+	bs, _ := blob.NewFS(t.TempDir())
+	s, err := postgres.Open(ctx, testDSN, bs)
+	if err != nil {
+		t.Skipf("postgres not available (%v)", err)
+	}
+	defer s.Close()
+	if _, err := s.Pool.Exec(ctx, `TRUNCATE tenant_send_rate, tenants RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	var tid int64
+	s.Pool.QueryRow(ctx, `INSERT INTO tenants (name) VALUES ('a') RETURNING id`).Scan(&tid)
+
+	svc := &deliverability.Service{Pool: s.Pool, MaxPerWindow: 100, RateWindow: time.Minute}
+	// Record a send in the current window.
+	if _, err := svc.AllowSend(ctx, tid); err != nil {
+		t.Fatal(err)
+	}
+	// Seed old rows well outside the retained window.
+	if _, err := s.Pool.Exec(ctx,
+		`INSERT INTO tenant_send_rate (tenant_id, window_start, count) VALUES
+		 ($1, now() - interval '2 hours', 5), ($1, now() - interval '1 day', 9)`, tid); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, err := svc.PruneSendRate(ctx)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned != 2 {
+		t.Fatalf("pruned %d rows, want 2 (the two aged windows)", pruned)
+	}
+	// The current window's row must survive.
+	var remaining int
+	s.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_send_rate WHERE tenant_id=$1`, tid).Scan(&remaining)
+	if remaining != 1 {
+		t.Fatalf("after prune %d rows remain, want 1 (current window)", remaining)
+	}
+	t.Logf("OK: PruneSendRate removed elapsed windows, kept the current one")
+}

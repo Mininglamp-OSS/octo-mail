@@ -169,8 +169,10 @@ CREATE INDEX IF NOT EXISTS tlsrpt_reports_domain_idx ON tlsrpt_reports (domain);
 -- gives a baseline platform-wide throttle so a single tenant burst can't dominate
 -- outbound capacity (or a shared IP's reputation) even in the no-egress-pool
 -- default. The limiter increments count on each send attempt and blocks (defers)
--- once count exceeds the configured cap for the current window. Rows for elapsed
--- windows are harmless; the daily-maintenance singleton may prune them.
+-- once count exceeds the configured cap for the current window. Elapsed-window
+-- rows are pruned by Service.PruneSendRate, run on the reputation-unpause cluster
+-- singleton's tick (which runs regardless of the egress pool), so the table stays
+-- bounded to roughly one row per active tenant.
 CREATE TABLE IF NOT EXISTS tenant_send_rate (
     tenant_id    bigint NOT NULL REFERENCES tenants(id),
     window_start timestamptz NOT NULL,               -- start of the fixed window (UTC)
