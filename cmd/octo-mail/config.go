@@ -117,6 +117,16 @@ func validate(cfg config, log *slog.Logger) error {
 	// leader orders but validation never completes and TLS silently stays down
 	// cluster-wide — warn loudly at startup.
 	if cfg.acmeDirectory != "" && cfg.acmeContact != "" {
+		// Shared mode issues ONLY from the leader Tick over the configured hosts (the
+		// serving path never lazily orders), so with no ACME host AND no real hostname
+		// to fall back on, no certificate is ever issued — every :443 handshake fails.
+		// Refuse that config rather than fail silently. (main.go seeds a real hostname
+		// into the issuance set, so a real OCTO_MAIL_HOSTNAME alone is sufficient.)
+		if cfg.acmeShared && len(cfg.acmeHosts) == 0 && (cfg.hostname == "" || cfg.hostname == "octo-mail.local") {
+			return fmt.Errorf("shared ACME is enabled but no certificate host is configured: " +
+				"set OCTO_MAIL_ACME_HOSTS (comma-separated) and/or a real OCTO_MAIL_HOSTNAME — " +
+				"otherwise the leader issues nothing and every TLS handshake fails")
+		}
 		if cfg.jmapAddr == "" {
 			log.Warn("ACME is enabled but the JMAP/webmail HTTPS listener (OCTO_MAIL_JMAP_ADDR) is disabled: " +
 				"nothing will answer tls-alpn-01 on :443 and certificate issuance cannot complete")

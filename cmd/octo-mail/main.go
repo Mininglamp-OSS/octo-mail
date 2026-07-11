@@ -227,11 +227,30 @@ func run() error {
 				log.Info("ACME cert/account key encryption at rest enabled")
 			}
 		}
+		// Effective issuance host set: the configured ACME hosts plus this node's
+		// real hostname (which is also the SNI fallback, so it must have a cert). In
+		// shared mode the leader Tick is the ONLY issuance path (the serving path
+		// never orders), so an empty set means no cert is ever issued — validate()
+		// refuses that config, but guard here too and always include a real hostname.
+		acmeIssueHosts := append([]dns.Domain(nil), cfg.acmeHosts...)
+		if cfg.hostname != "" && cfg.hostname != "octo-mail.local" {
+			h := dns.Domain{ASCII: cfg.hostname}
+			seen := false
+			for _, x := range acmeIssueHosts {
+				if x.ASCII == h.ASCII {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				acmeIssueHosts = append(acmeIssueHosts, h)
+			}
+		}
 		am, err := acme.New(acme.Config{
 			CacheDir:     cfg.acmeCacheDir,
 			ContactEmail: cfg.acmeContact,
 			DirectoryURL: cfg.acmeDirectory,
-			Hostnames:    cfg.acmeHosts,
+			Hostnames:    acmeIssueHosts,
 			Fallback:     dns.Domain{ASCII: cfg.hostname},
 			Shutdown:     ctx.Done(),
 			Cache:        acmeCache,
@@ -242,7 +261,7 @@ func run() error {
 		acmeMail = am.MailTLSConfig()
 		acmeHTTPS = am.HTTPSTLSConfig()
 		if cfg.acmeShared {
-			log.Info("ACME/autotls enabled (shared cache, leader-gated issuance)", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts)
+			log.Info("ACME/autotls enabled (shared cache, leader-gated issuance)", "directory", cfg.acmeDirectory, "hosts", acmeIssueHosts)
 			// Leader-gated issuance: only the leader orders certs (into the shared
 			// cache); followers serve certs — and answer tls-alpn-01 challenges — from
 			// the cache and never order. The leader Tick pre-warms/renews each host so
@@ -260,7 +279,7 @@ func run() error {
 				log.Info("lost ACME issuance leadership", "node", cfg.nodeID)
 			}
 			acmeCoord.Tick = func(ctx context.Context) {
-				for _, h := range cfg.acmeHosts {
+				for _, h := range acmeIssueHosts {
 					if err := am.EnsureCert(ctx, h); err != nil {
 						log.WarnContext(ctx, "ACME pre-warm/renew", "host", h.ASCII, "err", err)
 					}

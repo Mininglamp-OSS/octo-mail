@@ -82,6 +82,12 @@ type Manager struct {
 	// path no longer consults it (all clustered nodes direct-serve).
 	clustered bool
 	isLeader  atomic.Bool
+	// leaderMu guards the per-leadership context. leaderCtx is live while this node
+	// is leader and cancelled on step-down (SetLeader(false)); EnsureCert threads it
+	// so an in-flight order is abandoned when leadership is lost.
+	leaderMu     sync.Mutex
+	leaderCtx    context.Context
+	leaderCancel context.CancelFunc
 	// cache is the shared autocert.Cache (nil in single-node mode). Every clustered
 	// node reads certs DIRECTLY from it (serveCachedCert) rather than via autocert's
 	// GetCertificate — because autocert's cert() arms a background renewal timer on
@@ -161,11 +167,36 @@ func New(cfg Config) (*Manager, error) {
 	return mgr, nil
 }
 
-// SetLeader marks this node as the ACME issuance leader (or not). In clustered
-// mode only the leader orders certs; followers serve from the shared cache. Wired
-// to a leader-election coordinator's OnElected/OnLost. No-op meaning in single-node
-// mode (the gate is skipped there).
-func (m *Manager) SetLeader(v bool) { m.isLeader.Store(v) }
+// SetLeader marks this node as the ACME issuance leader (or not), wired to a
+// leader-election coordinator's OnElected/OnLost. In clustered mode only the leader
+// orders certs; followers serve from the shared cache. Beyond the atomic flag it
+// manages a per-LEADERSHIP context: becoming leader creates a fresh leaderCtx;
+// losing leadership cancels it, so any in-flight EnsureCert order is abandoned
+// promptly rather than continuing to completion (and possibly writing to the shared
+// cache) after a new leader has taken over — closing the stale-leader double-order
+// window that a pre-launch boolean check alone leaves open.
+func (m *Manager) SetLeader(v bool) {
+	m.leaderMu.Lock()
+	defer m.leaderMu.Unlock()
+	if v == m.isLeader.Load() {
+		return // no transition
+	}
+	if v {
+		m.leaderCtx, m.leaderCancel = context.WithCancel(context.Background())
+	} else if m.leaderCancel != nil {
+		m.leaderCancel()
+		m.leaderCtx, m.leaderCancel = nil, nil
+	}
+	m.isLeader.Store(v)
+}
+
+// leadershipContext returns the current per-leadership context (cancelled on
+// step-down), or nil when not leader.
+func (m *Manager) leadershipContext() context.Context {
+	m.leaderMu.Lock()
+	defer m.leaderMu.Unlock()
+	return m.leaderCtx
+}
 
 // servingConfig builds a *tls.Config for serving traffic. protos sets NextProtos:
 // the HTTPS listener passes h2/http1.1/acme-tls/1 (so the same :443 door serves web
@@ -355,11 +386,14 @@ func parseCachedKeycert(data []byte) (*tls.Certificate, bool) {
 // the autotls logging wrapper, which dereferences hello.Conn and would panic on a
 // synthetic ClientHelloInfo. Call only on the leader (the coordinator's Tick).
 //
-// autocert's GetCertificate runs on its own internal context, so to honor the
-// caller's ctx (bound to the tick, cancelled on step-down/shutdown) the two orders
-// run in a goroutine and EnsureCert returns as soon as ctx is done — so a stuck
-// order can't stall subsequent ticks or delay shutdown. The order goroutine is not
-// abandoned mid-write: autocert bounds itself with its own 5-minute deadline.
+// autocert's GetCertificate runs on its own internal context, so to honor
+// cancellation the two orders run in a goroutine and EnsureCert returns as soon as
+// EITHER the caller's ctx (bound to the tick — cancelled on shutdown) OR the
+// per-leadership context (cancelled on step-down) is done. So a stuck order can't
+// stall subsequent ticks or delay shutdown, and — critically — an order in flight
+// when leadership is lost is abandoned rather than running to completion off-leader.
+// (The background goroutine itself is bounded by autocert's own 5-minute deadline;
+// abandoning it just means we stop waiting and never treat its result as ours.)
 func (m *Manager) EnsureCert(ctx context.Context, host dns.Domain) error {
 	// Defense in depth: EnsureCert is the ONLY path that orders, so refuse to run it
 	// unless this node is the leader — a stray/racing call on a non-leader (or after
@@ -368,6 +402,7 @@ func (m *Manager) EnsureCert(ctx context.Context, host dns.Domain) error {
 	if m.clustered && !m.isLeader.Load() {
 		return nil
 	}
+	leaderCtx := m.leadershipContext() // nil in single-node mode
 	done := make(chan error, 1)
 	go func() {
 		// ECDSA variant: advertise ECDSA capability so supportsECDSA() is true.
@@ -389,11 +424,18 @@ func (m *Manager) EnsureCert(ctx context.Context, host dns.Domain) error {
 		_, err := m.m.Manager.GetCertificate(rsaHello)
 		done <- err
 	}()
+	// Wait for completion, caller cancellation, or loss of leadership.
+	var leaderDone <-chan struct{}
+	if leaderCtx != nil {
+		leaderDone = leaderCtx.Done()
+	}
 	select {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-leaderDone:
+		return context.Canceled // leadership lost mid-order; abandon it
 	}
 }
 

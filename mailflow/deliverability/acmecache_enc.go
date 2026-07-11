@@ -21,13 +21,24 @@ type EncryptingCache struct {
 	Cipher *KeyCipher
 }
 
-// Get reads and decrypts the blob for name, verifying the name-bound AAD.
+// Get reads and decrypts the blob for name, verifying the name-bound AAD. A decrypt
+// failure (e.g. pre-existing PLAINTEXT rows from before the operator enabled
+// OCTO_MAIL_KEY_SECRET, or a wrong secret) is mapped to autocert.ErrCacheMiss
+// rather than surfaced as an error — so the ACME layer treats it as absent and the
+// leader re-issues, overwriting the entry with a properly-encrypted blob. That makes
+// enabling encryption on an existing cluster self-healing (certs re-issue once)
+// rather than a hard failure. (A genuinely wrong master secret therefore also reads
+// as a miss and triggers reissue — acceptable: the old blob is unreadable regardless.)
 func (c EncryptingCache) Get(ctx context.Context, name string) ([]byte, error) {
 	data, err := c.Inner.Get(ctx, name)
 	if err != nil {
 		return nil, err // includes autocert.ErrCacheMiss, propagated unchanged
 	}
-	return c.Cipher.decrypt(data, []byte(name))
+	plain, derr := c.Cipher.decrypt(data, []byte(name))
+	if derr != nil {
+		return nil, autocert.ErrCacheMiss // undecryptable (legacy plaintext / wrong key) → reissue
+	}
+	return plain, nil
 }
 
 // Put encrypts the blob (name bound as AAD) and stores it.

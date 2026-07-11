@@ -60,10 +60,24 @@ func TestEncryptingCache(t *testing.T) {
 	}
 
 	// AAD binding: move the ciphertext to a different cache key; decrypt must fail
-	// (the name is bound as GCM AAD), so a lifted blob can't be served.
+	// (the name is bound as GCM AAD), so a lifted blob is NOT served — it reads as a
+	// cache miss (undecryptable → ErrCacheMiss, which triggers reissue), never as the
+	// plaintext.
 	inner.m["other.com"] = inner.m["example.com"]
-	if _, err := c.Get(ctx, "other.com"); err == nil {
-		t.Fatal("decrypt succeeded for a ciphertext moved to a different cache key — AAD not bound to the name")
+	got2, err := c.Get(ctx, "other.com")
+	if !errors.Is(err, autocert.ErrCacheMiss) {
+		t.Fatalf("lifted ciphertext under a different key: err=%v, want ErrCacheMiss (not served)", err)
+	}
+	if got2 != nil {
+		t.Fatal("lifted ciphertext returned data — AAD not bound to the name")
+	}
+
+	// Self-heal: a PLAINTEXT (unencrypted) row, as would exist after enabling the
+	// secret on a running cluster, is undecryptable → reads as a miss so the leader
+	// reissues, rather than surfacing a hard error.
+	inner.m["legacy.com"] = []byte("plaintext-pem-not-MENC2")
+	if _, err := c.Get(ctx, "legacy.com"); !errors.Is(err, autocert.ErrCacheMiss) {
+		t.Fatalf("legacy plaintext row: err=%v, want ErrCacheMiss (self-heal via reissue)", err)
 	}
 
 	// Delete removes it.

@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/mjl-/mox/dns"
 )
 
 // TestCheckVERPConfig proves the security control that closes the nil-vs-empty
@@ -71,6 +73,43 @@ func TestValidateS3CredsFailFast(t *testing.T) {
 			err := validate(tc.cfg, log)
 			if tc.wantErr && err == nil {
 				t.Fatal("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateSharedACMERequiresHost proves the #44 fix: shared ACME issues only
+// from the leader Tick over the configured hosts, so an ACME-enabled shared config
+// with no ACME host AND only the default hostname would issue nothing — validate()
+// must refuse it. A real hostname (the SNI fallback, seeded into the issuance set)
+// or a configured ACME host satisfies it.
+func TestValidateSharedACMERequiresHost(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	base := func() config {
+		// ACME enabled + shared + a valid :443 JMAP so only the host rule is under test.
+		return config{acmeDirectory: "https://acme/dir", acmeContact: "a@b.example", acmeShared: true, jmapAddr: ":443"}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*config)
+		wantErr bool
+	}{
+		{"no hosts, default hostname → refuse", func(c *config) { c.hostname = "octo-mail.local" }, true},
+		{"no hosts, empty hostname → refuse", func(c *config) { c.hostname = "" }, true},
+		{"acme host configured → ok", func(c *config) { c.hostname = "octo-mail.local"; c.acmeHosts = []dns.Domain{{ASCII: "mail.example"}} }, false},
+		{"real hostname, no hosts → ok", func(c *config) { c.hostname = "mail.example" }, false},
+		{"legacy (non-shared) no hosts → ok (lazy issuance)", func(c *config) { c.hostname = "octo-mail.local"; c.acmeShared = false }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mutate(&cfg)
+			err := validate(cfg, log)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error (shared ACME with no issuable host), got nil")
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("unexpected error: %v", err)

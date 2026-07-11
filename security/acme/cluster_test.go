@@ -382,3 +382,30 @@ func TestServeSurvivesCacheOutage(t *testing.T) {
 	}
 	t.Logf("OK: a warmed cert is served through a shared-cache outage from the in-memory cache")
 }
+
+// TestEnsureCertAbandonedOnDemotion proves the #44 fix: an in-flight EnsureCert
+// order (here, stuck against an unreachable ACME directory) is abandoned promptly
+// when leadership is lost (SetLeader(false)), rather than running to autocert's
+// internal 5-minute deadline and possibly finalizing off-leader.
+func TestEnsureCertAbandonedOnDemotion(t *testing.T) {
+	m := newClusteredManager(t, newMemCache(), "x.example")
+	m.SetLeader(true)
+
+	done := make(chan error, 1)
+	go func() { done <- m.EnsureCert(context.Background(), dns.Domain{ASCII: "x.example"}) }()
+
+	// Give the order a moment to start (it will block on the unreachable directory),
+	// then demote.
+	time.Sleep(100 * time.Millisecond)
+	m.SetLeader(false)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("EnsureCert returned nil after demotion; expected cancellation")
+		}
+		t.Logf("OK: in-flight EnsureCert abandoned on demotion: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("EnsureCert did not return within 5s of demotion — leadership cancellation not honored")
+	}
+}
