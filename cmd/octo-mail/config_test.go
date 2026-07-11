@@ -48,10 +48,10 @@ func TestCheckVERPConfig(t *testing.T) {
 	}
 }
 
-// TestValidateS3CredsFailFast proves #25-5: an S3 endpoint configured with no
-// credential path at all is a fatal misconfiguration (caught at startup, not at
-// first request), while empty static creds are allowed when a session token is
-// present (STS/IAM-role auth).
+// TestValidateS3CredsFailFast proves #25-5: an S3 endpoint requires BOTH access
+// and secret (the hand-rolled SigV4 signer has no ambient-IAM path and the session
+// token only augments them), so an endpoint with missing/incomplete static creds
+// is a fatal misconfiguration caught at startup rather than at first request.
 func TestValidateS3CredsFailFast(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cases := []struct {
