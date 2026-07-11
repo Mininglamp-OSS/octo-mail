@@ -159,41 +159,65 @@ func handshake(t *testing.T, serverCfg *tls.Config, sni string, clientProtos []s
 }
 
 // TestClusteredFollowerServesCachedNeverOrders proves the leader-gating core over a
-// REAL handshake: a non-leader serves a cert already in the shared cache, but for
-// an un-issued host the handshake fails (unrecognized_name) WITHOUT the server
-// trying to order (a bounded deadline catches a regression that would block on the
-// unreachable directory). As leader, the un-issued host now triggers an issuance
-// attempt (also a handshake failure, but because ordering failed against the
-// unreachable directory — observed via timing/behaviour, asserted loosely).
+// REAL handshake: a non-leader serves a cert already in the shared cache, but when
+// NOTHING usable is cached (neither the SNI host nor the fallback) the handshake
+// fails (unrecognized_name) WITHOUT trying to order — a bounded deadline catches a
+// regression that would block on the unreachable directory.
 func TestClusteredFollowerServesCachedNeverOrders(t *testing.T) {
 	cache := newMemCache()
-	const served, unissued = "served.example", "unissued.example"
+	const served = "served.example"
 	seedKeycertKey(t, cache, served, served)
 
+	// Manager whose fallback is `served` (cached) — an allowlisted, cached host.
 	m := newClusteredManager(t, cache, served)
 	cfg := m.HTTPSTLSConfig()
 
-	// Follower serves a cached host: handshake succeeds.
+	// Follower serves a cached, allowlisted host: handshake succeeds.
 	if err, _ := handshake(t, cfg, served, []string{"http/1.1"}); err != nil {
 		t.Fatalf("follower handshake for cached host failed: %v", err)
 	}
 
-	// Follower, un-issued host: handshake fails fast (no cert → unrecognized_name),
-	// and the bounded handshake deadline ensures it did NOT block ordering.
+	// A separate manager whose host AND fallback are an un-cached host: a follower
+	// has nothing to serve (SNI not cached; fallback not cached) → no cert, fast, no
+	// ordering. (With the fallback also empty in cache, the SNI-fallback path can't
+	// rescue it, so this isolates the genuine no-serve case.)
+	const absent = "absent.example"
+	m2 := newClusteredManager(t, cache, absent) // fallback=absent, not in cache
 	start := time.Now()
-	err, _ := handshake(t, cfg, unissued, []string{"http/1.1"})
+	err, _ := handshake(t, m2.HTTPSTLSConfig(), absent, []string{"http/1.1"})
 	if err == nil {
-		t.Fatal("follower handshake for an un-issued host succeeded — expected no cert (serve-only)")
+		t.Fatal("follower handshake for an un-cached host succeeded — expected no cert (serve-only)")
 	}
 	if time.Since(start) > 3*time.Second {
-		t.Fatal("follower handshake for an un-issued host was slow — it likely tried to order (should be cache-only)")
+		t.Fatal("follower handshake for an un-cached host was slow — it likely tried to order (should be cache-only)")
 	}
-	t.Logf("OK: follower serves cached certs and returns no-cert (fast, no ordering) for un-issued hosts: %v", err)
+	t.Logf("OK: follower serves cached certs and returns no-cert (fast, no ordering) when nothing usable is cached: %v", err)
 }
 
-// TestServingConfigNextProtos proves the serving configs advertise acme-tls/1 (so
-// the same listener answers tls-alpn-01) and that the HTTPS config also offers
-// h2/http1.1 while the mail config does not.
+// TestFollowerFallbackForUnknownSNI proves the #44 fix: a follower mirrors the
+// leader/autotls unknown-SNI fallback. A client sending an SNI that is NOT the
+// allowlisted host (e.g. a bare domain / wrong name) is served the FALLBACK host's
+// cached cert — the same cert the leader would serve — instead of unrecognized_name.
+func TestFollowerFallbackForUnknownSNI(t *testing.T) {
+	cache := newMemCache()
+	const fallback = "mx.example"
+	seedKeycertKey(t, cache, fallback, fallback) // only the fallback host is cached
+
+	m := newClusteredManager(t, cache, fallback) // Hostnames + Fallback = mx.example
+	cfg := m.HTTPSTLSConfig()
+
+	// Client sends an unknown (non-allowlisted) SNI; the follower must fall back to
+	// the cached fallback host's cert and complete the handshake.
+	if err, _ := handshake(t, cfg, "not-allowlisted.example", []string{"http/1.1"}); err != nil {
+		t.Fatalf("follower did not fall back for an unknown SNI (would diverge from the leader): %v", err)
+	}
+	t.Logf("OK: follower serves the fallback host cert for an unknown SNI (matches leader/autotls behavior)")
+}
+
+// TestServingConfigNextProtos proves the HTTPS config advertises h2/http1.1/acme-tls/1
+// (so the same :443 door serves web traffic and answers tls-alpn-01), while the MAIL
+// config advertises NO ALPN — mail listeners never receive a tls-alpn-01 challenge,
+// and advertising only acme-tls/1 would break a mail client offering its own ALPN.
 func TestServingConfigNextProtos(t *testing.T) {
 	m := newClusteredManager(t, newMemCache(), "x.example")
 	https := m.HTTPSTLSConfig().NextProtos
@@ -202,13 +226,10 @@ func TestServingConfigNextProtos(t *testing.T) {
 	if !contains(https, xacme.ALPNProto) || !contains(https, "h2") || !contains(https, "http/1.1") {
 		t.Fatalf("HTTPS NextProtos = %v, want h2/http1.1/acme-tls/1", https)
 	}
-	if !contains(mail, xacme.ALPNProto) {
-		t.Fatalf("mail NextProtos = %v, want acme-tls/1", mail)
+	if len(mail) != 0 {
+		t.Fatalf("mail NextProtos = %v, want empty (mail listeners must not force ALPN / advertise acme-tls/1)", mail)
 	}
-	if contains(mail, "h2") {
-		t.Fatalf("mail NextProtos = %v, should not advertise h2", mail)
-	}
-	t.Logf("OK: HTTPS advertises h2/http1.1/acme-tls/1; mail advertises acme-tls/1 only")
+	t.Logf("OK: HTTPS advertises h2/http1.1/acme-tls/1; mail advertises no ALPN")
 }
 
 // TestFollowerAnswersTLSALPNChallenge proves a tls-alpn-01 challenge handshake is

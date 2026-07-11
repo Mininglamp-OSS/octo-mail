@@ -217,6 +217,15 @@ func run() error {
 		var acmeCache autocert.Cache
 		if cfg.acmeShared {
 			acmeCache = postgres.AcmeCache{Pool: s.Pool}
+			// Encrypt cert + ACME account private keys at rest with the same cipher as
+			// DKIM keys, when a master secret is configured — otherwise an operator who
+			// set OCTO_MAIL_KEY_SECRET (expecting all private keys at rest encrypted)
+			// would have plaintext TLS/account keys in a DB dump. Unset secret =
+			// plaintext, matching the DKIM path (operator's explicit choice).
+			if signer.Cipher != nil {
+				acmeCache = deliverability.EncryptingCache{Inner: acmeCache, Cipher: signer.Cipher}
+				log.Info("ACME cert/account key encryption at rest enabled")
+			}
 		}
 		am, err := acme.New(acme.Config{
 			CacheDir:     cfg.acmeCacheDir,

@@ -35,6 +35,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -144,15 +146,18 @@ func New(cfg Config) (*Manager, error) {
 // mode (the gate is skipped there).
 func (m *Manager) SetLeader(v bool) { m.isLeader.Store(v) }
 
-// servingConfig builds a *tls.Config for serving traffic that also answers
-// tls-alpn-01 challenges. withHTTP2 adds the h2/http1.1 protos (for the HTTPS
-// listener); mail listeners pass false. In clustered mode a NON-leader serves only
-// certs already in the shared cache and never triggers issuance — so a client
-// hitting a follower for an un-issued host gets unrecognized_name rather than the
-// follower racing the leader to order. tls-alpn-01 token requests are always served
-// (from the shared cache) on every node, so any node's :443 can answer a validation
-// the leader started.
-func (m *Manager) servingConfig(withHTTP2 bool) *tls.Config {
+// servingConfig builds a *tls.Config for serving traffic. protos sets NextProtos:
+// the HTTPS listener passes h2/http1.1/acme-tls/1 (so the same :443 door serves web
+// traffic AND answers tls-alpn-01); mail listeners pass nil (empty NextProtos) —
+// they never receive a tls-alpn-01 challenge (that only lands on :443), and
+// advertising ONLY acme-tls/1 would break an IMAP/submission client that offers its
+// own ALPN with no overlap (Go fails the handshake on non-overlapping ALPN). In
+// clustered mode a NON-leader serves only certs already in the shared cache and
+// never triggers issuance — a client hitting a follower for an un-issued host gets
+// unrecognized_name rather than the follower racing the leader to order. tls-alpn-01
+// token requests are always served (from the shared cache) on every node, so any
+// node's :443 can answer a validation the leader started.
+func (m *Manager) servingConfig(protos []string) *tls.Config {
 	cfg := m.m.TLSConfig(m.fallback, true, true)
 	inner := cfg.GetCertificate
 	cfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -173,10 +178,6 @@ func (m *Manager) servingConfig(withHTTP2 bool) *tls.Config {
 		}
 		return inner(hello) // leader may order on a cache miss; single-node always issues
 	}
-	protos := []string{xacme.ALPNProto}
-	if withHTTP2 {
-		protos = []string{"h2", "http/1.1", xacme.ALPNProto}
-	}
 	cfg.NextProtos = protos
 	return cfg
 }
@@ -185,31 +186,47 @@ func (m *Manager) servingConfig(withHTTP2 bool) *tls.Config {
 // :443 — it advertises h2/http1.1 AND acme-tls/1, so the same listener serves web
 // traffic and answers tls-alpn-01. This listener MUST be reachable on :443 for
 // issuance to complete.
-func (m *Manager) HTTPSTLSConfig() *tls.Config { return m.servingConfig(true) }
+func (m *Manager) HTTPSTLSConfig() *tls.Config {
+	return m.servingConfig([]string{"h2", "http/1.1", xacme.ALPNProto})
+}
 
 // MailTLSConfig is the serving config for the IMAP/submission TLS listeners
-// (implicit TLS / STARTTLS). It advertises acme-tls/1 too (harmless for mail
-// clients), so those listeners present ACME-managed certs.
-func (m *Manager) MailTLSConfig() *tls.Config { return m.servingConfig(false) }
+// (implicit TLS / STARTTLS). It sets NO NextProtos: mail listeners never receive a
+// tls-alpn-01 challenge (that lands only on :443), and advertising only acme-tls/1
+// would break a mail client that offers a non-overlapping ALPN. Certs are still
+// ACME-managed via GetCertificate.
+func (m *Manager) MailTLSConfig() *tls.Config { return m.servingConfig(nil) }
 
-// TLSConfig returns a serving *tls.Config. Retained for single-node callers/tests;
-// in clustered mode prefer HTTPSTLSConfig/MailTLSConfig. Equivalent to the mail
-// config (no h2), now including the acme-tls/1 responder proto.
-func (m *Manager) TLSConfig() *tls.Config { return m.servingConfig(false) }
+// TLSConfig returns a serving *tls.Config with no forced ALPN. Retained for
+// single-node callers/tests; in clustered mode prefer HTTPSTLSConfig/MailTLSConfig.
+func (m *Manager) TLSConfig() *tls.Config { return m.servingConfig(nil) }
 
 // serveCachedCert returns the cached certificate for hello's SNI, read DIRECTLY
-// from the shared cache (no autocert state, no renewal timer). It picks the ECDSA
-// or RSA variant by client capability (mirroring autocert's selection), so a
-// modern client gets the ECDSA cert and a legacy client the RSA one. A cache miss
-// or unusable/expired cert returns (nil, nil) — a TLS unrecognized_name alert.
-// Used only on a follower; the leader/single-node path goes through autocert.
+// from the shared cache (no autocert state, no renewal timer). It mirrors autotls's
+// serving fallback (fallbackNoSNI + fallbackUnknownSNI, both enabled for our
+// listeners): an empty, IP-literal, dotless, or non-allowlisted SNI is served the
+// fallback host's cert — so a legitimate mail client that sends a bare domain
+// instead of the MX hostname gets the same cert on a follower as it would on the
+// leader (not an unrecognized_name). It picks the ECDSA or RSA variant by client
+// capability. A genuine cache miss / unusable / expired cert returns (nil, nil) — a
+// TLS unrecognized_name alert. Used only on a follower; the leader/single-node path
+// goes through autocert. Never orders.
 func (m *Manager) serveCachedCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	if m.cache == nil {
 		return nil, nil
 	}
+	ctx := hello.Context()
 	name := strings.TrimSuffix(hello.ServerName, ".")
-	if name == "" {
-		name = m.fallback.ASCII // SNI-less client → fallback host (matches TLSConfig fallbackNoSNI)
+	// Resolve the effective host, mirroring autotls's fallback decisions:
+	//   - IP-literal SNI, empty SNI, or a dotless name → fallback host
+	//   - a well-formed name that is NOT allowlisted → fallback host
+	// (Our servingConfig builds the autotls config with fallbackNoSNI +
+	// fallbackUnknownSNI both true, so the leader path serves the fallback here too.)
+	if name == "" || net.ParseIP(name) != nil || !strings.Contains(name, ".") {
+		name = m.fallback.ASCII
+	} else if m.m.HostPolicy(ctx, name) != nil {
+		// Not an allowlisted host (or shutting down) → fallback, like the leader.
+		name = m.fallback.ASCII
 	}
 	if name == "" {
 		return nil, nil
@@ -220,11 +237,16 @@ func (m *Manager) serveCachedCert(hello *tls.ClientHelloInfo) (*tls.Certificate,
 	if !supportsECDSA(hello) {
 		keys = []string{name + "+rsa", name}
 	}
-	ctx := hello.Context()
 	for _, k := range keys {
 		data, err := m.cache.Get(ctx, k)
 		if err != nil {
-			continue // ErrCacheMiss or transient — try the other variant
+			if !errors.Is(err, autocert.ErrCacheMiss) {
+				// A transient cache (DB) error is fail-closed here (we serve no cert →
+				// unrecognized_name), but that turns a DB blip into a silent TLS outage,
+				// so make it visible rather than indistinguishable from a real miss.
+				m.log.Errorx("acme: reading cached certificate on follower", err, slog.String("cachekey", k))
+			}
+			continue // miss or transient — try the other variant
 		}
 		cert, ok := parseCachedKeycert(data)
 		if !ok {

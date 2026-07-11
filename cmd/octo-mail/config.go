@@ -122,8 +122,9 @@ func validate(cfg config, log *slog.Logger) error {
 				"nothing will answer tls-alpn-01 on :443 and certificate issuance cannot complete")
 		} else if _, port, err := net.SplitHostPort(cfg.jmapAddr); err != nil || port != "443" {
 			log.Warn("ACME is enabled but OCTO_MAIL_JMAP_ADDR is not on port 443: tls-alpn-01 validation "+
-				"lands on :443, so the ACME-serving HTTPS listener must be reachable there (directly or via an "+
-				"L4/SNI-passthrough proxy), else issuance will not complete", "jmap_addr", cfg.jmapAddr)
+				"lands on :443, so the ACME-serving HTTPS listener must be REACHABLE there — either bind it to "+
+				":443 directly, or front it with an L4/SNI-passthrough (non-terminating) proxy that forwards :443 "+
+				"to this port. If you have such a proxy, this warning is expected.", "jmap_addr", cfg.jmapAddr)
 		}
 	}
 
