@@ -309,6 +309,13 @@ type config struct {
 	// serve from the cache and answer tls-alpn-01 challenges (which requires the
 	// HTTPS listener to be reachable on :443). Set OCTO_MAIL_ACME_SHARED=0 for the
 	// legacy node-local single-node behavior.
+	//
+	// Upgrade notes: (1) first enabling shared mode on a node that already has certs
+	// in its local ./acme dir starts from an empty PG cache, so the leader re-orders
+	// every cert once (a brief no-cert window; watch Let's Encrypt rate limits).
+	// (2) first enabling OCTO_MAIL_KEY_SECRET over an existing (plaintext) shared
+	// acme_cache makes the old rows undecryptable → treated as a miss → the leader
+	// re-issues once, overwriting them encrypted (self-healing, same rate-limit note).
 	acmeDirectory string
 	acmeContact   string
 	acmeCacheDir  string

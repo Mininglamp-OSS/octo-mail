@@ -409,3 +409,45 @@ func TestEnsureCertAbandonedOnDemotion(t *testing.T) {
 		t.Fatal("EnsureCert did not return within 5s of demotion — leadership cancellation not honored")
 	}
 }
+
+// TestLeaderGatedCachePut proves the residual off-leader-write is closed: autocert's
+// cache Put (routed through the leader-gated wrapper) drops an issuance/account write
+// on a non-leader but always allows a tls-alpn-01 token write (every node must answer
+// challenges). Exercised through the manager's injected cache via a real order-less
+// path: we can't easily drive autocert here, so assert the wrapper behavior by
+// observing the shared cache after direct Puts through the manager's autocert cache.
+func TestLeaderGatedCachePut(t *testing.T) {
+	inner := newMemCache()
+	m := newClusteredManager(t, inner, "x.example")
+	// Reach the gated cache autocert would use: it's what New installed on the
+	// autotls manager. Exercise it via the exported behavior — SetLeader toggles.
+	gated := m.AutocertCacheForTest()
+	ctx := context.Background()
+
+	// Non-leader: an issuance/account Put is dropped; a token Put passes through.
+	m.SetLeader(false)
+	if err := gated.Put(ctx, "x.example", []byte("cert")); err != nil {
+		t.Fatalf("Put(cert) as non-leader: %v", err)
+	}
+	if _, err := inner.Get(ctx, "x.example"); !errorsIsCacheMiss(err) {
+		t.Fatal("non-leader issuance Put was NOT dropped — off-leader write possible")
+	}
+	if err := gated.Put(ctx, "x.example+token", []byte("tok")); err != nil {
+		t.Fatalf("Put(token) as non-leader: %v", err)
+	}
+	if _, err := inner.Get(ctx, "x.example+token"); err != nil {
+		t.Fatal("non-leader token Put was dropped — challenge answering would break")
+	}
+
+	// Leader: issuance Put passes through.
+	m.SetLeader(true)
+	if err := gated.Put(ctx, "x.example", []byte("cert")); err != nil {
+		t.Fatalf("Put(cert) as leader: %v", err)
+	}
+	if _, err := inner.Get(ctx, "x.example"); err != nil {
+		t.Fatal("leader issuance Put was dropped")
+	}
+	t.Logf("OK: off-leader issuance/account cache writes dropped; token writes always allowed; leader writes pass")
+}
+
+func errorsIsCacheMiss(err error) bool { return errors.Is(err, autocert.ErrCacheMiss) }

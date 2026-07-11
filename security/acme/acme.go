@@ -159,7 +159,15 @@ func New(cfg Config) (*Manager, error) {
 		// ACCOUNT key from the cache (accountKey() is used only when Client.Key is
 		// nil); autotls.Load set it from the local file, which we override here. Done
 		// before any listener serves, so autocert has not yet used the old values.
-		m.Manager.Cache = cfg.Cache
+		//
+		// autocert writes through a LEADER-GATED wrapper: an issuance/account Put is
+		// dropped on a non-leader, so an order goroutine that finishes after this node
+		// was demoted (EnsureCert stops WAITING on step-down, but autocert's own
+		// goroutine keeps running to its internal deadline) cannot write a cert
+		// off-leader. tls-alpn-01 token Puts always pass through — every node writes
+		// those to answer a challenge on its :443. serveCachedCert reads the RAW cache
+		// (mgr.cache) directly, bypassing both autocert and the gate.
+		m.Manager.Cache = &leaderGatedCache{inner: cfg.Cache, mgr: mgr}
 		m.Manager.Client.Key = nil
 		mgr.clustered = true
 		mgr.cache = cfg.Cache
@@ -445,6 +453,38 @@ func (m *Manager) EnsureCert(ctx context.Context, host dns.Domain) error {
 // is only needed for a dedicated challenge-only listener.)
 func (m *Manager) ACMEChallengeTLSConfig() *tls.Config {
 	return m.m.ACMETLSConfig
+}
+
+// leaderGatedCache wraps the shared autocert.Cache so that, in clustered mode, an
+// issuance/account-key Put is only allowed while this node is the leader — closing
+// the residual window where an order goroutine that keeps running after step-down
+// (autocert ignores the caller ctx and runs to its own deadline) could write a cert
+// off-leader. tls-alpn-01 token Puts (key suffix "+token") are NEVER gated: every
+// node must write its own token cert to answer a challenge on its :443. Get and
+// Delete always pass through (reads are safe; Delete is idempotent cleanup).
+type leaderGatedCache struct {
+	inner autocert.Cache
+	mgr   *Manager
+}
+
+func (c *leaderGatedCache) Get(ctx context.Context, name string) ([]byte, error) {
+	return c.inner.Get(ctx, name)
+}
+
+func (c *leaderGatedCache) Put(ctx context.Context, name string, data []byte) error {
+	// Token certs are challenge-answering state, not issuance output — every node
+	// writes them. Everything else (issued certs "<domain>"/"<domain>+rsa", the
+	// account key "acme_account+key") is issuance output and must only be written by
+	// the leader.
+	if !strings.HasSuffix(name, "+token") && c.mgr.clustered && !c.mgr.isLeader.Load() {
+		c.mgr.log.Debug("acme: dropping off-leader issuance cache write", slog.String("cachekey", name))
+		return nil // silently no-op; the leader owns issuance
+	}
+	return c.inner.Put(ctx, name, data)
+}
+
+func (c *leaderGatedCache) Delete(ctx context.Context, name string) error {
+	return c.inner.Delete(ctx, name)
 }
 
 // supportsECDSA reports whether the client can use an ECDSA certificate — a
