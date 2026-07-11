@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"sync"
@@ -23,17 +24,29 @@ import (
 	xacme "golang.org/x/crypto/acme"
 )
 
-// memCache is an in-memory autocert.Cache for unit tests (no Postgres, no CA).
+// memCache is an in-memory autocert.Cache for unit tests (no Postgres, no CA). When
+// failing is set, Get returns a transient (non-ErrCacheMiss) error — to simulate a
+// Postgres outage and prove the in-memory serving cache survives it.
 type memCache struct {
-	mu sync.Mutex
-	m  map[string][]byte
+	mu      sync.Mutex
+	m       map[string][]byte
+	failing bool
 }
 
 func newMemCache() *memCache { return &memCache{m: map[string][]byte{}} }
 
+func (c *memCache) setFailing(v bool) {
+	c.mu.Lock()
+	c.failing = v
+	c.mu.Unlock()
+}
+
 func (c *memCache) Get(_ context.Context, k string) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.failing {
+		return nil, errors.New("simulated cache outage")
+	}
 	if v, ok := c.m[k]; ok {
 		return v, nil
 	}
@@ -341,4 +354,31 @@ func seedExpiredKeycert(t *testing.T, c *memCache, host string) {
 	if err := c.Put(context.Background(), host, buf.Bytes()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestServeSurvivesCacheOutage proves the in-memory serving cache (P1-2): once a
+// cert has been served (warmed into memory), a subsequent shared-cache (Postgres)
+// outage does NOT stop the node serving it — the handshake still succeeds from the
+// in-memory copy, rather than every ClientHello depending on a live DB query.
+func TestServeSurvivesCacheOutage(t *testing.T) {
+	cache := newMemCache()
+	const host = "warm.example"
+	seedKeycertKey(t, cache, host, host)
+
+	m := newClusteredManager(t, cache, host)
+	cfg := m.HTTPSTLSConfig()
+
+	// Warm the in-memory cache via one successful handshake.
+	if err, _ := handshake(t, cfg, host, []string{"http/1.1"}); err != nil {
+		t.Fatalf("initial handshake (warm) failed: %v", err)
+	}
+
+	// Now simulate a Postgres outage: Get returns a transient error, not a miss.
+	cache.setFailing(true)
+
+	// The node must still serve the warmed cert from memory.
+	if err, _ := handshake(t, cfg, host, []string{"http/1.1"}); err != nil {
+		t.Fatalf("handshake during cache outage failed — in-memory serving cache didn't cover the DB blip: %v", err)
+	}
+	t.Logf("OK: a warmed cert is served through a shared-cache outage from the in-memory cache")
 }

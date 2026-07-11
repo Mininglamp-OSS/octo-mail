@@ -25,6 +25,7 @@
 package acme
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -39,6 +40,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -74,18 +76,37 @@ type Manager struct {
 	fallback dns.Domain
 	log      mlog.Log
 	// clustered is true when a shared Cache was supplied (multi-node leader-gated
-	// mode). isLeader is consulted by the serving configs: a follower serves cached
-	// certs but never orders. In single-node mode (clustered=false) the gate is a
-	// no-op and this node always issues.
+	// mode): every node serves via the direct cache path and issuance is confined to
+	// the leader's coordinator Tick. isLeader records leadership (set by the
+	// coordinator) — issuance (EnsureCert) is only invoked while leader; the serving
+	// path no longer consults it (all clustered nodes direct-serve).
 	clustered bool
 	isLeader  atomic.Bool
-	// cache is the shared autocert.Cache (nil in single-node mode). A follower reads
-	// certs DIRECTLY from it (serveCachedCert) rather than via autocert's
+	// cache is the shared autocert.Cache (nil in single-node mode). Every clustered
+	// node reads certs DIRECTLY from it (serveCachedCert) rather than via autocert's
 	// GetCertificate — because autocert's cert() arms a background renewal timer on
-	// every cache-hit, which would later order a renewal ON THE FOLLOWER, defeating
+	// any serve, which would later order a renewal off-leader, defeating
 	// leader-gating. Direct serving never touches autocert's renewer.
 	cache autocert.Cache
+	// certMem is a small in-memory cache of parsed serving certs (keyed by autocert
+	// cache key), so the hot TLS path doesn't do a Postgres query + X.509 parse on
+	// every ClientHello. Entries are re-validated for expiry on read and refreshed
+	// from the shared cache after memTTL, so a brief DB blip doesn't stop serving a
+	// recently-served cert. sync.Map: read-mostly, per-key.
+	certMem sync.Map // cacheKey(string) → *memCert
 }
+
+// memCert is an in-memory cached serving certificate plus the time it was loaded
+// from the shared cache (for TTL-based refresh).
+type memCert struct {
+	cert     *tls.Certificate
+	loadedAt time.Time
+}
+
+// memTTL bounds how long a parsed cert is served from memory before it is
+// refreshed from the shared cache — short enough that a leader renewal propagates
+// promptly, long enough to keep the DB off the hot path.
+const memTTL = 60 * time.Second
 
 // New constructs the ACME manager and registers the allowed hostnames.
 func New(cfg Config) (*Manager, error) {
@@ -151,32 +172,35 @@ func (m *Manager) SetLeader(v bool) { m.isLeader.Store(v) }
 // traffic AND answers tls-alpn-01); mail listeners pass nil (empty NextProtos) —
 // they never receive a tls-alpn-01 challenge (that only lands on :443), and
 // advertising ONLY acme-tls/1 would break an IMAP/submission client that offers its
-// own ALPN with no overlap (Go fails the handshake on non-overlapping ALPN). In
-// clustered mode a NON-leader serves only certs already in the shared cache and
-// never triggers issuance — a client hitting a follower for an un-issued host gets
-// unrecognized_name rather than the follower racing the leader to order. tls-alpn-01
-// token requests are always served (from the shared cache) on every node, so any
+// own ALPN with no overlap (Go fails the handshake on non-overlapping ALPN).
+//
+// In CLUSTERED mode EVERY node (leader included) serves via the direct cache path
+// (serveCachedCert), NOT autocert's GetCertificate. autocert's cert() arms a
+// background renewal timer on any serve, and such a timer survives a
+// demotion-without-exit and would later order off-leader — so keeping issuance off
+// the serving path entirely is what makes "only the leader orders" hold. Issuance +
+// renewal happen ONLY in the leader's coordinator Tick (EnsureCert). Single-node
+// (non-clustered) mode has no coordinator, so it still serves via autocert (which
+// issues lazily on a cache miss) — the legacy behavior. tls-alpn-01 token requests
+// always go through autocert (served from the shared cache, never order) so any
 // node's :443 can answer a validation the leader started.
 func (m *Manager) servingConfig(protos []string) *tls.Config {
 	cfg := m.m.TLSConfig(m.fallback, true, true)
 	inner := cfg.GetCertificate
 	cfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		// tls-alpn-01 challenge: served from cache/in-memory token map, never orders.
-		// Allow on every node so a follower's :443 can answer the leader's challenge.
+		// Goes through autocert on every node so a :443 can answer the leader's challenge.
 		if len(hello.SupportedProtos) == 1 && hello.SupportedProtos[0] == xacme.ALPNProto {
 			return inner(hello)
 		}
-		// Follower (clustered, not leader): serve-only, DIRECTLY from the shared
-		// cache. We must NOT delegate to autocert's GetCertificate even on a cache
-		// hit: autocert.cert() arms a background renewal timer on every hit, which
-		// would later order a renewal on this follower (off-leader), reintroducing
-		// the H17 multi-node ordering race for the steady-state renewal case. Direct
-		// serving returns the cached cert without touching autocert's renewer; a miss
-		// returns (nil, nil) → TLS unrecognized_name (no order).
-		if m.clustered && !m.isLeader.Load() {
+		// Clustered: serve DIRECTLY from the shared cache on every node (leader and
+		// follower alike), never arming autocert's renewer. A miss returns (nil, nil)
+		// → TLS unrecognized_name; issuance is the leader Tick's job, not the serving
+		// path's.
+		if m.clustered {
 			return m.serveCachedCert(hello)
 		}
-		return inner(hello) // leader may order on a cache miss; single-node always issues
+		return inner(hello) // single-node: autocert issues lazily on a cache miss
 	}
 	cfg.NextProtos = protos
 	return cfg
@@ -238,27 +262,55 @@ func (m *Manager) serveCachedCert(hello *tls.ClientHelloInfo) (*tls.Certificate,
 		keys = []string{name + "+rsa", name}
 	}
 	for _, k := range keys {
-		data, err := m.cache.Get(ctx, k)
-		if err != nil {
-			if !errors.Is(err, autocert.ErrCacheMiss) {
-				// A transient cache (DB) error is fail-closed here (we serve no cert →
-				// unrecognized_name), but that turns a DB blip into a silent TLS outage,
-				// so make it visible rather than indistinguishable from a real miss.
-				m.log.Errorx("acme: reading cached certificate on follower", err, slog.String("cachekey", k))
-			}
-			continue // miss or transient — try the other variant
+		if cert := m.lookupCert(ctx, k); cert != nil {
+			return cert, nil
 		}
-		cert, ok := parseCachedKeycert(data)
-		if !ok {
-			continue
-		}
-		// Serve only a currently-valid cert (the leader renews before expiry).
-		if now := timeNow(); cert.Leaf != nil && (now.Before(cert.Leaf.NotBefore) || now.After(cert.Leaf.NotAfter)) {
-			continue
-		}
-		return cert, nil
 	}
 	return nil, nil
+}
+
+// lookupCert returns a currently-valid serving cert for cache key k, from the
+// in-memory cache when fresh, else from the shared cache (parsed and memoized).
+// Returns nil on miss / unusable / expired. Keeps the Postgres query + X.509 parse
+// off the hot TLS path except on a cold miss or after memTTL.
+func (m *Manager) lookupCert(ctx context.Context, k string) *tls.Certificate {
+	now := timeNow()
+	if v, ok := m.certMem.Load(k); ok {
+		mc := v.(*memCert)
+		// Serve from memory while fresh AND still within cert validity.
+		if now.Sub(mc.loadedAt) < memTTL && certValid(mc.cert, now) {
+			return mc.cert
+		}
+	}
+	data, err := m.cache.Get(ctx, k)
+	if err != nil {
+		if !errors.Is(err, autocert.ErrCacheMiss) {
+			// A transient cache (DB) error would otherwise be a silent TLS outage
+			// (fail-closed → unrecognized_name); log it distinctly from a real miss.
+			// Fall back to a still-valid in-memory entry if we have one, so a brief DB
+			// blip doesn't stop serving a recently-served cert.
+			m.log.Errorx("acme: reading cached certificate", err, slog.String("cachekey", k))
+			if v, ok := m.certMem.Load(k); ok {
+				if mc := v.(*memCert); certValid(mc.cert, now) {
+					return mc.cert
+				}
+			}
+		} else {
+			m.certMem.Delete(k) // definitively gone from shared storage
+		}
+		return nil
+	}
+	cert, ok := parseCachedKeycert(data)
+	if !ok || !certValid(cert, now) {
+		return nil
+	}
+	m.certMem.Store(k, &memCert{cert: cert, loadedAt: now})
+	return cert
+}
+
+// certValid reports whether cert is currently within its validity window.
+func certValid(cert *tls.Certificate, now time.Time) bool {
+	return cert != nil && cert.Leaf != nil && !now.Before(cert.Leaf.NotBefore) && !now.After(cert.Leaf.NotAfter)
 }
 
 // parseCachedKeycert decodes autocert's cached keycert blob (PEM private key
@@ -294,33 +346,55 @@ func parseCachedKeycert(data []byte) (*tls.Certificate, bool) {
 	return &tls.Certificate{Certificate: chain, PrivateKey: key, Leaf: leaf}, true
 }
 
-// EnsureCert proactively obtains (or renews) the certificate for host, so the
-// leader issues ahead of client traffic and re-establishes autocert's in-memory
-// renew timers after a restart. It warms BOTH the ECDSA and RSA variants: a
-// synthetic hello with no cipher/curve info makes autocert pick RSA, but real
-// clients overwhelmingly negotiate ECDSA — and the follower serve path looks up the
-// ECDSA key first — so warming only RSA would leave the cert clients actually use
-// unissued. Uses the RAW autocert GetCertificate — NOT the autotls logging wrapper,
-// which dereferences hello.Conn and would panic on a synthetic ClientHelloInfo.
-// Call only on the leader (the coordinator's Tick).
-func (m *Manager) EnsureCert(host dns.Domain) error {
-	// ECDSA variant: advertise ECDSA capability so supportsECDSA() is true.
-	ecdsaHello := &tls.ClientHelloInfo{
-		ServerName:       host.ASCII,
-		SignatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
-		SupportedCurves:  []tls.CurveID{tls.CurveP256},
-		CipherSuites:     []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+// EnsureCert proactively obtains (or renews) the certificate for host — the ONLY
+// issuance path in clustered mode (the serving path never orders). It warms BOTH
+// the ECDSA and RSA variants: a synthetic hello with no cipher/curve info makes
+// autocert pick RSA, but real clients overwhelmingly negotiate ECDSA — and the
+// serve path looks up the ECDSA key first — so warming only RSA would leave the
+// cert clients actually use unissued. Uses the RAW autocert GetCertificate — NOT
+// the autotls logging wrapper, which dereferences hello.Conn and would panic on a
+// synthetic ClientHelloInfo. Call only on the leader (the coordinator's Tick).
+//
+// autocert's GetCertificate runs on its own internal context, so to honor the
+// caller's ctx (bound to the tick, cancelled on step-down/shutdown) the two orders
+// run in a goroutine and EnsureCert returns as soon as ctx is done — so a stuck
+// order can't stall subsequent ticks or delay shutdown. The order goroutine is not
+// abandoned mid-write: autocert bounds itself with its own 5-minute deadline.
+func (m *Manager) EnsureCert(ctx context.Context, host dns.Domain) error {
+	// Defense in depth: EnsureCert is the ONLY path that orders, so refuse to run it
+	// unless this node is the leader — a stray/racing call on a non-leader (or after
+	// step-down) can never order off-leader. The coordinator only invokes it from the
+	// leader Tick anyway; this makes the invariant local to the ordering primitive.
+	if m.clustered && !m.isLeader.Load() {
+		return nil
 	}
-	if _, err := m.m.Manager.GetCertificate(ecdsaHello); err != nil {
+	done := make(chan error, 1)
+	go func() {
+		// ECDSA variant: advertise ECDSA capability so supportsECDSA() is true.
+		ecdsaHello := &tls.ClientHelloInfo{
+			ServerName:       host.ASCII,
+			SignatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
+			SupportedCurves:  []tls.CurveID{tls.CurveP256},
+			CipherSuites:     []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		}
+		if _, err := m.m.Manager.GetCertificate(ecdsaHello); err != nil {
+			done <- err
+			return
+		}
+		// RSA variant: no ECDSA capability → autocert picks RSA (for legacy clients).
+		rsaHello := &tls.ClientHelloInfo{
+			ServerName:   host.ASCII,
+			CipherSuites: []uint16{tls.TLS_RSA_WITH_AES_128_GCM_SHA256},
+		}
+		_, err := m.m.Manager.GetCertificate(rsaHello)
+		done <- err
+	}()
+	select {
+	case err := <-done:
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	// RSA variant: no ECDSA capability → autocert picks RSA (for legacy clients).
-	rsaHello := &tls.ClientHelloInfo{
-		ServerName:   host.ASCII,
-		CipherSuites: []uint16{tls.TLS_RSA_WITH_AES_128_GCM_SHA256},
-	}
-	_, err := m.m.Manager.GetCertificate(rsaHello)
-	return err
 }
 
 // ACMEChallengeTLSConfig returns the TLS config that answers ACME tls-alpn-01

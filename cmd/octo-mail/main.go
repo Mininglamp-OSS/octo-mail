@@ -261,7 +261,7 @@ func run() error {
 			}
 			acmeCoord.Tick = func(ctx context.Context) {
 				for _, h := range cfg.acmeHosts {
-					if err := am.EnsureCert(h); err != nil {
+					if err := am.EnsureCert(ctx, h); err != nil {
 						log.WarnContext(ctx, "ACME pre-warm/renew", "host", h.ASCII, "err", err)
 					}
 				}
