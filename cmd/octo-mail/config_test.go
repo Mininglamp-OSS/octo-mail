@@ -156,3 +156,25 @@ func TestOpenBlobStoreSelectsBackend(t *testing.T) {
 	}
 	_ = ref
 }
+
+// TestLoadConfigACMEDNSWebhook proves the new DNS-01 config surface (#32) is read
+// from the environment: the webhook URL/secret select leader-gated multi-node mode
+// downstream in run(), so they must load into the config.
+func TestLoadConfigACMEDNSWebhook(t *testing.T) {
+	t.Setenv("OCTO_MAIL_ACME_DNS_WEBHOOK_URL", "https://dns.example.test/hook")
+	t.Setenv("OCTO_MAIL_ACME_DNS_WEBHOOK_SECRET", "hooksecret")
+	cfg := loadConfig()
+	if cfg.acmeDNSWebhookURL != "https://dns.example.test/hook" {
+		t.Fatalf("acmeDNSWebhookURL = %q", cfg.acmeDNSWebhookURL)
+	}
+	if string(cfg.acmeDNSWebhookSecret) != "hooksecret" {
+		t.Fatalf("acmeDNSWebhookSecret = %q", cfg.acmeDNSWebhookSecret)
+	}
+
+	// Unset URL leaves legacy single-node mode (empty), not a non-nil zero value
+	// that could be misread as configured.
+	t.Setenv("OCTO_MAIL_ACME_DNS_WEBHOOK_URL", "")
+	if got := loadConfig(); got.acmeDNSWebhookURL != "" {
+		t.Fatalf("empty env → acmeDNSWebhookURL = %q, want empty", got.acmeDNSWebhookURL)
+	}
+}

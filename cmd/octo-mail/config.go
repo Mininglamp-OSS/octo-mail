@@ -283,6 +283,15 @@ type config struct {
 	acmeContact   string
 	acmeCacheDir  string
 	acmeHosts     []dns.Domain
+	// acmeDNSWebhookURL, when set, switches ACME to leader-gated multi-node DNS-01
+	// issuance (#32): the elected leader publishes _acme-challenge TXT records via
+	// this operator-run webhook and writes issued certs to shared Postgres; every
+	// node serves TLS from that shared store. Empty keeps the legacy single-node
+	// tls-alpn-01 path.
+	acmeDNSWebhookURL string
+	// acmeDNSWebhookSecret HMAC-signs the webhook body (X-Octo-Signature) so the
+	// operator's endpoint can authenticate record-mutation requests.
+	acmeDNSWebhookSecret []byte
 }
 
 func loadConfig() config {
@@ -351,6 +360,9 @@ func loadConfig() config {
 		acmeContact:   os.Getenv("OCTO_MAIL_ACME_CONTACT"),
 		acmeCacheDir:  envDefault("OCTO_MAIL_ACME_CACHE", "./acme"),
 		acmeHosts:     parseDomainList(os.Getenv("OCTO_MAIL_ACME_HOSTS")),
+
+		acmeDNSWebhookURL:    os.Getenv("OCTO_MAIL_ACME_DNS_WEBHOOK_URL"),
+		acmeDNSWebhookSecret: []byte(os.Getenv("OCTO_MAIL_ACME_DNS_WEBHOOK_SECRET")),
 	}
 }
 

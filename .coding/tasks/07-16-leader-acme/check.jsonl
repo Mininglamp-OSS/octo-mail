@@ -1,0 +1,4 @@
+{"file": ".coding/spec/backend/quality-guidelines.md", "reason": "verify mox reuse boundary respected (no vendored patching), tenant/dep-direction rules, env config + make fmt/vet/test discipline"}
+{"file": ".coding/spec/backend/database-guidelines.md", "reason": "verify idempotent DDL, pgx patterns, ErrCacheMiss mapping, and that tests run under -p 1 against real Postgres (not skipped-as-passed)"}
+{"file": ".coding/spec/backend/error-handling.md", "reason": "verify %w wrapping, sentinel errors, no panic in the ACME/serving paths"}
+{"file": ".coding/spec/guides/cross-layer-thinking-guide.md", "reason": "leader-gated issuance vs all-node serving crosses ha/security/storage layers; check the seam and shared-cache staleness handling"}

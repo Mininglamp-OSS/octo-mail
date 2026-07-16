@@ -1,0 +1,5 @@
+{"file": ".coding/spec/backend/database-guidelines.md", "reason": "pgx usage, idempotent embedded schema (schema/10_acme_cache.sql), and the -p 1 real-infra test rule for pgCache tests"}
+{"file": ".coding/spec/backend/directory-structure.md", "reason": "dependency direction: security/acme takes *pgxpool.Pool (junkfilter precedent); schema stays in storage/postgres; no protocol involvement"}
+{"file": ".coding/spec/backend/error-handling.md", "reason": "fmt.Errorf(\"...: %w\") wrapping and sentinel-error style for the ACME flow and pgCache (map no-rows to autocert.ErrCacheMiss)"}
+{"file": ".coding/spec/backend/logging-guidelines.md", "reason": "injected *slog.Logger + WarnContext/structured kv for the leader renewal loop and webhook solver"}
+{"file": ".coding/spec/backend/quality-guidelines.md", "reason": "mox reuse boundary (drive vendored x/crypto/acme, do NOT patch vendored autocert), env-var config conventions, make targets"}
