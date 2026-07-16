@@ -43,15 +43,24 @@ func (c *pgCache) Get(ctx context.Context, name string) ([]byte, error) {
 // Put upserts data under name and bumps updated_at (the change marker followers
 // poll to detect a leader renewal).
 func (c *pgCache) Put(ctx context.Context, name string, data []byte) error {
-	_, err := c.pool.Exec(ctx,
-		`INSERT INTO acme_cache (name, data, updated_at) VALUES ($1, $2, now())
-		 ON CONFLICT (name) DO UPDATE SET data=EXCLUDED.data, updated_at=now()`,
-		name, data)
-	if err != nil {
+	if _, err := c.pool.Exec(ctx, acmeUpsertSQL, name, data); err != nil {
 		return fmt.Errorf("acme cache put %q: %w", name, err)
 	}
 	return nil
 }
+
+// putTx upserts within an existing transaction — used to commit a cert write
+// under the leadership epoch fence (ha.Leader.FenceExec), so a leader demoted by
+// a PostgreSQL promotion cannot overwrite a newer leader's cert.
+func putTx(ctx context.Context, tx pgx.Tx, name string, data []byte) error {
+	if _, err := tx.Exec(ctx, acmeUpsertSQL, name, data); err != nil {
+		return fmt.Errorf("acme cache put %q: %w", name, err)
+	}
+	return nil
+}
+
+const acmeUpsertSQL = `INSERT INTO acme_cache (name, data, updated_at) VALUES ($1, $2, now())
+	 ON CONFLICT (name) DO UPDATE SET data=EXCLUDED.data, updated_at=now()`
 
 // Delete removes name. Absent name is not an error (autocert.Cache contract).
 func (c *pgCache) Delete(ctx context.Context, name string) error {

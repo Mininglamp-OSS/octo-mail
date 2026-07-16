@@ -15,9 +15,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mjl-/autocert"
 	"github.com/mjl-/mox/dns"
@@ -38,9 +40,20 @@ type ClusterConfig struct {
 	DirectoryURL string        // ACME directory (Let's Encrypt prod/staging, or pebble)
 	ContactEmail string        // ACME account contact
 	Hostnames    []dns.Domain  // hostnames the cluster obtains certificates for
+	Fallback     dns.Domain    // fallback hostname for SNI-less / unknown-SNI clients (also managed)
 	Solver       DNSSolver     // dns-01 record publisher (webhook in production)
 	RenewBefore  time.Duration // renew this long before expiry (0 = 30 days)
 	Log          *slog.Logger  // nil = slog.Default()
+}
+
+// Fencer guards a write with the ha leadership epoch: FenceExec commits fn's
+// transaction only if this node still holds the lease at the epoch it held when
+// elected, else returns ha.ErrFenced without running fn. *ha.Leader satisfies it.
+// Used so a leader demoted by a PostgreSQL promotion cannot commit a cert write
+// after a new leader has taken over. Kept as a local interface so security/acme
+// need not import ops/ha.
+type Fencer interface {
+	FenceExec(ctx context.Context, fn func(pgx.Tx) error) error
 }
 
 // ClusterManager runs octo-mail's leader-gated, DNS-01, multi-node ACME issuance.
@@ -49,17 +62,20 @@ type ClusterConfig struct {
 // certificates over dns-01 and writes them to the shared Postgres store. EVERY
 // node serves TLS via TLSConfig, reading certificates from that shared store and
 // NEVER issuing — so leadership is consulted only on the background renewal loop,
-// never on the TLS hot path. A per-node refresher (refreshLoop) reloads a
+// never on the TLS hot path. A per-node refresher (RunRefresh) reloads a
 // certificate after the leader renews it, bounded by the poll interval.
 type ClusterManager struct {
 	cache       *pgCache
 	client      *acme.Client
 	solver      DNSSolver
-	hosts       []string // ASCII hostnames
+	hosts       []string            // managed ASCII hostnames (includes fallback), normalized
+	hostSet     map[string]struct{} // allowlist for serve-path lookups (avoids DB hit for unknown SNI)
+	fallback    string              // normalized fallback host served for no-SNI / unknown-SNI ("" = none)
 	contact     string
 	renewBefore time.Duration
 	log         *slog.Logger
 	dirHash     string // sha256(directoryURL) hex — namespaces the account key per directory
+	fencer      Fencer // optional: epoch-fences the cert write against a PG failover
 
 	regMu      sync.Mutex
 	registered bool // account registered this process (KID cached on the client)
@@ -67,6 +83,12 @@ type ClusterManager struct {
 	mu    sync.RWMutex
 	certs map[string]*tls.Certificate // host -> served cert
 	seen  map[string]time.Time        // host -> updated_at last loaded (refresh marker)
+}
+
+// normalizeHost lowercases and strips a trailing dot so SNI matching is
+// case-insensitive and FQDN-form ("mail.example.com." ) matches the stored host.
+func normalizeHost(h string) string {
+	return strings.ToLower(strings.TrimSuffix(h, "."))
 }
 
 // NewCluster builds a ClusterManager. It does not touch the network or the
@@ -93,9 +115,31 @@ func NewCluster(cfg ClusterConfig) (*ClusterManager, error) {
 	if renew == 0 {
 		renew = defaultRenewBefore
 	}
-	hosts := make([]string, 0, len(cfg.Hostnames))
+	// Managed host set = configured hostnames ∪ fallback, normalized and deduped.
+	// The fallback is served for no-SNI / unknown-SNI clients, so it must also be
+	// issued and renewed — it is just another managed host.
+	fallback := normalizeHost(cfg.Fallback.ASCII)
+	hostSet := map[string]struct{}{}
+	hosts := make([]string, 0, len(cfg.Hostnames)+1)
+	add := func(h string) {
+		h = normalizeHost(h)
+		if h == "" {
+			return
+		}
+		if _, ok := hostSet[h]; ok {
+			return
+		}
+		hostSet[h] = struct{}{}
+		hosts = append(hosts, h)
+	}
 	for _, h := range cfg.Hostnames {
-		hosts = append(hosts, h.ASCII)
+		add(h.ASCII)
+	}
+	add(fallback)
+	if len(hosts) == 0 {
+		// Empty host list would build a manager that reports "enabled" yet can never
+		// issue or serve anything — reject rather than silently no-op (#32 review).
+		return nil, fmt.Errorf("acme cluster: no hostnames configured (set OCTO_MAIL_ACME_HOSTS and/or a fallback hostname)")
 	}
 	sum := sha256.Sum256([]byte(cfg.DirectoryURL))
 	return &ClusterManager{
@@ -103,6 +147,8 @@ func NewCluster(cfg ClusterConfig) (*ClusterManager, error) {
 		client:      &acme.Client{DirectoryURL: cfg.DirectoryURL, UserAgent: "octo-mail"},
 		solver:      cfg.Solver,
 		hosts:       hosts,
+		hostSet:     hostSet,
+		fallback:    fallback,
 		contact:     cfg.ContactEmail,
 		renewBefore: renew,
 		log:         log,
@@ -111,6 +157,11 @@ func NewCluster(cfg ClusterConfig) (*ClusterManager, error) {
 		seen:        map[string]time.Time{},
 	}, nil
 }
+
+// SetFencer installs the leadership epoch fence used to guard the cert write
+// against a PostgreSQL failover (see Fencer). Call once after election wiring,
+// before RenewOnce runs. Optional: without it the write is a plain upsert.
+func (m *ClusterManager) SetFencer(f Fencer) { m.fencer = f }
 
 // SetACMEHTTPClient overrides the HTTP client the ACME account uses to reach the
 // directory. Used by the pebble integration test to trust pebble's self-signed
@@ -129,26 +180,45 @@ func (m *ClusterManager) TLSConfig() *tls.Config {
 }
 
 func (m *ClusterManager) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	host := hello.ServerName
-	if host == "" {
-		return nil, nil // no SNI: let the caller's default handling apply
+	// Resolve the host to serve: normalize SNI; an empty or unknown SNI falls back
+	// to the fallback host (matching the legacy manager's no-SNI/unknown-SNI
+	// behavior), which is critical for mail clients / STARTTLS. Gating on the
+	// allowlist before any DB access also stops random-SNI handshakes from
+	// amplifying into one Postgres query each.
+	host := normalizeHost(hello.ServerName)
+	if _, ok := m.hostSet[host]; !ok {
+		if m.fallback == "" {
+			return nil, nil // unknown SNI, no fallback → "unrecognized name"
+		}
+		host = m.fallback
 	}
+
 	m.mu.RLock()
 	cert := m.certs[host]
 	m.mu.RUnlock()
-	if cert != nil {
-		return cert, nil
+	if cert == nil {
+		// Cold miss (e.g. before the first refresh tick): one synchronous load. Only
+		// reached for allowlisted hosts, so this cannot be abused by arbitrary SNI.
+		ctx := hello.Context()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		c, _, err := m.loadCert(ctx, host)
+		if err != nil {
+			return nil, nil // missing/unparseable → "unrecognized name", not a hard error
+		}
+		cert = c
 	}
-	// Cold miss (e.g. before the first refresh tick): one synchronous load.
-	ctx := hello.Context()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	cert, _, err := m.loadCert(ctx, host)
-	if err != nil {
-		// Missing/unparseable cert → "unrecognized name" to the client, not a
-		// hard error (matches the legacy manager's unknown-SNI behavior).
-		return nil, nil
+	// Serve-time validation makes the fail-soft contract real: never serve a cert
+	// that does not cover the host or has expired (corrupt/mis-seeded bundle, or a
+	// stalled renewal). Reject to "unrecognized name" rather than serving it.
+	if leaf := cert.Leaf; leaf != nil {
+		if err := leaf.VerifyHostname(host); err != nil {
+			return nil, nil
+		}
+		if !time.Now().Before(leaf.NotAfter) {
+			return nil, nil
+		}
 	}
 	return cert, nil
 }
@@ -231,6 +301,15 @@ func (m *ClusterManager) RunRefresh(ctx context.Context, interval time.Duration)
 // every managed host that is missing or within RenewBefore of expiry. Call ONLY
 // from the leader (e.g. an ops/ha.Coordinator Tick). Per-host errors are logged
 // and do not abort the remaining hosts.
+//
+// Failover fencing: the final cert write is committed through the leadership epoch
+// fence (SetFencer), so a leader demoted by a PostgreSQL promotion cannot overwrite
+// a newer leader's cert. The ACME order itself (a multi-minute network flow) is not
+// transactionally fenceable, so a promotion mid-order leaves a BOUNDED window where
+// the demoted old primary and the new leader both order the same host — at most one
+// extra Let's Encrypt order per host per failover. Cache writes stay atomic (no
+// corruption); the wasted order is accepted as the cost of not holding a DB
+// transaction open across the order.
 func (m *ClusterManager) RenewOnce(ctx context.Context) {
 	if err := m.ensureRegistered(ctx); err != nil {
 		m.log.WarnContext(ctx, "acme: account registration failed", "err", err)
@@ -352,10 +431,19 @@ func (m *ClusterManager) issue(ctx context.Context, host string) error {
 	if err != nil {
 		return err
 	}
-	if err := m.cache.Put(ctx, certName(host), bundle); err != nil {
-		return err
+	return m.storeCert(ctx, certName(host), bundle)
+}
+
+// storeCert commits the cert bundle, through the leadership epoch fence when one
+// is installed so a leader demoted by a PostgreSQL promotion cannot overwrite a
+// newer leader's cert (see Fencer). Without a fencer it is a plain upsert.
+func (m *ClusterManager) storeCert(ctx context.Context, name string, bundle []byte) error {
+	if m.fencer == nil {
+		return m.cache.Put(ctx, name, bundle)
 	}
-	return nil
+	return m.fencer.FenceExec(ctx, func(tx pgx.Tx) error {
+		return putTx(ctx, tx, name, bundle)
+	})
 }
 
 // solveAuthz fulfills one authorization via its dns-01 challenge.

@@ -41,6 +41,19 @@ func openACMEPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	return pool
 }
 
+// lazyPool returns a pool WITHOUT pinging the DB, for tests that exercise pure
+// in-memory logic (host allowlist, empty-hosts rejection) and never issue a query
+// — pgxpool.New connects lazily, so these run in an offline CI without Postgres.
+func lazyPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
+	t.Helper()
+	pool, err := pgxpool.New(ctx, testDSN)
+	if err != nil {
+		t.Skipf("pool config invalid (%v)", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
 func TestPGCacheRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	c := newPGCache(openACMEPool(t, ctx))

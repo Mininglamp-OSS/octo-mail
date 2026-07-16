@@ -17,9 +17,16 @@ import (
 // challenge. dns-01 is what makes cluster issuance routing-free: the leader
 // publishes _acme-challenge.<host> and the CA validates it over DNS, so no
 // inbound challenge connection has to reach any particular node.
+//
+// Propagation contract: Present MUST NOT return until the published TXT record is
+// visible to the ACME CA's resolvers — the manager calls Accept immediately after
+// Present, so a solver that returns before propagation will fail validation. A
+// webhook solver's endpoint is therefore expected to block until the record is
+// live (or to front a provider with fast, authoritative propagation).
 type DNSSolver interface {
 	// Present publishes a TXT record at fqdn (already including the
-	// "_acme-challenge." prefix) with the given value.
+	// "_acme-challenge." prefix) with the given value, returning only once it is
+	// resolvable by the CA (see the propagation contract above).
 	Present(ctx context.Context, fqdn, value string) error
 	// CleanUp removes the record published by Present. It is best-effort and
 	// always called (deferred) after a challenge attempt.

@@ -49,7 +49,9 @@ up)
 	docker rm "$cid" >/dev/null
 	echo "pebble up: directory=https://localhost:14000/dir  host_ip=$HOST_IP"
 	echo "OCTO_MAIL_ACME_CA=$CA_OUT"
-	echo "run: OCTO_MAIL_ACME=1 OCTO_MAIL_ACME_CA=$CA_OUT OCTO_MAIL_ACME_HOST_IP=$HOST_IP go test -run TestACMELiveIssuance ./security/acme/"
+	echo "challtestsrv mgmt API (DNS-01 TXT records): http://localhost:8055"
+	echo "run (tls-alpn-01): OCTO_MAIL_ACME=1 OCTO_MAIL_ACME_CA=$CA_OUT OCTO_MAIL_ACME_HOST_IP=$HOST_IP go test -run TestACMELiveIssuance ./security/acme/"
+	echo "run (DNS-01, needs Postgres): OCTO_MAIL_ACME=1 OCTO_MAIL_ACME_CA=$CA_OUT go test -run TestACMEClusterDNSIssuance ./security/acme/"
 	;;
 down)
 	docker rm -f "$PNAME" "$CNAME" >/dev/null 2>&1 || true

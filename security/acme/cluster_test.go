@@ -62,12 +62,28 @@ func newTestCluster(t *testing.T, ctx context.Context, host string, solver DNSSo
 		DirectoryURL: "https://acme.example.test/dir",
 		ContactEmail: "ops@example.test",
 		Hostnames:    []dns.Domain{{ASCII: host}},
+		Fallback:     dns.Domain{ASCII: host},
 		Solver:       solver,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return cm
+}
+
+// TestNewClusterRejectsEmptyHosts proves the silent-no-op guard: DNS-01 mode with
+// no hostnames and no fallback must fail construction, not build a manager that
+// reports enabled yet issues/serves nothing.
+func TestNewClusterRejectsEmptyHosts(t *testing.T) {
+	_, err := NewCluster(ClusterConfig{
+		Pool:         lazyPool(t, context.Background()),
+		DirectoryURL: "https://acme.example.test/dir",
+		ContactEmail: "ops@example.test",
+		Solver:       &recordingSolver{t: t},
+	})
+	if err == nil {
+		t.Fatal("expected error for empty hostnames, got nil")
+	}
 }
 
 // TestClusterServesFromSharedStoreWithoutIssuing seeds a cert into the shared
@@ -98,13 +114,68 @@ func TestClusterServesFromSharedStoreWithoutIssuing(t *testing.T) {
 		t.Fatalf("served cert = %+v, want leaf CN %q", got, host)
 	}
 
-	// Unknown SNI → nil cert, nil error (no issuance, "unrecognized name").
-	if c, err := cm.getCertificate(&tls.ClientHelloInfo{ServerName: "other.example.test"}); err != nil || c != nil {
-		t.Fatalf("unknown SNI: got (%v,%v), want (nil,nil)", c, err)
+	// SNI normalization: mixed case and a trailing dot resolve to the same cert.
+	for _, sni := range []string{"MAIL.EXAMPLE.TEST", "mail.example.test."} {
+		if c, err := cm.getCertificate(&tls.ClientHelloInfo{ServerName: sni}); err != nil || c == nil {
+			t.Fatalf("SNI %q: got (%v,%v), want served cert", sni, c, err)
+		}
+	}
+
+	// No SNI → fallback (here the only host) is served, not a nil handshake failure.
+	if c, err := cm.getCertificate(&tls.ClientHelloInfo{ServerName: ""}); err != nil || c == nil {
+		t.Fatalf("empty SNI: got (%v,%v), want fallback cert", c, err)
+	}
+	// Unknown SNI → fallback is served (this host has a fallback == host).
+	if c, err := cm.getCertificate(&tls.ClientHelloInfo{ServerName: "other.example.test"}); err != nil || c == nil {
+		t.Fatalf("unknown SNI with fallback: got (%v,%v), want fallback cert", c, err)
 	}
 
 	if solver.presents != 0 {
 		t.Fatalf("solver invoked %d times on serving path, want 0", solver.presents)
+	}
+}
+
+// TestClusterServeTimeValidation proves an expired stored cert is not served
+// (the fail-soft contract): a stalled renewal must yield "unrecognized name",
+// not a served-but-expired certificate.
+func TestClusterServeTimeValidation(t *testing.T) {
+	ctx := context.Background()
+	const host = "mail.example.test"
+	cm := newTestCluster(t, ctx, host, &recordingSolver{t: t})
+
+	// Store an already-expired cert (NotAfter in the past).
+	if err := cm.cache.Put(ctx, certName(host), selfSignedBundle(t, host, -time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	cm.RefreshOnce(ctx)
+	if c, err := cm.getCertificate(&tls.ClientHelloInfo{ServerName: host}); err != nil || c != nil {
+		t.Fatalf("expired cert: got (%v,%v), want (nil,nil)", c, err)
+	}
+}
+
+// TestClusterUnknownSNINoFallback checks that, with no fallback configured, an
+// unknown SNI returns (nil,nil) — the allowlist stops it before any DB access.
+func TestClusterUnknownSNINoFallback(t *testing.T) {
+	ctx := context.Background()
+	cm, err := NewCluster(ClusterConfig{
+		Pool:         lazyPool(t, ctx),
+		DirectoryURL: "https://acme.example.test/dir",
+		ContactEmail: "ops@example.test",
+		Hostnames:    []dns.Domain{{ASCII: "mail.example.test"}},
+		// no Fallback
+		Solver: &recordingSolver{t: t},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.fallback != "" {
+		t.Fatalf("expected no fallback, got %q", cm.fallback)
+	}
+	if c, err := cm.getCertificate(&tls.ClientHelloInfo{ServerName: "nope.example.test"}); err != nil || c != nil {
+		t.Fatalf("unknown SNI, no fallback: got (%v,%v), want (nil,nil)", c, err)
+	}
+	if c, err := cm.getCertificate(&tls.ClientHelloInfo{ServerName: ""}); err != nil || c != nil {
+		t.Fatalf("empty SNI, no fallback: got (%v,%v), want (nil,nil)", c, err)
 	}
 }
 

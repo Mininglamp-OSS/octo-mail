@@ -212,11 +212,18 @@ func run() error {
 	var acmeCluster *acme.ClusterManager
 	if cfg.acmeDirectory != "" && cfg.acmeContact != "" {
 		if cfg.acmeDNSWebhookURL != "" {
+			// An unsigned webhook is allowed (operators may authenticate by mTLS /
+			// network policy) but warn, since the HMAC signature is the built-in
+			// authentication and it is silently absent without a secret.
+			if len(cfg.acmeDNSWebhookSecret) == 0 {
+				log.Warn("OCTO_MAIL_ACME_DNS_WEBHOOK_URL set without OCTO_MAIL_ACME_DNS_WEBHOOK_SECRET: DNS webhook requests are unsigned (no X-Octo-Signature). Set a secret, or ensure the endpoint is authenticated another way (mTLS / network policy)")
+			}
 			cm, err := acme.NewCluster(acme.ClusterConfig{
 				Pool:         s.Pool,
 				DirectoryURL: cfg.acmeDirectory,
 				ContactEmail: cfg.acmeContact,
 				Hostnames:    cfg.acmeHosts,
+				Fallback:     dns.Domain{ASCII: cfg.hostname},
 				Solver:       acme.NewWebhookSolver(cfg.acmeDNSWebhookURL, cfg.acmeDNSWebhookSecret, nil),
 				Log:          log,
 			})
@@ -226,7 +233,7 @@ func run() error {
 			acmeCluster = cm
 			acmeTLS = cm.TLSConfig()
 			go cm.RunRefresh(ctx, 30*time.Second)
-			log.Info("ACME enabled: leader-gated multi-node DNS-01", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts)
+			log.Info("ACME enabled: leader-gated multi-node DNS-01", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts, "fallback", cfg.hostname)
 		} else {
 			am, err := acme.New(acme.Config{
 				CacheDir:     cfg.acmeCacheDir,
@@ -598,6 +605,10 @@ func run() error {
 	// nothing is near expiry, so an hourly campaign is fine and also bounds failover.
 	if acmeCluster != nil {
 		acmeCoord := ha.NewCoordinator(ha.New(s.Pool, acmeLeaderKey, cfg.nodeID), time.Hour)
+		// Epoch-fence the cert write so a leader demoted by a PostgreSQL promotion
+		// cannot overwrite a newer leader's cert (the ACME order itself has a bounded
+		// duplicate-order window across failover — see ClusterManager.RenewOnce).
+		acmeCluster.SetFencer(acmeCoord.Leader())
 		acmeCoord.OnElected = func(context.Context) { log.Info("elected acme-issuance leader", "node", cfg.nodeID) }
 		acmeCoord.OnLost = func() { log.Info("lost acme-issuance leadership", "node", cfg.nodeID) }
 		acmeCoord.Tick = acmeCluster.RenewOnce
