@@ -179,6 +179,50 @@ func TestClusterUnknownSNINoFallback(t *testing.T) {
 	}
 }
 
+// TestRefreshEvictsRemovedCert proves that deleting the shared-store row causes
+// the refresher to evict the in-memory cert, so a revoked/rotated-away cert is not
+// served indefinitely from memory.
+func TestRefreshEvictsRemovedCert(t *testing.T) {
+	ctx := context.Background()
+	const host = "mail.example.test"
+	cm := newTestCluster(t, ctx, host, &recordingSolver{t: t})
+
+	if err := cm.cache.Put(ctx, certName(host), selfSignedBundle(t, host, 90*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if n := cm.RefreshOnce(ctx); n != 1 {
+		t.Fatalf("RefreshOnce loaded %d, want 1", n)
+	}
+	// Emergency removal from the shared store.
+	if err := cm.cache.Delete(ctx, certName(host)); err != nil {
+		t.Fatal(err)
+	}
+	cm.RefreshOnce(ctx)
+	if c, err := cm.getCertificate(&tls.ClientHelloInfo{ServerName: host}); err != nil || c != nil {
+		t.Fatalf("after eviction: got (%v,%v), want (nil,nil)", c, err)
+	}
+}
+
+// TestNeedsRenewalTransientDBErrorSkips proves the rate-limit guard: a transient
+// DB error must NOT trigger reissuance (which would burn Let's Encrypt orders) —
+// only a cache miss or an unparseable bundle does. Simulated by closing the pool
+// so cache.Get returns a non-ErrCacheMiss error.
+func TestNeedsRenewalTransientDBErrorSkips(t *testing.T) {
+	ctx := context.Background()
+	const host = "mail.example.test"
+	cm := newTestCluster(t, ctx, host, &recordingSolver{t: t})
+
+	// Seed a valid cert, then break the DB connection.
+	if err := cm.cache.Put(ctx, certName(host), selfSignedBundle(t, host, 90*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	cm.cache.pool.Close() // subsequent queries error (not ErrNoRows)
+
+	if cm.needsRenewal(ctx, host) {
+		t.Fatal("transient DB error must NOT trigger reissuance (would burn LE rate limit)")
+	}
+}
+
 // TestNeedsRenewal covers the expiry decision that drives the leader loop.
 func TestNeedsRenewal(t *testing.T) {
 	ctx := context.Background()

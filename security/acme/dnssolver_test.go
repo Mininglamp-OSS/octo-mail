@@ -49,6 +49,11 @@ func TestWebhookSolverSignsAndSends(t *testing.T) {
 	if gotSig != want {
 		t.Fatalf("signature: want %q, got %q", want, gotSig)
 	}
+
+	// Body carries a timestamp (anti-replay); it is part of the signed bytes.
+	if req.TS == 0 {
+		t.Fatalf("expected non-zero ts in signed body: %+v", req)
+	}
 }
 
 func TestWebhookSolverErrorsOnNon2xx(t *testing.T) {

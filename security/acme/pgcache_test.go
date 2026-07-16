@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -56,7 +57,7 @@ func lazyPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 
 func TestPGCacheRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	c := newPGCache(openACMEPool(t, ctx))
+	c := newPGCache(openACMEPool(t, ctx), nil)
 
 	// Miss maps to autocert.ErrCacheMiss.
 	if _, err := c.Get(ctx, "cert:missing"); !errors.Is(err, autocert.ErrCacheMiss) {
@@ -103,5 +104,70 @@ func TestPGCacheRoundTrip(t *testing.T) {
 	}
 	if err := c.Delete(ctx, "cert:a"); err != nil {
 		t.Fatalf("Delete missing: want nil, got %v", err)
+	}
+}
+
+// fakeCipher is a trivial reversible transform standing in for KeyCipher: it
+// prefixes a marker + the AAD so tests can assert data is sealed at rest and that
+// the AAD (cache key) is bound.
+type fakeCipher struct{}
+
+func (fakeCipher) Encrypt(plain, aad []byte) ([]byte, error) {
+	out := append([]byte("SEAL|"), aad...)
+	out = append(out, '|')
+	return append(out, plain...), nil
+}
+func (fakeCipher) Decrypt(stored, aad []byte) ([]byte, error) {
+	prefix := append([]byte("SEAL|"), aad...)
+	prefix = append(prefix, '|')
+	if !bytes.HasPrefix(stored, prefix) {
+		return nil, errors.New("bad seal or AAD mismatch")
+	}
+	return stored[len(prefix):], nil
+}
+
+func TestPGCacheEncryptsAtRest(t *testing.T) {
+	ctx := context.Background()
+	pool := openACMEPool(t, ctx)
+	c := newPGCache(pool, fakeCipher{})
+
+	plain := []byte("account-key-pem")
+	if err := c.Put(ctx, "acct-key:x", plain); err != nil {
+		t.Fatal(err)
+	}
+	// Raw column holds ciphertext, not the plaintext.
+	var raw []byte
+	if err := pool.QueryRow(ctx, `SELECT data FROM acme_cache WHERE name=$1`, "acct-key:x").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(raw, plain) {
+		t.Fatal("data stored in plaintext despite cipher")
+	}
+	if !bytes.HasPrefix(raw, []byte("SEAL|octo-mail-acme:acct-key:x|")) {
+		t.Fatalf("ciphertext not AAD-bound to the key: %q", raw)
+	}
+	// Get transparently decrypts.
+	got, err := c.Get(ctx, "acct-key:x")
+	if err != nil || string(got) != string(plain) {
+		t.Fatalf("Get after encrypted Put: got (%q,%v), want %q", got, err, plain)
+	}
+}
+
+func TestPGCachePutIfAbsent(t *testing.T) {
+	ctx := context.Background()
+	c := newPGCache(openACMEPool(t, ctx), nil)
+
+	created, err := c.putIfAbsent(ctx, "acct-key:race", []byte("first"))
+	if err != nil || !created {
+		t.Fatalf("first putIfAbsent: created=%v err=%v, want true", created, err)
+	}
+	// Second writer loses; existing value is preserved.
+	created, err = c.putIfAbsent(ctx, "acct-key:race", []byte("second"))
+	if err != nil || created {
+		t.Fatalf("second putIfAbsent: created=%v err=%v, want false", created, err)
+	}
+	got, _ := c.Get(ctx, "acct-key:race")
+	if string(got) != "first" {
+		t.Fatalf("putIfAbsent overwrote: got %q, want first", got)
 	}
 }

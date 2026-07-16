@@ -30,9 +30,12 @@ import (
 // ClusterConfig.RenewBefore is zero (matches autocert's default).
 const defaultRenewBefore = 30 * 24 * time.Hour
 
-// perHostIssueTimeout bounds a single host's DNS-01 order so one stuck
-// authorization cannot wedge the leader renewal pass.
-const perHostIssueTimeout = 3 * time.Minute
+// perHostIssueTimeout bounds a single host's DNS-01 order. It must comfortably
+// exceed real DNS propagation (a webhook solver's Present blocks until the TXT is
+// resolvable by the CA — cloud providers commonly take 45–120s), so it also caps
+// the webhook HTTP call (which is driven by this context, not a fixed client
+// timeout).
+const perHostIssueTimeout = 5 * time.Minute
 
 // ClusterConfig configures a ClusterManager.
 type ClusterConfig struct {
@@ -42,18 +45,20 @@ type ClusterConfig struct {
 	Hostnames    []dns.Domain  // hostnames the cluster obtains certificates for
 	Fallback     dns.Domain    // fallback hostname for SNI-less / unknown-SNI clients (also managed)
 	Solver       DNSSolver     // dns-01 record publisher (webhook in production)
+	Cipher       Cipher        // at-rest cipher for stored keys (nil = plaintext; see Cipher)
 	RenewBefore  time.Duration // renew this long before expiry (0 = 30 days)
 	Log          *slog.Logger  // nil = slog.Default()
 }
 
 // Fencer guards a write with the ha leadership epoch: FenceExec commits fn's
 // transaction only if this node still holds the lease at the epoch it held when
-// elected, else returns ha.ErrFenced without running fn. *ha.Leader satisfies it.
-// Used so a leader demoted by a PostgreSQL promotion cannot commit a cert write
-// after a new leader has taken over. Kept as a local interface so security/acme
-// need not import ops/ha.
+// elected, else returns ha.ErrFenced without running fn. Epoch reports the current
+// fencing token (0 when not leader), used to detect leadership change mid-pass.
+// *ha.Leader satisfies it. Kept as a local interface so security/acme need not
+// import ops/ha.
 type Fencer interface {
 	FenceExec(ctx context.Context, fn func(pgx.Tx) error) error
+	Epoch() int64
 }
 
 // ClusterManager runs octo-mail's leader-gated, DNS-01, multi-node ACME issuance.
@@ -143,7 +148,7 @@ func NewCluster(cfg ClusterConfig) (*ClusterManager, error) {
 	}
 	sum := sha256.Sum256([]byte(cfg.DirectoryURL))
 	return &ClusterManager{
-		cache:       newPGCache(cfg.Pool),
+		cache:       newPGCache(cfg.Pool, cfg.Cipher),
 		client:      &acme.Client{DirectoryURL: cfg.DirectoryURL, UserAgent: "octo-mail"},
 		solver:      cfg.Solver,
 		hosts:       hosts,
@@ -203,10 +208,16 @@ func (m *ClusterManager) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certif
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		c, _, err := m.loadCert(ctx, host)
+		c, ts, err := m.loadCert(ctx, host)
 		if err != nil {
 			return nil, nil // missing/unparseable → "unrecognized name", not a hard error
 		}
+		// Populate the cache so a burst of cold handshakes before the first refresh
+		// tick does not each run a DB query + PEM parse (thundering herd).
+		m.mu.Lock()
+		m.certs[host] = c
+		m.seen[host] = ts
+		m.mu.Unlock()
 		cert = c
 	}
 	// Serve-time validation makes the fail-soft contract real: never serve a cert
@@ -224,15 +235,27 @@ func (m *ClusterManager) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certif
 }
 
 // loadCert reads and parses the stored certificate bundle for host. It does not
-// cache; callers (getCertificate cold path, refreshLoop) decide caching.
+// cache; callers (getCertificate cold path, RefreshOnce) decide caching. The
+// returned time is the shared-store updated_at (the refresh marker), fetched in
+// the same call so a cold-path populate records it too.
 func (m *ClusterManager) loadCert(ctx context.Context, host string) (*tls.Certificate, time.Time, error) {
 	data, err := m.cache.Get(ctx, certName(host))
 	if err != nil {
 		return nil, time.Time{}, err
 	}
-	// The bundle holds both the PRIVATE KEY and CERTIFICATE blocks; X509KeyPair
-	// scans each argument for the block type it needs, so passing the bundle for
-	// both cert and key is correct.
+	cert, _, err := parseBundle(host, data)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	ts, _, _ := m.cache.updatedAt(ctx, certName(host))
+	return cert, ts, nil
+}
+
+// parseBundle parses a stored PEM bundle into a servable certificate and returns
+// the leaf's NotAfter. The bundle holds both the PRIVATE KEY and CERTIFICATE
+// blocks; X509KeyPair scans each argument for the block type it needs, so passing
+// the bundle for both cert and key is correct.
+func parseBundle(host string, data []byte) (*tls.Certificate, time.Time, error) {
 	cert, err := tls.X509KeyPair(data, data)
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("acme: parse cert bundle for %q: %w", host, err)
@@ -259,7 +282,18 @@ func (m *ClusterManager) RefreshOnce(ctx context.Context) int {
 			continue
 		}
 		if !ok {
-			continue // not issued yet
+			// Row gone (emergency rotation / revocation): evict so nodes stop serving
+			// the removed cert from memory. Serve-time validation only checks
+			// hostname+expiry, so without eviction an unexpired-but-revoked cert would
+			// keep being served until process restart.
+			m.mu.Lock()
+			if _, had := m.certs[host]; had {
+				delete(m.certs, host)
+				delete(m.seen, host)
+				m.log.WarnContext(ctx, "acme refresh: cert removed from store, evicted", "host", host)
+			}
+			m.mu.Unlock()
+			continue
 		}
 		m.mu.RLock()
 		prev, had := m.seen[host]
@@ -309,13 +343,25 @@ func (m *ClusterManager) RunRefresh(ctx context.Context, interval time.Duration)
 // the demoted old primary and the new leader both order the same host — at most one
 // extra Let's Encrypt order per host per failover. Cache writes stay atomic (no
 // corruption); the wasted order is accepted as the cost of not holding a DB
-// transaction open across the order.
+// transaction open across the order. To narrow that window, the pass stops early
+// if it observes the leadership epoch change mid-pass (a demoted leader ceases
+// ordering the remaining hosts rather than running the full list).
 func (m *ClusterManager) RenewOnce(ctx context.Context) {
 	if err := m.ensureRegistered(ctx); err != nil {
 		m.log.WarnContext(ctx, "acme: account registration failed", "err", err)
 		return
 	}
+	// Capture the fencing epoch we started under; if it changes we've lost/rotated
+	// leadership and must stop issuing (the fence would reject writes anyway).
+	var startEpoch int64
+	if m.fencer != nil {
+		startEpoch = m.fencer.Epoch()
+	}
 	for _, host := range m.hosts {
+		if m.fencer != nil && m.fencer.Epoch() != startEpoch {
+			m.log.WarnContext(ctx, "acme: leadership changed mid-pass, stopping issuance", "host", host)
+			return
+		}
 		if !m.needsRenewal(ctx, host) {
 			continue
 		}
@@ -330,12 +376,24 @@ func (m *ClusterManager) RenewOnce(ctx context.Context) {
 	}
 }
 
-// needsRenewal reports whether host has no stored cert or one within renewBefore
-// of expiry. A load error is treated as "needs renewal" so a corrupt bundle is
-// reissued rather than stranding the host.
+// needsRenewal reports whether host should be (re)issued now. It deliberately
+// distinguishes error kinds to avoid burning Let's Encrypt rate limits:
+//   - cache miss → issue (no cert yet);
+//   - unparseable/undecryptable stored bundle → reissue (corrupt);
+//   - any OTHER (transient DB) error → do NOT reissue — keep serving the existing
+//     cert until the DB recovers, so a DB flap can't trigger duplicate orders.
 func (m *ClusterManager) needsRenewal(ctx context.Context, host string) bool {
-	_, notAfter, err := m.loadCert(ctx, host)
+	data, err := m.cache.Get(ctx, certName(host))
+	if errors.Is(err, autocert.ErrCacheMiss) {
+		return true
+	}
 	if err != nil {
+		m.log.WarnContext(ctx, "acme: cert load failed, not reissuing (keeping existing cert until DB recovers)", "host", host, "err", err)
+		return false
+	}
+	_, notAfter, perr := parseBundle(host, data)
+	if perr != nil {
+		m.log.WarnContext(ctx, "acme: stored cert unparseable, reissuing", "host", host, "err", perr)
 		return true
 	}
 	return time.Until(notAfter) < m.renewBefore
@@ -366,28 +424,18 @@ func (m *ClusterManager) ensureRegistered(ctx context.Context) error {
 
 // loadOrCreateAccountKey returns the shared account key, generating and persisting
 // a fresh ECDSA P-256 key on first use so the whole cluster registers ONE account.
+// The create is first-writer-wins (putIfAbsent + authoritative re-read): if two
+// nodes race across a failover, the loser adopts the winner's key rather than both
+// registering distinct CA accounts.
 func (m *ClusterManager) loadOrCreateAccountKey(ctx context.Context) (crypto.Signer, error) {
 	data, err := m.cache.Get(ctx, m.acctKeyName())
 	switch {
 	case err == nil:
-		block, _ := pem.Decode(data)
-		if block == nil {
-			return nil, fmt.Errorf("acme: account key: no PEM data")
-		}
-		k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("acme: parse account key: %w", err)
-		}
-		signer, ok := k.(crypto.Signer)
-		if !ok {
-			return nil, fmt.Errorf("acme: account key is not a signer (%T)", k)
-		}
-		return signer, nil
+		return parseAccountKey(data)
 	case !errors.Is(err, autocert.ErrCacheMiss):
-		// Any error other than a cache miss is a real failure.
-		return nil, err
+		return nil, err // real (e.g. transient DB) error, not a miss
 	}
-	// Cache miss: generate and persist a fresh account key.
+	// Cache miss: generate a candidate and try to claim the slot.
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("acme: generate account key: %w", err)
@@ -396,10 +444,37 @@ func (m *ClusterManager) loadOrCreateAccountKey(ctx context.Context) (crypto.Sig
 	if err != nil {
 		return nil, err
 	}
-	if err := m.cache.Put(ctx, m.acctKeyName(), pemBytes); err != nil {
+	created, err := m.cache.putIfAbsent(ctx, m.acctKeyName(), pemBytes)
+	if err != nil {
 		return nil, err
 	}
-	return key, nil
+	if created {
+		return key, nil
+	}
+	// Another node won the race: adopt the stored key so the cluster shares ONE
+	// account instead of registering a duplicate.
+	stored, err := m.cache.Get(ctx, m.acctKeyName())
+	if err != nil {
+		return nil, err
+	}
+	return parseAccountKey(stored)
+}
+
+// parseAccountKey decodes a PKCS#8 PEM account key into a crypto.Signer.
+func parseAccountKey(data []byte) (crypto.Signer, error) {
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("acme: account key: no PEM data")
+	}
+	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("acme: parse account key: %w", err)
+	}
+	signer, ok := k.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("acme: account key is not a signer (%T)", k)
+	}
+	return signer, nil
 }
 
 // issue runs the full dns-01 order flow for one host and stores the resulting
@@ -442,7 +517,7 @@ func (m *ClusterManager) storeCert(ctx context.Context, name string, bundle []by
 		return m.cache.Put(ctx, name, bundle)
 	}
 	return m.fencer.FenceExec(ctx, func(tx pgx.Tx) error {
-		return putTx(ctx, tx, name, bundle)
+		return m.cache.putTx(ctx, tx, name, bundle)
 	})
 }
 

@@ -153,14 +153,17 @@ func run() error {
 	submitter := &submit.Submitter{Pool: s.Pool, Blob: bs}
 	repo := &deliverability.Service{Pool: s.Pool, MaxPerWindow: cfg.sendRateMax, RateWindow: cfg.sendRateWindow}
 	signer := &deliverability.DKIMSigner{Pool: s.Pool}
-	// Optional DKIM key encryption at rest.
+	// Optional key encryption at rest (AES-256-GCM), shared by DKIM keys and the
+	// ACME account/cert keys. Enabled by OCTO_MAIL_KEY_SECRET.
+	var keyCipher *deliverability.KeyCipher
 	if secret := os.Getenv("OCTO_MAIL_KEY_SECRET"); secret != "" {
 		kc, err := deliverability.NewKeyCipher([]byte(secret))
 		if err != nil {
 			return fmt.Errorf("key cipher: %w", err)
 		}
+		keyCipher = kc
 		signer.Cipher = kc
-		log.Info("DKIM key encryption at rest enabled")
+		log.Info("key encryption at rest enabled (DKIM keys + ACME account/cert keys)")
 	}
 
 	// --- Front doors ---
@@ -218,7 +221,7 @@ func run() error {
 			if len(cfg.acmeDNSWebhookSecret) == 0 {
 				log.Warn("OCTO_MAIL_ACME_DNS_WEBHOOK_URL set without OCTO_MAIL_ACME_DNS_WEBHOOK_SECRET: DNS webhook requests are unsigned (no X-Octo-Signature). Set a secret, or ensure the endpoint is authenticated another way (mTLS / network policy)")
 			}
-			cm, err := acme.NewCluster(acme.ClusterConfig{
+			clusterCfg := acme.ClusterConfig{
 				Pool:         s.Pool,
 				DirectoryURL: cfg.acmeDirectory,
 				ContactEmail: cfg.acmeContact,
@@ -226,7 +229,13 @@ func run() error {
 				Fallback:     dns.Domain{ASCII: cfg.hostname},
 				Solver:       acme.NewWebhookSolver(cfg.acmeDNSWebhookURL, cfg.acmeDNSWebhookSecret, nil),
 				Log:          log,
-			})
+			}
+			if keyCipher != nil {
+				clusterCfg.Cipher = keyCipher // AES-256-GCM at rest for account + cert keys
+			} else {
+				log.Warn("ACME account/cert private keys stored UNENCRYPTED at rest in acme_cache; set OCTO_MAIL_KEY_SECRET to encrypt them (same cipher used for DKIM keys)")
+			}
+			cm, err := acme.NewCluster(clusterCfg)
 			if err != nil {
 				return fmt.Errorf("acme: %w", err)
 			}

@@ -74,9 +74,10 @@ though we don't use autocert for issuance — keeps the seam standard and testab
 
 `ClusterManager.ensureCert(ctx, host)`:
 
-1. **Account**: load `acct-key`; if absent, generate ECDSA P-256, store, then
-   `client.Register` (idempotent: x/crypto returns the existing account on conflict);
-   persist `acct-url`.
+1. **Account**: load `acct-key` (first-writer-wins on create so racing leaders
+   share ONE account); if absent, generate ECDSA P-256, `putIfAbsent`, re-read;
+   then `client.Register` (idempotent: x/crypto caches the KID even on
+   `ErrAccountAlreadyExists`). The account URL/KID is NOT persisted.
 2. `order := client.AuthorizeOrder(ctx, acme.DomainIDs(host))`.
 3. For each pending authz: pick the `dns-01` challenge; `rec :=
    client.DNS01ChallengeRecord(chal.Token)`; `solver.Present(ctx,
