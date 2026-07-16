@@ -2,23 +2,28 @@
 // TLS-config source for the SMTP/IMAP/HTTPS listeners. It obtains and renews
 // certificates automatically for a set of allowed hostnames.
 //
-// Single-node only (H17): the cache backing the account key and issued certs is a
-// node-local directory. Running built-in ACME on multiple nodes of the stateless
-// cluster makes each node register its own account and independently order certs
-// for the same hostnames (Let's Encrypt rate limits), and a tls-alpn-01 challenge
-// may land on a node that did not create the order. Multi-node deployments must
-// terminate TLS at a shared front proxy or provision certs externally; leader-gated
-// cluster issuance (one node issues into shared storage, all read) is a tracked
-// follow-up.
+// Two modes exist:
+//
+//   - Legacy single-node (this file, Manager/New): autotls over tls-alpn-01 with a
+//     node-local cache. Running it on multiple nodes makes each register its own
+//     account and race to order the same hostnames (Let's Encrypt rate limits), and
+//     a tls-alpn-01 challenge may land on a node that did not create the order.
+//     Suitable for single-node, or multi-node behind a shared TLS-terminating proxy.
+//
+//   - Leader-gated multi-node (cluster.go, ClusterManager/NewCluster): DNS-01
+//     issuance driven directly over golang.org/x/crypto/acme, gated by ops/ha so
+//     exactly one node orders/renews into a shared Postgres store
+//     (schema/10_acme_cache.sql); every node serves TLS from that store. dns-01
+//     removes challenge routing entirely (the CA validates a _acme-challenge TXT via
+//     DNS, not an inbound connection), so it is safe across the stateless cluster.
+//     Enabled by OCTO_MAIL_ACME_DNS_WEBHOOK_URL (a provider-neutral DNS solver
+//     webhook). This is the full fix for the H17 single-node limitation (#32).
 //
 // Honest boundary: real certificate issuance requires a reachable ACME directory
-// (Let's Encrypt or a local pebble) plus port 80/443 or DNS-01 provisioning for
-// the challenge. TestACMEManagerWiring unit-tests construction (a usable
-// *tls.Config with a GetCertificate hook). TestACMELiveIssuance (gated by
-// OCTO_MAIL_ACME=1, provisioned via scripts/acme-pebble.sh) drives a real ACME CA:
-// it has been observed performing account registration, order, tls-alpn-01
-// validation, and certificate issuance against pebble — see that test for the
-// documented pebble/x-crypto retrieval boundary.
+// (Let's Encrypt or a local pebble) plus tls-alpn-01 challenge reachability (legacy)
+// or DNS provisioning (cluster). TestACMEManagerWiring unit-tests construction;
+// TestACMELiveIssuance (tls-alpn-01) and TestACMEClusterDNSIssuance (dns-01), both
+// gated by OCTO_MAIL_ACME=1 via scripts/acme-pebble.sh, drive a real ACME CA.
 package acme
 
 import (

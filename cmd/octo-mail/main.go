@@ -153,14 +153,17 @@ func run() error {
 	submitter := &submit.Submitter{Pool: s.Pool, Blob: bs}
 	repo := &deliverability.Service{Pool: s.Pool, MaxPerWindow: cfg.sendRateMax, RateWindow: cfg.sendRateWindow}
 	signer := &deliverability.DKIMSigner{Pool: s.Pool}
-	// Optional DKIM key encryption at rest.
+	// Optional key encryption at rest (AES-256-GCM), shared by DKIM keys and the
+	// ACME account/cert keys. Enabled by OCTO_MAIL_KEY_SECRET.
+	var keyCipher *deliverability.KeyCipher
 	if secret := os.Getenv("OCTO_MAIL_KEY_SECRET"); secret != "" {
 		kc, err := deliverability.NewKeyCipher([]byte(secret))
 		if err != nil {
 			return fmt.Errorf("key cipher: %w", err)
 		}
+		keyCipher = kc
 		signer.Cipher = kc
-		log.Info("DKIM key encryption at rest enabled")
+		log.Info("key encryption at rest enabled (DKIM keys + ACME account/cert keys)")
 	}
 
 	// --- Front doors ---
@@ -201,30 +204,67 @@ func run() error {
 	}
 
 	// Optional ACME/autotls: when configured, listeners can use automatic certs.
-	// Real issuance needs a reachable ACME directory + challenge reachability
-	// (deployment-layer); here we construct the manager and expose its TLS config.
+	// Two modes:
+	//   - DNS-01 webhook set → leader-gated multi-node issuance (#32): the elected
+	//     leader orders/renews over dns-01 into shared Postgres, every node serves
+	//     from that shared store. The renewal coordinator is registered in the
+	//     leader-election block below; here we build the manager, wire its serving
+	//     TLS config, and start the per-node cert refresher.
+	//   - otherwise → legacy single-node tls-alpn-01 (node-local cache).
 	var acmeTLS *tls.Config
+	var acmeCluster *acme.ClusterManager
 	if cfg.acmeDirectory != "" && cfg.acmeContact != "" {
-		am, err := acme.New(acme.Config{
-			CacheDir:     cfg.acmeCacheDir,
-			ContactEmail: cfg.acmeContact,
-			DirectoryURL: cfg.acmeDirectory,
-			Hostnames:    cfg.acmeHosts,
-			Fallback:     dns.Domain{ASCII: cfg.hostname},
-			Shutdown:     ctx.Done(),
-		})
-		if err != nil {
-			return fmt.Errorf("acme: %w", err)
+		if cfg.acmeDNSWebhookURL != "" {
+			// An unsigned webhook is allowed (operators may authenticate by mTLS /
+			// network policy) but warn, since the HMAC signature is the built-in
+			// authentication and it is silently absent without a secret.
+			if len(cfg.acmeDNSWebhookSecret) == 0 {
+				log.Warn("OCTO_MAIL_ACME_DNS_WEBHOOK_URL set without OCTO_MAIL_ACME_DNS_WEBHOOK_SECRET: DNS webhook requests are unsigned (no X-Octo-Signature). Set a secret, or ensure the endpoint is authenticated another way (mTLS / network policy)")
+			}
+			clusterCfg := acme.ClusterConfig{
+				Pool:         s.Pool,
+				DirectoryURL: cfg.acmeDirectory,
+				ContactEmail: cfg.acmeContact,
+				Hostnames:    cfg.acmeHosts,
+				Fallback:     dns.Domain{ASCII: cfg.hostname},
+				Solver:       acme.NewWebhookSolver(cfg.acmeDNSWebhookURL, cfg.acmeDNSWebhookSecret, nil),
+				Log:          log,
+			}
+			if keyCipher != nil {
+				clusterCfg.Cipher = keyCipher // AES-256-GCM at rest for account + cert keys
+			} else {
+				log.Warn("ACME account/cert private keys stored UNENCRYPTED at rest in acme_cache; set OCTO_MAIL_KEY_SECRET to encrypt them (same cipher used for DKIM keys)")
+			}
+			cm, err := acme.NewCluster(clusterCfg)
+			if err != nil {
+				return fmt.Errorf("acme: %w", err)
+			}
+			acmeCluster = cm
+			acmeTLS = cm.TLSConfig()
+			go cm.RunRefresh(ctx, 30*time.Second)
+			log.Info("ACME enabled: leader-gated multi-node DNS-01", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts, "fallback", cfg.hostname)
+		} else {
+			am, err := acme.New(acme.Config{
+				CacheDir:     cfg.acmeCacheDir,
+				ContactEmail: cfg.acmeContact,
+				DirectoryURL: cfg.acmeDirectory,
+				Hostnames:    cfg.acmeHosts,
+				Fallback:     dns.Domain{ASCII: cfg.hostname},
+				Shutdown:     ctx.Done(),
+			})
+			if err != nil {
+				return fmt.Errorf("acme: %w", err)
+			}
+			acmeTLS = am.TLSConfig()
+			log.Info("ACME/autotls enabled", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts)
+			// Legacy single-node mode: the tls-alpn-01 challenge token and the node-local
+			// cache are per-node, so running this on multiple nodes makes each register
+			// its own account and race to order the same certs, and challenges can land
+			// on a node that didn't create the order. For multi-node, set
+			// OCTO_MAIL_ACME_DNS_WEBHOOK_URL to enable leader-gated DNS-01 issuance (#32),
+			// or terminate TLS at a shared proxy / provision certs externally.
+			log.Warn("built-in ACME is single-node only in tls-alpn-01 mode; set OCTO_MAIL_ACME_DNS_WEBHOOK_URL for leader-gated multi-node DNS-01, or terminate TLS at a shared proxy")
 		}
-		acmeTLS = am.TLSConfig()
-		log.Info("ACME/autotls enabled", "directory", cfg.acmeDirectory, "hosts", cfg.acmeHosts)
-		// H17: the ACME cache (account key + certs) is node-local, so built-in ACME
-		// is single-node only. Running it on multiple nodes makes each register its
-		// own account and race to order the same certs (Let's Encrypt rate limits),
-		// and tls-alpn-01 challenges can land on a node that didn't create the order.
-		// Multi-node deployments must terminate TLS at a shared front proxy or supply
-		// certs externally. Leader-gated cluster issuance is tracked as a follow-up.
-		log.Warn("built-in ACME is single-node only (node-local cert cache); for multi-node, terminate TLS at a shared proxy or provision certs externally")
 	}
 
 	// Inbound authenticator (SPF/DKIM/DMARC/iprev/DNSBL) for the MX listener.
@@ -559,6 +599,7 @@ func run() error {
 		warmupLeaderKey = int64(2) // IP warmup daily maintenance
 		reputLeaderKey  = int64(3) // reputation auto-unpause
 		reportLeaderKey = int64(4) // DMARC/TLS-RPT report scheduler
+		acmeLeaderKey   = int64(5) // ACME DNS-01 issuance/renewal
 	)
 	projCoord := ha.NewCoordinator(ha.New(s.Pool, projLeaderKey, cfg.nodeID), cfg.projInterval)
 	projCoord.OnElected = func(context.Context) { log.Info("elected projection-drain leader", "node", cfg.nodeID) }
@@ -566,6 +607,22 @@ func run() error {
 	projDrainer := &projectionDrainer{s: s, fts: fts, threads: threads, log: log, pageSize: 500}
 	projCoord.Tick = projDrainer.tick
 	go projCoord.Run(ctx)
+
+	// Leader-gated ACME issuance/renewal (#32): only the elected leader orders and
+	// renews certificates over dns-01 into the shared Postgres store; every node
+	// serves from that store (the refresher started above). RenewOnce is cheap when
+	// nothing is near expiry, so an hourly campaign is fine and also bounds failover.
+	if acmeCluster != nil {
+		acmeCoord := ha.NewCoordinator(ha.New(s.Pool, acmeLeaderKey, cfg.nodeID), time.Hour)
+		// Epoch-fence the cert write so a leader demoted by a PostgreSQL promotion
+		// cannot overwrite a newer leader's cert (the ACME order itself has a bounded
+		// duplicate-order window across failover — see ClusterManager.RenewOnce).
+		acmeCluster.SetFencer(acmeCoord.Leader())
+		acmeCoord.OnElected = func(context.Context) { log.Info("elected acme-issuance leader", "node", cfg.nodeID) }
+		acmeCoord.OnLost = func() { log.Info("lost acme-issuance leadership", "node", cfg.nodeID) }
+		acmeCoord.Tick = acmeCluster.RenewOnce
+		go acmeCoord.Run(ctx)
+	}
 
 	// Daily IP-warmup maintenance, when an egress pool is configured. This MUST be
 	// a cluster singleton (it resets/advances shared per-IP counters), so it is

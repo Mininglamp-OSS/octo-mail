@@ -67,6 +67,14 @@ func (c *KeyCipher) aeadFor(salt []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
+// Encrypt is the exported form of encrypt, so other packages (e.g. security/acme)
+// can reuse this at-rest cipher for their own secrets. It binds aad as GCM
+// additional authenticated data; a nil *KeyCipher returns plaintext (no secret).
+func (c *KeyCipher) Encrypt(plain, aad []byte) ([]byte, error) { return c.encrypt(plain, aad) }
+
+// Decrypt is the exported form of decrypt (reverses Encrypt, verifying aad).
+func (c *KeyCipher) Decrypt(stored, aad []byte) ([]byte, error) { return c.decrypt(stored, aad) }
+
 // encrypt returns "MENC2" || salt || nonce || sealed, binding aad as GCM
 // additional authenticated data. A nil cipher returns plaintext (dev/no secret).
 func (c *KeyCipher) encrypt(plain, aad []byte) ([]byte, error) {

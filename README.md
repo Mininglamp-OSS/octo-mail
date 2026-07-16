@@ -142,6 +142,11 @@ Anti-abuse, queue, ACME, and deliverability knobs (`OCTO_MAIL_REJECT_DMARC`,
 `OCTO_MAIL_GREYLIST`, `OCTO_MAIL_QUEUE_BACKOFF`, `OCTO_MAIL_ACME_HOSTS`, …) are
 documented alongside their defaults in `config.go`.
 
+Built-in ACME runs single-node over tls-alpn-01 by default. For the stateless
+multi-node cluster, set `OCTO_MAIL_ACME_DNS_WEBHOOK_URL` (a provider-neutral,
+HMAC-signed DNS solver webhook): the elected leader then issues/renews over DNS-01
+into shared Postgres and every node serves from it — no shared proxy required.
+
 The `octo-mail` binary also exposes operational subcommands:
 `serve`, `passwd`, `apikey`, `gendkim`, `export`, `import`.
 
