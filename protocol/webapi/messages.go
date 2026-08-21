@@ -51,6 +51,7 @@ type messageDetail struct {
 	Bcc                  []string             `json:"bcc,omitempty"`
 	BodyText             string               `json:"bodyText,omitempty"`
 	BodyHTML             string               `json:"bodyHtml,omitempty"`
+	BodyTruncated        bool                 `json:"bodyTruncated,omitempty"`
 	OriginalFrom         string               `json:"originalFrom,omitempty"`
 	SentBy               string               `json:"sentBy,omitempty"`
 	Attachments          []receivedAttachment `json:"attachments"`
@@ -207,9 +208,10 @@ func (s *Server) getMessage(ctx context.Context, a authCtx, r *http.Request) (in
 		br := a.acc.MessageReader(ctx, m)
 		data, _ := io.ReadAll(br)
 		br.Close()
-		text, html, cc := parseBodies(data)
+		text, html, cc, bodyTruncated := parseBodiesWithTruncation(data)
 		envelope := parseEnvelope(data, s.RuleMetadata, ruleRecipients)
 		detail.BodyText, detail.BodyHTML, detail.Cc = text, html, cc
+		detail.BodyTruncated = bodyTruncated
 		detail.Bcc = envelope.bcc
 		detail.OriginalFrom, detail.SentBy = envelope.originalFrom, envelope.sentBy
 		detail.Attachments, detail.AttachmentsTruncated = parseAttachments(data)
@@ -819,43 +821,76 @@ func validAttributionAddress(value string) string {
 	return address.String()
 }
 
+const maxRenderableHTMLBytes = 128 * 1024
+
 // parseBodies returns (text, html, cc) parsed from the raw message.
 func parseBodies(data []byte) (text, html string, cc []string) {
+	text, html, cc, _ = parseBodiesWithTruncation(data)
+	return text, html, cc
+}
+
+// parseBodiesWithTruncation returns one eligible HTML body when it fits the
+// inline rendering limit. Oversized or multiple HTML bodies are omitted so the
+// client can offer the complete raw message instead.
+func parseBodiesWithTruncation(data []byte) (text, html string, cc []string, bodyTruncated bool) {
 	part, err := moxmessage.EnsurePart(nil, false, bytes.NewReader(data), int64(len(data)))
 	if err != nil && part.Envelope == nil {
-		return "", "", nil
+		return "", "", nil, false
 	}
 	if part.Envelope != nil {
 		for _, a := range part.Envelope.CC {
 			cc = append(cc, a.User+"@"+a.Host)
 		}
 	}
-	var walk func(p *moxmessage.Part)
-	walk = func(p *moxmessage.Part) {
+	var htmlParts []*moxmessage.Part
+	var walk func(p *moxmessage.Part, root bool)
+	walk = func(p *moxmessage.Part, root bool) {
+		if !root && isExplicitAttachment(p) {
+			return
+		}
 		if len(p.Parts) > 0 {
 			for i := range p.Parts {
-				walk(&p.Parts[i])
+				walk(&p.Parts[i], false)
 			}
 			return
 		}
 		if !strings.EqualFold(p.MediaType, "TEXT") && p.MediaType != "" {
 			return
 		}
-		rd := p.Reader()
-		if rd == nil {
-			return
-		}
-		b, _ := io.ReadAll(rd)
 		if strings.EqualFold(p.MediaSubType, "HTML") {
-			if html == "" {
-				html = string(b)
-			}
+			htmlParts = append(htmlParts, p)
 		} else if text == "" {
+			b, _ := io.ReadAll(p.Reader())
 			text = string(b)
 		}
 	}
-	walk(&part)
-	return text, html, cc
+	walk(&part, true)
+	if len(htmlParts) > 1 {
+		return text, "", cc, true
+	}
+	if len(htmlParts) == 1 {
+		b, _ := io.ReadAll(io.LimitReader(htmlParts[0].Reader(), maxRenderableHTMLBytes+1))
+		if len(b) > maxRenderableHTMLBytes {
+			return text, "", cc, true
+		}
+		html = string(b)
+	}
+	return text, html, cc, false
+}
+
+func isExplicitAttachment(part *moxmessage.Part) bool {
+	if part.ContentDisposition == nil {
+		return false
+	}
+	disposition, _, _ := part.DispositionFilename()
+	if strings.EqualFold(disposition, "attachment") {
+		return true
+	}
+	raw := strings.TrimSpace(*part.ContentDisposition)
+	if i := strings.IndexByte(raw, ';'); i >= 0 {
+		raw = raw[:i]
+	}
+	return strings.EqualFold(strings.Trim(strings.TrimSpace(raw), `"`), "attachment")
 }
 
 func previewText(data []byte) string {
